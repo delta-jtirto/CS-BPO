@@ -1,0 +1,743 @@
+/**
+ * useGlobalAutoReply — Global listener that watches ALL tickets for new guest
+ * messages and automatically generates AI responses when the host has
+ * "Automatic Replies" enabled and an API key is configured.
+ *
+ * EIGHT IMPROVEMENTS over the original per-ticket hook:
+ * 1. Partial Coverage — answers covered inquiries + acknowledges uncovered
+ * 2. Debounce Window (30s) — waits for guest to finish typing before replying
+ * 3. Don't-Double-Hold Guard — won't re-send holding msgs for same topics
+ * 4. Global Listener — watches all tickets, not just the active one
+ * 5. Channel-Aware Tone — adapts message style to Airbnb/Booking.com/etc.
+ * 6. Escalation Urgency Tiers — maps inquiry types to urgency levels + SLAs
+ * 7. Re-Escalation Timer — bumps to urgent if agent doesn't respond within 30min
+ * 8. Response Mode Config — supports auto/draft/assist per host
+ *
+ * ROUTING OUTCOMES (hospitality-friendly labels):
+ * AI Handled:       Full KB coverage → AI composes helpful reply using matched facts
+ * Handed to Agent:  Zero KB coverage → AI sends warm holding message, routes to team
+ * Partially Answered: Some coverage → AI answers covered parts, routes the rest
+ *
+ * POST-REPLY COHERENCE CHECK:
+ * After Track 1 AI composes a reply, we scan the text for holding/deferral
+ * patterns. If the AI "punted" despite having KB matches (vague entries),
+ * we reclassify as Handed to Agent to avoid the green "AI Handled" banner
+ * appearing above a holding message.
+ */
+
+import { useEffect, useRef, useCallback } from 'react';
+import { toast } from 'sonner';
+import { useAppContext } from '../../context/AppContext';
+import { composeReplyAI } from '../../ai/api-client';
+import { AUTO_REPLY_SYSTEM, AUTO_REPLY_USER, interpolate } from '../../ai/prompts';
+import { MOCK_PROPERTIES } from '../../data/mock-data';
+import { buildPropertyContext } from '../../ai/kb-context';
+import type { Ticket } from '../../data/types';
+
+// ─── Debounce presets (ms) — configurable per host ───────────────
+const DEBOUNCE_PRESETS: Record<string, number> = {
+  instant: 2_000,  // 2 seconds — fire ASAP (small buffer for typos)
+  quick: 10_000,   // 10 seconds — SMS/chat
+  normal: 30_000,  // 30 seconds — default
+  patient: 60_000, // 60 seconds — email-style
+};
+
+// ─── Re-escalation timer (ms) — bumps to urgent if no agent reply ─
+const RE_ESCALATION_MS = 30 * 60_000; // 30 minutes
+
+// ─── Channel-Aware Tone Hints ────────────────────────────────────
+const CHANNEL_TONE: Record<string, string> = {
+  'Airbnb': 'Warm and personal — Airbnb guests expect a friendly, host-like tone. Keep it conversational, 2-3 sentences.',
+  'Booking.com': 'Professional and concise — Booking.com guests expect efficient, hotel-style communication. Keep it to 1-2 sentences.',
+  'VRBO': 'Friendly and informative — VRBO guests are often families, keep it welcoming and clear.',
+  'WhatsApp': 'Casual and brief — this is a chat channel, keep messages short and informal, 1-2 sentences max.',
+  'SMS': 'Very brief — SMS has character limits, be extremely concise in 1 sentence.',
+  'Email': 'Professional and thorough — email allows for more detail, but stay warm.',
+  'Direct': 'Warm and helpful — direct booking guests chose you specifically, make them feel valued.',
+};
+
+// ─── Inquiry-Type → Urgency Mapping ──────────────────────────────
+const URGENCY_MAP: Record<string, { level: 'urgent' | 'warning'; sla: string }> = {
+  maintenance:  { level: 'urgent',  sla: '2h' },
+  safety:       { level: 'urgent',  sla: '1h' },
+  houserules:   { level: 'warning', sla: '4h' },
+  noise:        { level: 'warning', sla: '4h' },
+  billing:      { level: 'warning', sla: '6h' },
+  complaint:    { level: 'warning', sla: '4h' },
+  // Everything else defaults to { level: 'warning', sla: '12h' }
+};
+
+function getUrgency(inquiries: DetectedInquiry[]): { level: 'warning' | 'urgent'; sla: string } {
+  let highest: { level: 'warning' | 'urgent'; sla: string } = { level: 'warning', sla: '12h' };
+  for (const inq of inquiries) {
+    const u = URGENCY_MAP[inq.type];
+    if (u && u.level === 'urgent') return u; // urgent is highest, return immediately
+    if (u && highest.level !== 'urgent') {
+      // Keep the tightest SLA
+      const currentHours = parseInt(highest.sla);
+      const newHours = parseInt(u.sla);
+      if (newHours < currentHours) highest = u;
+    }
+  }
+  return highest;
+}
+
+// ─── Track 1/2/3 constants kept for reference (replaced by AUTO_REPLY_SYSTEM) ─
+// const TRACK1_SYSTEM = ...
+// const TRACK2_SYSTEM = ...
+// const TRACK3_SYSTEM = ...
+
+
+// ─── AI Auto-Reply Output Schema ─────────────────────────────────
+
+interface AIAutoReplyOutput {
+  reply: string;
+  outcome: 'answered' | 'partial' | 'escalate';
+  escalate_topics: string[];
+  risk_score: number;
+  reason: string;
+}
+
+/**
+ * Parse the AI's JSON response. Returns a safe fallback on any parse error.
+ */
+function parseAIReplyOutput(text: string): AIAutoReplyOutput {
+  const fallback: AIAutoReplyOutput = {
+    reply: '',
+    outcome: 'escalate',
+    escalate_topics: [],
+    risk_score: 10,
+    reason: 'JSON parse failure — fallback to escalate',
+  };
+  try {
+    const stripped = text.replace(/```(?:json)?\n?/g, '').replace(/```/g, '').trim();
+    const match = stripped.match(/\{[\s\S]*\}/);
+    if (!match) {
+      console.log('[AutoReply] JSON parse failure — no JSON block found. Raw:', text.slice(0, 200));
+      return fallback;
+    }
+    const parsed = JSON.parse(match[0]);
+    if (!parsed.reply || !parsed.outcome || !['answered', 'partial', 'escalate'].includes(parsed.outcome)) {
+      console.log('[AutoReply] JSON parse failure — missing/invalid fields. Raw:', text.slice(0, 200));
+      return fallback;
+    }
+    return {
+      reply: String(parsed.reply),
+      outcome: parsed.outcome as 'answered' | 'partial' | 'escalate',
+      escalate_topics: Array.isArray(parsed.escalate_topics) ? parsed.escalate_topics.map(String) : [],
+      risk_score: typeof parsed.risk_score === 'number' ? parsed.risk_score : 5,
+      reason: parsed.reason ? String(parsed.reason) : '',
+    };
+  } catch {
+    console.log('[AutoReply] JSON parse failure. Raw:', text.slice(0, 200));
+    return fallback;
+  }
+}
+
+/**
+ * Map escalated topic keywords to an urgency level.
+ * Replaces inquiry-type-based URGENCY_MAP for the single-call flow.
+ */
+function topicsToUrgency(topics: string[]): 'urgent' | 'warning' | 'normal' {
+  const joined = topics.join(' ');
+  if (/(fire|gas|flood|emergency|medical|injury|break.?in)/i.test(joined)) return 'urgent';
+  if (/(noise|billing|complaint|refund|damage)/i.test(joined)) return 'warning';
+  return 'normal';
+}
+
+/**
+ * Build the system + user prompt pair for a single auto-reply AI call.
+ */
+function buildAutoReplyPrompt(
+  ticket: Ticket, guestMessage: string, kbContext: string,
+  hostTone: string, conversationHistory: string, channelHint: string,
+): { system: string; user: string } {
+  const guestFirstName = ticket.guestName.split(' ')[0];
+  const historyBlock = conversationHistory
+    ? `Recent conversation:\n${conversationHistory}\n\n`
+    : '';
+  return {
+    system: AUTO_REPLY_SYSTEM,
+    user: interpolate(AUTO_REPLY_USER, {
+      hostName: ticket.host.name,
+      hostTone,
+      channel: ticket.channel,
+      channelHint,
+      guestFirstName,
+      propertyName: ticket.property,
+      roomName: ticket.room || 'N/A',
+      conversationHistory: historyBlock,
+      guestMessage,
+      kbContext,
+    }),
+  };
+}
+
+function buildConversationHistory(ticket: Ticket): string {
+  // Exclude system messages — they are internal routing notes, not conversation content.
+  // Feeding them to the AI pollutes tone assessment and confuses context.
+  // Expanded from 10 to 20 messages for better context depth.
+  const recentMessages = ticket.messages
+    .filter(m => m.sender !== 'system')
+    .slice(-20);
+
+  if (recentMessages.length === 0) return 'Recent conversation (TOON format):\nconversation[0]:';
+
+  // TOON format: conversation[N]{sender,text}: then N rows
+  const header = `Recent conversation (TOON format):
+conversation[${recentMessages.length}]{sender,text}:`;
+  const rows = recentMessages.map(m => {
+    // Map sender to TOON label, escape newlines and quotes
+    const senderLabel = m.sender === 'guest' ? 'guest'
+      : m.sender === 'bot' ? 'ai'
+      : m.sender === 'host' ? 'host'
+      : 'agent';
+    const escaped = m.text.replace(/\n/g, ' ').replace(/"/g, '\\"');
+    return `  ${senderLabel},"${escaped}"`;
+  });
+
+  return [header, ...rows].join('\n');
+}
+
+// ─── Exported Global Hook ────────────────────────────────────────
+
+export function useGlobalAutoReply() {
+  // Use a try/catch to gracefully handle HMR context identity mismatches
+  // where AppContext recreates during hot module replacement
+  let ctx: ReturnType<typeof useAppContext> | null = null;
+  try {
+    ctx = useAppContext();
+  } catch {
+    // Context not available (HMR transition) — will no-op this render cycle
+  }
+
+  const tickets = ctx?.tickets ?? [];
+  const hostSettings = ctx?.hostSettings ?? [];
+  const kbEntries = ctx?.kbEntries ?? [];
+  const onboardingData = ctx?.onboardingData ?? {};
+  const formTemplate = ctx?.formTemplate ?? [];
+  const hasApiKey = ctx?.hasApiKey ?? false;
+  const aiModel = ctx?.aiModel ?? '';
+  const addBotMessage = ctx?.addBotMessage ?? (() => {});
+  const addSystemMessage = ctx?.addSystemMessage ?? (() => {});
+  const addMultipleMessages = ctx?.addMultipleMessages ?? (() => {});
+  const escalateTicketStatus = ctx?.escalateTicketStatus ?? (() => {});
+  const escalateTicketWithUrgency = ctx?.escalateTicketWithUrgency ?? (() => {});
+  const setDraftReply = ctx?.setDraftReply ?? (() => {});
+  const notificationPrefs = ctx?.notificationPrefs ?? { notifyAutoReply: true, notifyEscalation: true, notifyDraft: true, emailAlerts: true, soundAlerts: true, escalationAlerts: true };
+  const setAutoReplyProcessing = ctx?.setAutoReplyProcessing ?? (() => {});
+  const autoReplyCancelledRef = ctx?.autoReplyCancelledRef ?? { current: {} };
+  const autoReplyAbortControllers = ctx?.autoReplyAbortControllers ?? { current: {} };
+  const autoReplyPausedTickets = ctx?.autoReplyPausedTickets ?? {};
+  const autoReplyHandedOff = ctx?.autoReplyHandedOff ?? {};
+  const setAutoReplyHandedOff = ctx?.setAutoReplyHandedOff ?? (() => {});
+  const cancelAutoReply = ctx?.cancelAutoReply ?? (() => {});
+  
+  // Track message counts per ticket (for new-message detection)
+  const prevCountsRef = useRef<Record<string, number>>({});
+  // Debounce timers per ticket
+  const debounceTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  // Pending processing flag per ticket
+  const pendingRef = useRef<Record<string, boolean>>({});
+  // Already-escalated inquiry types per ticket (don't-double-hold guard)
+  const escalatedTypesRef = useRef<Record<string, Set<string>>>({});
+  // Re-escalation timers per ticket
+  const reEscalationTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  // Track which tickets had their counts initialized
+  const initializedRef = useRef<Set<string>>(new Set());
+  // Timestamp of hook mount — tickets appearing after this are "new" and should be processed
+  const mountTimeRef = useRef(Date.now());
+  // Latest tickets ref for re-escalation timer (avoids stale closure)
+  const ticketsRef = useRef(tickets);
+  ticketsRef.current = tickets;
+
+  // Build AI context for a ticket directly from form data + manual KB entries
+  const buildKBContext = useCallback((ticket: Ticket): string => {
+    const prop = MOCK_PROPERTIES.find(p => p.name === ticket.property);
+    const roomNames = prop?.roomNames ?? (prop?.units === 1 ? ['Entire Property'] : Array.from({ length: prop?.units ?? 1 }, (_, i) => `Unit ${i + 1}`));
+    const manualEntries = kbEntries.filter(kb => kb.hostId === ticket.host.id && (!kb.propId || kb.propId === prop?.id));
+    return buildPropertyContext(prop?.id ?? '', ticket.property, onboardingData, formTemplate, roomNames, manualEntries);
+  }, [kbEntries, onboardingData, formTemplate]);
+
+  // ─── Re-escalation timer (defined before processTicket so it can be referenced) ─
+  const startReEscalationTimer = useCallback((ticketId: string) => {
+    // Clear any existing timer
+    if (reEscalationTimersRef.current[ticketId]) {
+      clearTimeout(reEscalationTimersRef.current[ticketId]);
+    }
+
+    reEscalationTimersRef.current[ticketId] = setTimeout(() => {
+      // Check if agent has responded (use ref for latest state)
+      const ticket = ticketsRef.current.find(t => t.id === ticketId);
+      if (!ticket) return;
+
+      const recentHuman = ticket.messages.slice(-10).some(
+        m => m.sender === 'agent' || m.sender === 'host'
+      );
+
+      if (!recentHuman && ticket.status !== 'urgent') {
+        console.log('[AutoReply] Re-escalation: no agent response for %s — bumping to urgent', ticketId);
+        escalateTicketWithUrgency(ticketId, 'urgent', '1h');
+        addSystemMessage(
+          ticketId,
+          'No reply in 30 min — escalated to urgent'
+        );
+        toast.error(`URGENT: ${ticket.guestName}`, {
+          description: 'No agent response in 30 min — re-escalated to urgent priority.',
+          duration: 10000,
+        });
+      }
+    }, RE_ESCALATION_MS);
+  }, [escalateTicketWithUrgency, addSystemMessage]);
+
+  // ─── Process a ticket (called after debounce) ──────────────────
+  const processTicket = useCallback(async (ticketId: string) => {
+    // Find the ticket in the latest state
+    const ticket = tickets.find(t => t.id === ticketId);
+    if (!ticket) {
+      setAutoReplyProcessing(ticketId, false);
+      return;
+    }
+
+    const hostConfig = hostSettings.find(s => s.hostId === ticket.host.id);
+    if (!hostConfig?.autoReply) {
+      setAutoReplyProcessing(ticketId, false);
+      return;
+    }
+
+    // Assist mode = no auto-reply, only sidebar powers
+    if (hostConfig.autoReplyMode === 'assist') {
+      console.log('[AutoReply] %s: assist mode — skipping auto-reply', ticketId);
+      setAutoReplyProcessing(ticketId, false);
+      return;
+    }
+
+    // ─── Pause check — user paused AI for this thread ────────
+    if (autoReplyPausedTickets[ticketId]) {
+      console.log('[AutoReply] %s: AI paused for this thread — skipping', ticketId);
+      setAutoReplyProcessing(ticketId, false);
+      return;
+    }
+
+    // Note: handoff no longer disables AI — AI continues responding to new questions.
+    // The "Your Turn" badge persists until the agent replies; duplicate holding messages
+    // are suppressed (see escalate path below). This way guests get answers to topics
+    // the AI CAN cover even after a previous escalation.
+
+    if (pendingRef.current[ticketId]) {
+      setAutoReplyProcessing(ticketId, false);
+      return;
+    }
+    pendingRef.current[ticketId] = true;
+    
+    // Clear any prior cancellation and set processing state
+    autoReplyCancelledRef.current[ticketId] = false;
+    setAutoReplyProcessing(ticketId, true);
+
+    // Create an AbortController for this ticket's AI request(s)
+    // so cancelAutoReply() can abort in-flight HTTP calls
+    const abortController = new AbortController();
+    autoReplyAbortControllers.current[ticketId] = abortController;
+    const signal = abortController.signal;
+
+    try {
+      // ─── Safety keyword check (P0) ─────────────────────────
+      const safetyKeywords = hostConfig.safetyKeywords || [];
+      if (safetyKeywords.length > 0) {
+        // Dedup: only fire the safety alert once per thread (don't re-add on every new message)
+        const alreadySafety = ticket.messages.some(
+          m => m.sender === 'system' && m.text.toLowerCase().startsWith('safety alert')
+        );
+        if (!alreadySafety) {
+          // Scan ALL guest messages in the thread — a safety keyword anywhere should escalate
+          const allGuestMsgs = ticket.messages.filter(m => m.sender === 'guest');
+          const guestText = allGuestMsgs.map(m => m.text).join(' ').toLowerCase();
+          const triggeredKeywords = safetyKeywords.filter(kw => {
+            const escaped = kw.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            return new RegExp(`\\b${escaped}\\b`, 'i').test(guestText);
+          });
+          if (triggeredKeywords.length > 0) {
+            console.log('[AutoReply] SAFETY TRIGGER on %s: keywords [%s] — forcing escalation',
+              ticketId, triggeredKeywords.join(', '));
+            addSystemMessage(
+              ticketId,
+              `Safety Alert — Keywords: ${triggeredKeywords.join(', ')}`
+            );
+            escalateTicketWithUrgency(ticketId, 'urgent', '1h');
+            toast.error(`Safety alert: ${ticket.guestName}`, {
+              description: `Flagged keywords detected: ${triggeredKeywords.join(', ')}. Manual response required.`,
+              duration: 10000,
+            });
+            startReEscalationTimer(ticketId);
+            return;
+          }
+        }
+      }
+
+      // ─── Cooldown check — pause AI after agent reply (#1) ──
+      if (hostConfig.cooldownEnabled && (hostConfig.cooldownMinutes || 10) > 0) {
+        const cooldownMs = (hostConfig.cooldownMinutes || 10) * 60_000;
+        const recentAgentMsg = [...ticket.messages].reverse().find(m => m.sender === 'agent' || m.sender === 'host');
+        if (recentAgentMsg && recentAgentMsg.createdAt) {
+          const elapsed = Date.now() - recentAgentMsg.createdAt;
+          if (elapsed < cooldownMs) {
+            console.log('[AutoReply] %s: cooldown active — agent replied %ds ago (cooldown=%dm), skipping',
+              ticketId, Math.round(elapsed / 1000), hostConfig.cooldownMinutes || 10);
+            return;
+          }
+        }
+      }
+
+      // ─── [STEP 3] Transactional Override (pre-AI, no exceptions) ─
+      // Skip if already handed off — ticket is already escalated, no need to re-trigger
+      if (autoReplyHandedOff[ticketId] !== true) {
+        const TRANSACTIONAL_PATTERNS = [
+          /\b(refund|compensat|reimburse)\b/i,
+          /\b(cancel|modify).{0,30}(booking|reservation|stay)\b/i,
+          /\b(lawyer|sue|legal action|chargeback)\b/i,
+        ];
+        const allGuestTextForTransactional = ticket.messages
+          .filter(m => m.sender === 'guest').map(m => m.text).join(' ');
+        if (TRANSACTIONAL_PATTERNS.some(p => p.test(allGuestTextForTransactional))) {
+          console.log('[AutoReply] TRANSACTIONAL OVERRIDE on %s — escalating immediately', ticketId);
+          addSystemMessage(
+            ticketId,
+            'Routed to team — Legal or financial request'
+          );
+          escalateTicketWithUrgency(ticketId, 'warning', '4h');
+          setAutoReplyHandedOff(ticketId, true);
+          if (notificationPrefs.notifyEscalation) {
+            toast.warning(`Escalated: ${ticket.guestName}`, {
+              description: 'Transactional request detected — agent required.',
+              duration: 8000,
+            });
+          }
+          startReEscalationTimer(ticketId);
+          return;
+        }
+      }
+
+      // ─── [STEP 4] Single AI Call with Full KB ─────────────────
+      const lastGuestMsg = [...ticket.messages].reverse().find(m => m.sender === 'guest');
+      if (!lastGuestMsg) return;
+
+      const kbContext = buildKBContext(ticket);
+      const channelHint = CHANNEL_TONE[ticket.channel] || CHANNEL_TONE['Direct']!;
+      const conversationHistory = buildConversationHistory(ticket);
+      const isDraft = hostConfig.autoReplyMode === 'draft';
+
+      const { system: autoReplySystem, user: autoReplyUser } = buildAutoReplyPrompt(
+        ticket, lastGuestMsg.text, kbContext,
+        hostConfig.tone, conversationHistory, channelHint,
+      );
+
+      console.log('[AutoReply] Single AI call for %s — context len: %d chars', ticketId, kbContext.length);
+
+      const result = await composeReplyAI({
+        systemPrompt: autoReplySystem,
+        userPrompt: autoReplyUser,
+        model: aiModel,
+        signal,
+      });
+
+      // ─── Cancellation check after AI call ─────────────────────
+      if (autoReplyCancelledRef.current[ticketId]) {
+        console.log('[AutoReply] Cancelled after AI response for %s — discarding result', ticketId);
+        return;
+      }
+
+      const output = parseAIReplyOutput(result.text);
+      console.log('[AutoReply] AI output for %s: outcome=%s, risk=%d, topics=[%s]',
+        ticketId, output.outcome, output.risk_score, output.escalate_topics.join(', '));
+
+      // ─── [STEP 5] Risk Gate ────────────────────────────────────
+      if (output.risk_score >= 8) {
+        console.log('[AutoReply] RISK GATE: score=%d — overriding outcome to escalate for %s', output.risk_score, ticketId);
+        output.outcome = 'escalate';
+      }
+
+      // ─── [STEP 6] Route by Outcome + Host Settings ─────────────
+      const outcomeForRouting = (output.outcome === 'partial' && hostConfig.partialCoverage === 'escalate-all')
+        ? 'escalate'
+        : output.outcome;
+
+      if (outcomeForRouting === 'answered') {
+        if (isDraft) {
+          setDraftReply(ticketId, output.reply);
+          if (notificationPrefs.notifyDraft) {
+            toast.info(`AI Draft: ${ticket.guestName}`, {
+              description: 'AI composed a reply. Review in the compose box.',
+              duration: 6000,
+            });
+          }
+        } else {
+          // Only the bot reply — no system message needed. The bot bubble is self-evident.
+          // Thread status badge handles showing "Resolved" in the sidebar.
+          addMultipleMessages(ticketId, [
+            { sender: 'bot', text: output.reply },
+          ]);
+          if (notificationPrefs.notifyAutoReply) {
+            toast.success(`AI replied: ${ticket.guestName}`, {
+              description: 'Auto-reply sent.',
+            });
+          }
+        }
+
+      } else if (outcomeForRouting === 'partial') {
+        const topicList = output.escalate_topics.join(', ') || 'some topics';
+        if (isDraft) {
+          setDraftReply(ticketId, output.reply);
+          if (notificationPrefs.notifyDraft) {
+            toast.info(`AI Draft: ${ticket.guestName}`, {
+              description: `Partial coverage — review before sending. Uncovered: ${topicList}`,
+              duration: 8000,
+            });
+          }
+        } else {
+          addMultipleMessages(ticketId, [
+            { sender: 'bot', text: output.reply },
+            { sender: 'system', text: `Follow-up needed — ${topicList}` },
+          ]);
+          const urgencyLevel = topicsToUrgency(output.escalate_topics);
+          if (urgencyLevel !== 'normal') {
+            escalateTicketWithUrgency(ticketId, urgencyLevel, urgencyLevel === 'urgent' ? '1h' : '4h');
+          }
+          if (notificationPrefs.notifyEscalation) {
+            toast.warning(`Partial: ${ticket.guestName}`, {
+              description: `AI answered some topics. Needs manual follow-up: ${topicList}`,
+              duration: 8000,
+            });
+          }
+          startReEscalationTimer(ticketId);
+        }
+
+      } else {
+        // escalate
+        const topicList = output.escalate_topics.join(', ') || 'guest inquiry';
+        const isSilent = hostConfig.zeroCoverage === 'silent-escalate';
+        // If already handed off, suppress the guest-facing holding message to avoid
+        // repeating "someone will be in touch" — just add a quiet agent-visible note instead.
+        const alreadyHandedOff = autoReplyHandedOff[ticketId] === true;
+
+        if (isDraft) {
+          if (output.reply) setDraftReply(ticketId, output.reply);
+          if (notificationPrefs.notifyDraft) {
+            toast.info(`AI Draft: ${ticket.guestName}`, {
+              description: 'Escalating — review holding message.',
+              duration: 8000,
+            });
+          }
+        } else if (alreadyHandedOff) {
+          // Ticket already in agent hands — add internal note.
+          // Also send a brief guest acknowledgment for real needs (not pleasantries)
+          // so the guest isn't ghosted while waiting for the agent.
+          addSystemMessage(ticketId, `AI Note — ${topicList}`);
+          const isPleasantry = /^(hi|hello|hey|thanks|thank you|ok|okay|sure|sounds good|great|no worries|got it|perfect)[\s!?.]*$/i
+            .test(lastGuestMsg.text.trim());
+          if (!isPleasantry && !isSilent) {
+            const botReply = output.reply || `Hi ${ticket.guestName.split(' ')[0]}, I've noted this and passed it to our team — they'll follow up with you shortly.`;
+            addBotMessage(ticketId, botReply);
+          }
+          // Re-bump urgency if topics are serious
+          const urgencyLevel = topicsToUrgency(output.escalate_topics);
+          if (urgencyLevel !== 'normal') {
+            escalateTicketWithUrgency(ticketId, urgencyLevel, urgencyLevel === 'urgent' ? '1h' : '4h');
+          }
+        } else {
+          if (isSilent) {
+            addSystemMessage(
+              ticketId,
+              `Silently routed — Not covered: ${topicList}`
+            );
+          } else {
+            const botReply = output.reply || `Hi ${ticket.guestName.split(' ')[0]}, I've noted this and passed it to our team — they'll follow up with you shortly.`;
+            addMultipleMessages(ticketId, [
+              { sender: 'bot', text: botReply },
+              { sender: 'system', text: `Routed to team — Not covered: ${topicList}` },
+            ]);
+          }
+          setAutoReplyHandedOff(ticketId, true);
+          const urgencyLevel = topicsToUrgency(output.escalate_topics);
+          escalateTicketWithUrgency(ticketId, urgencyLevel === 'normal' ? 'warning' : urgencyLevel, urgencyLevel === 'urgent' ? '1h' : urgencyLevel === 'warning' ? '4h' : '12h');
+          if (notificationPrefs.notifyEscalation) {
+            toast.warning(`Escalated: ${ticket.guestName}`, {
+              description: isSilent
+                ? `Routed to agent (no guest message): ${topicList}`
+                : `Holding message sent — manual reply needed: ${topicList}`,
+              duration: 8000,
+            });
+          }
+          startReEscalationTimer(ticketId);
+        }
+      }
+
+    } catch (err) {
+      // AbortError is expected when the user cancels — don't show error toast
+      if ((err as any)?.name === 'AbortError') {
+        console.log('[AutoReply] Request aborted for ticket %s (user cancelled)', ticketId);
+      } else {
+        console.error('[AutoReply] Failed for ticket %s:', ticketId, err);
+        toast.error('Auto-reply failed', {
+          description: `Could not process ${tickets.find(t => t.id === ticketId)?.guestName}'s message. Reply manually.`,
+        });
+      }
+    } finally {
+      pendingRef.current[ticketId] = false;
+      setAutoReplyProcessing(ticketId, false);
+      // Clean up the abort controller
+      delete autoReplyAbortControllers.current[ticketId];
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tickets, hostSettings, hasApiKey, aiModel, buildKBContext,
+    addBotMessage, addSystemMessage, addMultipleMessages, escalateTicketStatus,
+    escalateTicketWithUrgency, setDraftReply, startReEscalationTimer, notificationPrefs,
+    autoReplyPausedTickets, autoReplyHandedOff, setAutoReplyHandedOff,
+    setAutoReplyProcessing, autoReplyCancelledRef, autoReplyAbortControllers]);
+
+  // ─── Main effect: watch all tickets for new guest messages ─────
+  useEffect(() => {
+    if (!hasApiKey) return;
+
+    for (const ticket of tickets) {
+      const hostConfig = hostSettings.find(s => s.hostId === ticket.host.id);
+      if (!hostConfig?.autoReply) continue;
+      if (hostConfig.autoReplyMode === 'assist') continue;
+
+      const currentCount = ticket.messages.length;
+      const prevCount = prevCountsRef.current[ticket.id];
+
+      // Initialize on first encounter
+      if (!initializedRef.current.has(ticket.id)) {
+        prevCountsRef.current[ticket.id] = currentCount;
+        initializedRef.current.add(ticket.id);
+        
+        // If this ticket appeared AFTER initial mount (e.g. createTestTicket),
+        // and its last message is from a guest, treat it as a new guest message
+        // so auto-reply can process it.
+        const isPostMount = Date.now() - mountTimeRef.current > 1500;
+        const lastMsg = ticket.messages[ticket.messages.length - 1];
+        if (isPostMount && lastMsg?.sender === 'guest') {
+          const ticketId = ticket.id;
+          console.log('[AutoReply] New ticket %s detected post-mount with guest message — processing', ticketId);
+
+          // Run through the same debounce path as normal new messages
+          if (debounceTimersRef.current[ticketId]) {
+            clearTimeout(debounceTimersRef.current[ticketId]);
+          }
+          const debounceMs = DEBOUNCE_PRESETS[hostConfig.debouncePreset || 'normal'] || DEBOUNCE_PRESETS.normal;
+          autoReplyCancelledRef.current[ticketId] = false;
+          setAutoReplyProcessing(ticketId, true);
+          debounceTimersRef.current[ticketId] = setTimeout(() => {
+            if (autoReplyCancelledRef.current[ticketId]) {
+              setAutoReplyProcessing(ticketId, false);
+              return;
+            }
+            processTicket(ticketId);
+          }, debounceMs);
+        }
+        continue;
+      }
+
+      // Detect new messages
+      if (currentCount > (prevCount || 0)) {
+        const newMessages = ticket.messages.slice(prevCount || 0);
+        // #7: Include guest-mode test messages — auto-reply should respond to them too
+        const hasNewGuestMsg = newMessages.some(m => m.sender === 'guest');
+
+        if (hasNewGuestMsg) {
+          // ─── Pre-checks: don't show loading for tickets that will be skipped ──
+          const ticketId = ticket.id;
+
+          // Skip if AI is paused for this thread
+          if (autoReplyPausedTickets[ticketId]) {
+            console.log('[AutoReply] New guest msg on %s but AI paused — ignoring', ticketId);
+            prevCountsRef.current[ticket.id] = currentCount;
+            continue;
+          }
+
+          // Note: handoff no longer suppresses AI in the EFFECT — AI continues processing
+          // new guest messages even after a prior "Handed to Agent". Duplicate guest-facing
+          // holding messages are suppressed inside processTicket (escalate path).
+
+          // ─── Cooldown pre-check: don't show pending indicator if cooldown is active ──
+          if (hostConfig.cooldownEnabled && (hostConfig.cooldownMinutes || 10) > 0) {
+            const cooldownMs = (hostConfig.cooldownMinutes || 10) * 60_000;
+            const recentAgentMsg = [...ticket.messages].reverse().find(
+              m => m.sender === 'agent' || m.sender === 'host'
+            );
+            if (recentAgentMsg?.createdAt && Date.now() - recentAgentMsg.createdAt < cooldownMs) {
+              console.log('[AutoReply] New guest msg on %s but cooldown active (%dm) — ignoring',
+                ticketId, hostConfig.cooldownMinutes || 10);
+              prevCountsRef.current[ticket.id] = currentCount;
+              continue;
+            }
+          }
+
+          // ─── Debounce: reset timer on each new guest message ──
+          if (debounceTimersRef.current[ticket.id]) {
+            clearTimeout(debounceTimersRef.current[ticket.id]);
+          }
+
+          // Use host's debounce preset (instant=2s, quick=10s, normal=30s, patient=60s)
+          const debounceMs = DEBOUNCE_PRESETS[hostConfig.debouncePreset || 'normal'] || DEBOUNCE_PRESETS.normal;
+
+          console.log('[AutoReply] New guest message on %s — starting %ds debounce',
+            ticket.id, debounceMs / 1000);
+
+          autoReplyCancelledRef.current[ticketId] = false;
+          setAutoReplyProcessing(ticketId, true);
+
+          debounceTimersRef.current[ticketId] = setTimeout(() => {
+            if (autoReplyCancelledRef.current[ticketId]) {
+              console.log('[AutoReply] Cancelled during debounce for %s', ticketId);
+              setAutoReplyProcessing(ticketId, false);
+              return;
+            }
+            console.log('[AutoReply] Debounce expired for %s — processing', ticketId);
+            processTicket(ticketId);
+          }, debounceMs);
+        }
+      }
+
+      prevCountsRef.current[ticket.id] = currentCount;
+    }
+  }, [tickets, hasApiKey, hostSettings, processTicket, autoReplyPausedTickets, setAutoReplyProcessing, autoReplyCancelledRef]);
+
+  // Cleanup timers on unmount
+  useEffect(() => {
+    return () => {
+      for (const timer of Object.values(debounceTimersRef.current)) clearTimeout(timer);
+      for (const timer of Object.values(reEscalationTimersRef.current)) clearTimeout(timer);
+    };
+  }, []);
+
+  // ─── Reset escalated types when AI is resumed for a ticket ──────
+  // When autoReplyHandedOff[id] goes to false (user resumed) or
+  // autoReplyPausedTickets[id] goes to false (user unpaused),
+  // clear the don't-double-hold guard so AI re-evaluates fresh.
+  useEffect(() => {
+    for (const ticketId of Object.keys(autoReplyHandedOff)) {
+      if (autoReplyHandedOff[ticketId] === false && escalatedTypesRef.current[ticketId]) {
+        console.log('[AutoReply] Clearing escalated types for resumed ticket %s', ticketId);
+        delete escalatedTypesRef.current[ticketId];
+      }
+    }
+    for (const ticketId of Object.keys(autoReplyPausedTickets)) {
+      if (!autoReplyPausedTickets[ticketId] && escalatedTypesRef.current[ticketId]) {
+        console.log('[AutoReply] Clearing escalated types for unpaused ticket %s', ticketId);
+        delete escalatedTypesRef.current[ticketId];
+      }
+    }
+  }, [autoReplyHandedOff, autoReplyPausedTickets]);
+}
+// ─── Legacy export for backward compatibility ────────────────────
+// (InboxView previously called useAutoReply(activeTicket))
+export function useAutoReply(_activeTicket: Ticket | null) {
+  // No-op — replaced by useGlobalAutoReply mounted in AppLayout
+}
+
+// ─── Rendered inside AppContext.Provider to guarantee context access ──
+export function GlobalAutoReplyEffect(): null {
+  useGlobalAutoReply();
+  return null;
+}

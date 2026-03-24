@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__Claude_Preview__preview_start",
+      "Bash(npm install:*)",
+      "Bash(find '/Users/jamestwork/Delta/AI BPO/AI Internal Tool/src' -maxdepth 2 -type f -name *.tsx -o -name *.ts -o -name *.css)",
+      "Bash(pip3 install:*)",
+      "Bash(npx tsc:*)",
+      "Bash(./node_modules/.bin/tsc --noEmit)",
+      "Bash(node_modules/typescript/bin/tsc --noEmit)",
+      "Bash(npm run:*)",
+      "Bash(python3:*)"
+    ]
+  }
+}

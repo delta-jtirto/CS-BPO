@@ -1,0 +1,102 @@
+❌ Error: useAppContext must be used within AppProvider
+    at useAppContext (https://app-hg3o37f36sg5kzlnjezhdix4crlkgqpjofc7vilt37eqcmql2f6q.makeproxy-c.figma.site/src/app/context/AppContext.tsx:133:19)
+    at KnowledgeBaseView (https://app-hg3o37f36sg5kzlnjezhdix4crlkgqpjofc7vilt37eqcmql2f6q.makeproxy-c.figma.site/src/app/components/views/KnowledgeBaseView.tsx:76:94)
+    at ms (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:68027)
+    at _S (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:114634)
+    at _4 (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:127720)
+    at HTMLUnknownElement.y (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:77:54006)
+    at HTMLUnknownElement.i (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:28:4861)
+    at Object.ik (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:77:54331)
+    at ij (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:77:55284)
+    at ep (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:166948)
+    at SX (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:160942)
+    at Sz (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:160557)
+    at Sj (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:160323)
+    at SO (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:158164)
+    at pC (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:36290)
+    at SL (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:158998)
+    at IO (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:169939)
+    at r.scheduleRefresh (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:69:53181)
+    at https://app-hg3o37f36sg5kzlnjezhdix4crlkgqpjofc7vilt37eqcmql2f6q.makeproxy-c.figma.site/@react-refresh:228:17
+    at Set.forEach (<anonymous>)
+    at performReactRefresh (https://app-hg3o37f36sg5kzlnjezhdix4crlkgqpjofc7vilt37eqcmql2f6q.makeproxy-c.figma.site/@react-refresh:217:26)
+    at https://app-hg3o37f36sg5kzlnjezhdix4crlkgqpjofc7vilt37eqcmql2f6q.makeproxy-c.figma.site/@react-refresh:608:3
+    at i (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:28:4861)
+2
+❌ Error handled by React Router default ErrorBoundary: Error: useAppContext must be used within AppProvider
+❌ React Router caught the following error during render Error: useAppContext must be used within AppProvider
+❌ Error: useAppContext must be used within AppProvider
+    at useAppContext (https://app-hg3o37f36sg5kzlnjezhdix4crlkgqpjofc7vilt37eqcmql2f6q.makeproxy-c.figma.site/src/app/context/AppContext.tsx:133:19)
+    at KnowledgeBaseView (https://app-hg3o37f36sg5kzlnjezhdix4crlkgqpjofc7vilt37eqcmql2f6q.makeproxy-c.figma.site/src/app/components/views/KnowledgeBaseView.tsx:76:94)
+    at ms (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:68027)
+    at _S (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:114634)
+    at _4 (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:127720)
+    at HTMLUnknownElement.y (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:77:54006)
+    at HTMLUnknownElement.i (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:28:4861)
+    at Object.ik (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:77:54331)
+    at ij (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:77:55284)
+    at ep (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:166948)
+    at SX (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:160942)
+    at Sz (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:160557)
+    at Sj (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:160323)
+    at SI (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:156868)
+    at SO (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:158222)
+    at pC (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:36290)
+    at SL (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:158998)
+    at IO (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:169939)
+    at r.scheduleRefresh (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:69:53181)
+    at https://app-hg3o37f36sg5kzlnjezhdix4crlkgqpjofc7vilt37eqcmql2f6q.makeproxy-c.figma.site/@react-refresh:228:17
+    at Set.forEach (<anonymous>)
+    at performReactRefresh (https://app-hg3o37f36sg5kzlnjezhdix4crlkgqpjofc7vilt37eqcmql2f6q.makeproxy-c.figma.site/@react-refresh:217:26)
+    at https://app-hg3o37f36sg5kzlnjezhdix4crlkgqpjofc7vilt37eqcmql2f6q.makeproxy-c.figma.site/@react-refresh:608:3
+    at i (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:28:4861)
+2
+❌ Error handled by React Router default ErrorBoundary: Error: useAppContext must be used within AppProvider
+❌ React Router caught the following error during render Error: useAppContext must be used within AppProvider
+❌ Error: useAppContext must be used within AppProvider
+    at useAppContext (https://app-hg3o37f36sg5kzlnjezhdix4crlkgqpjofc7vilt37eqcmql2f6q.makeproxy-c.figma.site/src/app/context/AppContext.tsx:133:19)
+    at KnowledgeBaseView (https://app-hg3o37f36sg5kzlnjezhdix4crlkgqpjofc7vilt37eqcmql2f6q.makeproxy-c.figma.site/src/app/components/views/KnowledgeBaseView.tsx:76:94)
+    at ms (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:68027)
+    at _S (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:114634)
+    at _4 (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:127720)
+    at HTMLUnknownElement.y (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:77:54006)
+    at HTMLUnknownElement.i (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:28:4861)
+    at Object.ik (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:77:54331)
+    at ij (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:77:55284)
+    at ep (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:166948)
+    at SX (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:160942)
+    at Sz (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:160557)
+    at Sj (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:160323)
+    at SI (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:156868)
+    at SS (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:156422)
+    at V (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:113:1842)
+    at B (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:113:1559)
+    at MessagePort.eo (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:113:3433)
+[vite] hot updated: /src/app/context/AppContext.tsx
+[vite] hot updated: /src/styles/index.css
+2:51:40 AM [vite] (client) hmr update /src/app/components/layout/TopBar.tsx, /src/styles/index.css
+2:51:40 AM [vite] (client) hmr update /src/app/components/views/InboxView.tsx, /src/styles/index.css
+2:51:40 AM [vite] (client) hmr update /src/app/components/views/SettingsView.tsx, /src/styles/index.css
+2:51:40 AM [vite] (client) hmr update /src/app/context/AppContext.tsx, /src/styles/index.css
+2
+❌ Error handled by React Router default ErrorBoundary: Error: useAppContext must be used within AppProvider
+❌ Error: useAppContext must be used within AppProvider
+    at useAppContext (https://app-hg3o37f36sg5kzlnjezhdix4crlkgqpjofc7vilt37eqcmql2f6q.makeproxy-c.figma.site/src/app/context/AppContext.tsx:133:19)
+    at KnowledgeBaseView (https://app-hg3o37f36sg5kzlnjezhdix4crlkgqpjofc7vilt37eqcmql2f6q.makeproxy-c.figma.site/src/app/components/views/KnowledgeBaseView.tsx:76:94)
+    at ms (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:68027)
+    at _S (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:114634)
+    at _4 (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:127720)
+    at HTMLUnknownElement.y (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:77:54006)
+    at HTMLUnknownElement.i (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:28:4861)
+    at Object.ik (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:77:54331)
+    at ij (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:77:55284)
+    at ep (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:166948)
+    at SX (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:160942)
+    at Sz (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:160557)
+    at Sj (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:160323)
+    at SI (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:156868)
+    at SS (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:89:156422)
+    at V (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:113:1842)
+    at B (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:113:1559)
+    at MessagePort.eo (https://www.figma.com/webpack-artifacts/assets/code_components_preview_iframe-1e875785bc0d6c5a.min.js.br:113:3433)
+❌ React Router caught the following error during render Error: useAppContext must be used within AppProvider
