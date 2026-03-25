@@ -72,28 +72,45 @@ export async function clearAIKey(): Promise<AISettings> {
 
 // ─── Agent Preferences ──────────────────────────────────
 
+const PREFS_LS_KEY = 'appPrefs';
+
 export async function getPreferences(): Promise<Record<string, any>> {
-  const res = await fetch(`${BASE_URL}/preferences`, { headers: headers() });
-  const json = await res.json();
-  if (!res.ok) {
-    console.error('Failed to fetch preferences:', json);
-    throw new Error(json.error || 'Failed to load preferences');
-  }
-  return json;
+  // Try backend first
+  try {
+    const res = await fetch(`${BASE_URL}/preferences`, { headers: headers() });
+    const json = await res.json();
+    if (res.ok) {
+      // Sync to localStorage as cache
+      try { localStorage.setItem(PREFS_LS_KEY, JSON.stringify(json)); } catch {}
+      return json;
+    }
+  } catch {}
+  // Fallback: localStorage
+  try {
+    const stored = localStorage.getItem(PREFS_LS_KEY);
+    return stored ? JSON.parse(stored) : {};
+  } catch { return {}; }
 }
 
 export async function savePreferences(prefs: Record<string, any>): Promise<{ saved: string[] }> {
-  const res = await fetch(`${BASE_URL}/preferences`, {
-    method: 'PUT',
-    headers: headers(),
-    body: JSON.stringify(prefs),
-  });
-  const json = await res.json();
-  if (!res.ok) {
-    console.error('Failed to save preferences:', json);
-    throw new Error(json.error || 'Failed to save preferences');
+  // Always persist to localStorage immediately
+  try { localStorage.setItem(PREFS_LS_KEY, JSON.stringify(prefs)); } catch {}
+  // Best-effort backend sync
+  try {
+    const res = await fetch(`${BASE_URL}/preferences`, {
+      method: 'PUT',
+      headers: headers(),
+      body: JSON.stringify(prefs),
+    });
+    const json = await res.json();
+    if (!res.ok) {
+      console.error('Backend preference save failed, using localStorage:', json);
+    }
+    return json;
+  } catch (err) {
+    console.error('Backend preference sync failed, data saved to localStorage:', err);
+    return { saved: Object.keys(prefs) };
   }
-  return json;
 }
 
 // ─── AI Proxy Calls ─────────────────────────────────────
