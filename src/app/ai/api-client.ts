@@ -78,51 +78,38 @@ export async function clearAIKey(): Promise<AISettings> {
 
 // ─── Agent Preferences ──────────────────────────────────
 
-// Supabase client for direct persistence
+export async function getPreferences(): Promise<Record<string, any>> {
+  const res = await fetch(`${BASE_URL}/preferences`, { headers: headers() });
+  const json = await res.json();
+  if (!res.ok) {
+    console.error('Failed to fetch preferences:', json);
+    throw new Error(json.error || 'Failed to load preferences');
+  }
+  return json;
+}
+
+export async function savePreferences(prefs: Record<string, any>): Promise<{ saved: string[] }> {
+  const res = await fetch(`${BASE_URL}/preferences`, {
+    method: 'PUT',
+    headers: headers(),
+    body: JSON.stringify(prefs),
+  });
+  const json = await res.json();
+  if (!res.ok) {
+    console.error('Failed to save preferences:', json);
+    throw new Error(json.error || 'Failed to save preferences');
+  }
+  return json;
+}
+
+// Supabase client for direct table access (properties)
 let supabaseClient: any = null;
 const getSupabaseClient = async () => {
   if (supabaseClient) return supabaseClient;
   const { createClient } = await import('@supabase/supabase-js');
-  supabaseClient = createClient(
-    `https://${projectId}.supabase.co`,
-    publicAnonKey
-  );
+  supabaseClient = createClient(`https://${projectId}.supabase.co`, publicAnonKey);
   return supabaseClient;
 };
-
-export async function getPreferences(): Promise<Record<string, any>> {
-  try {
-    const client = await getSupabaseClient();
-    const { data, error } = await client
-      .from('preferences')
-      .select('*')
-      .limit(1)
-      .single();
-
-    if (error && error.code !== 'PGRST116') throw error; // PGRST116 = no rows
-    return data?.data || {};
-  } catch (err: any) {
-    console.error('Failed to fetch preferences:', err);
-    return {};
-  }
-}
-
-export async function savePreferences(prefs: Record<string, any>): Promise<{ saved: string[] }> {
-  try {
-    const client = await getSupabaseClient();
-
-    // Try upsert: insert or update
-    const { error } = await client
-      .from('preferences')
-      .upsert({ id: 1, data: prefs }, { onConflict: 'id' });
-
-    if (error) throw error;
-    return { saved: Object.keys(prefs) };
-  } catch (err: any) {
-    console.error('Failed to save preferences:', err);
-    throw new Error(err.message || 'Failed to save preferences');
-  }
-}
 
 // ─── Properties ─────────────────────────────────────────
 
