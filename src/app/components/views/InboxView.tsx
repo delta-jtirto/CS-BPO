@@ -8,7 +8,7 @@ import {
   Plus, X, Trash2, Copy, FileEdit, Info, ShieldAlert, ArrowRightLeft,
   Loader2, Square, PauseCircle, SkipForward, Zap, AlertCircle,
   ArrowLeft, PanelRightOpen, PanelRightClose, PanelLeftOpen, PanelLeftClose, ChevronsLeft, ChevronsRight,
-  ArrowDown, MessageSquare as MessageSquareIcon
+  ArrowDown, MessageSquare as MessageSquareIcon, MoreVertical
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { toast } from 'sonner';
@@ -69,6 +69,14 @@ export function InboxView() {
   const [showSmartReply, setShowSmartReply] = useState(false);
   const [summaryCollapsed, setSummaryCollapsed] = useState(true);
   const [viewedTickets, setViewedTickets] = useState<Record<string, number>>({});
+  const [cardMenuOpen, setCardMenuOpen] = useState<string | null>(null);
+  const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
+  useEffect(() => {
+    if (!cardMenuOpen && !headerMenuOpen) return;
+    const close = () => { setCardMenuOpen(null); setHeaderMenuOpen(false); };
+    const t = setTimeout(() => document.addEventListener('click', close), 0);
+    return () => { clearTimeout(t); document.removeEventListener('click', close); };
+  }, [cardMenuOpen, headerMenuOpen]);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const isMobile = useIsMobile();
   // Mobile panel: 'list' = inbox sidebar, 'thread' = chat, 'details' = right panel
@@ -429,6 +437,11 @@ export function InboxView() {
       if (activeDraft && replyText.trim() === activeDraft.trim()) {
         addSystemMessage(activeTicket.id, `Draft sent as-is — Agent sent the AI-drafted reply without edits.`);
       }
+      // Auto-clear Follow-up badge when agent replies after a partial status
+      const lastSys = [...activeTicket.messages].reverse().find(m => m.sender === 'system');
+      if (lastSys && parseThreadStatus(lastSys.text) === 'partial') {
+        addSystemMessage(activeTicket.id, `AI handled — Agent followed up.`);
+      }
       addMessageToTicket(activeTicket.id, replyText.trim());
       setReplyText('');
       setShowSmartReply(false);
@@ -562,16 +575,6 @@ export function InboxView() {
                   <ChevronsLeft size={12} />
                 </button>
               )}
-              <button
-                onClick={() => {
-                  resetToDemo();
-                  toast.success('Reset to demo state', { description: 'All conversations restored to original data.' });
-                }}
-                className="text-[10px] font-medium text-slate-400 hover:text-red-500 transition-colors"
-                title="Reset all conversations to demo data"
-              >
-                Reset
-              </button>
               <button
                 onClick={() => setShowNewThread(prev => !prev)}
                 className={`w-6 h-6 rounded-md flex items-center justify-center transition-colors ${
@@ -743,11 +746,10 @@ export function InboxView() {
                       }`
                 }`}
               >
-                {/* Chevron revealed on hover */}
-                <ChevronRight size={14} className="absolute right-1 top-1/2 -translate-y-1/2 text-slate-300 translate-x-4 group-hover:translate-x-0 transition-transform duration-150" />
+
 
                 {/* Avatar + Content shift together on hover */}
-                <div className="flex gap-2.5 flex-1 min-w-0 transition-transform duration-150 group-hover:-translate-x-1">
+                <div className="flex gap-2.5 flex-1 min-w-0">
 
                 <div className={`w-9 h-9 rounded-full flex items-center justify-center text-white text-sm font-bold shrink-0 mt-0.5 ${
                   ticket.status === 'urgent' ? 'bg-red-400' : ticket.status === 'warning' ? 'bg-amber-400' : 'bg-slate-300'
@@ -763,18 +765,9 @@ export function InboxView() {
                       {unread && !isActive && <span className="w-1.5 h-1.5 bg-indigo-500 rounded-full shrink-0" />}
                       <span className={`text-sm truncate ${unread && !isActive ? 'font-bold text-slate-900' : 'font-semibold text-slate-800'}`}>{ticket.guestName}</span>
                     </div>
-                    <div className="flex items-center gap-1 shrink-0">
-                      <button
-                        onClick={(e) => { e.stopPropagation(); setShowDeleteConfirm(true); navigate(`/inbox/${ticket.id}`); }}
-                        className="w-5 h-5 rounded flex items-center justify-center text-slate-300 hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100"
-                        title="Delete thread"
-                      >
-                        <Trash2 size={11} />
-                      </button>
-                      <span className={`text-[11px] font-semibold tabular-nums ${
-                        ticket.status === 'urgent' ? 'text-red-500' : ticket.status === 'warning' ? 'text-amber-500' : 'text-slate-400'
-                      }`}>{ticket.sla}</span>
-                    </div>
+                    <span className={`text-[11px] font-semibold tabular-nums pr-5 ${
+                      ticket.status === 'urgent' ? 'text-red-500' : ticket.status === 'warning' ? 'text-amber-500' : 'text-slate-400'
+                    }`}>{ticket.sla}</span>
                   </div>
 
                   {/* Row 2: badges inline */}
@@ -844,14 +837,34 @@ export function InboxView() {
                     <span className="text-[10px] text-slate-400 truncate ml-0.5">{ticket.property} · {timeSinceGuest}</span>
                   </div>
 
-                  {/* Row 3: preview */}
-                  <p className={`text-[11px] leading-snug line-clamp-1 ${unread && !isActive ? 'text-slate-600' : 'text-slate-400'}`}>
-                    {previewSender && (
-                      <span className={`font-medium ${
-                        lastNonSystemMsg?.sender === 'bot' ? 'text-violet-400' : 'text-slate-400'
-                      }`}>{previewSender}: </span>
-                    )}{previewText}
-                  </p>
+                  {/* Row 3: preview + chevron on hover */}
+                  <div className="flex items-center gap-1">
+                    <p className={`text-[11px] leading-snug line-clamp-1 flex-1 min-w-0 ${unread && !isActive ? 'text-slate-600' : 'text-slate-400'}`}>
+                      {previewSender && (
+                        <span className={`font-medium ${
+                          lastNonSystemMsg?.sender === 'bot' ? 'text-violet-400' : 'text-slate-400'
+                        }`}>{previewSender}: </span>
+                      )}{previewText}
+                    </p>
+                    <div className="relative shrink-0 w-0 group-hover:w-5 overflow-visible transition-all duration-150">
+                      <button
+                        onClick={(e) => { e.stopPropagation(); setCardMenuOpen(cardMenuOpen === ticket.id ? null : ticket.id); }}
+                        className="w-5 h-5 flex items-center justify-center rounded text-slate-300 hover:text-slate-500 hover:bg-slate-100 transition-colors opacity-0 group-hover:opacity-100 duration-150"
+                      >
+                        <ChevronDown size={13} />
+                      </button>
+                      {cardMenuOpen === ticket.id && (
+                        <div className="absolute right-0 bottom-7 bg-white border border-slate-200 rounded-xl shadow-lg py-1 w-40 z-50">
+                          <button
+                            onClick={(e) => { e.stopPropagation(); setCardMenuOpen(null); setShowDeleteConfirm(true); navigate(`/inbox/${ticket.id}`); }}
+                            className="w-full flex items-center gap-2 px-3 py-2 text-sm text-red-600 hover:bg-red-50 transition-colors"
+                          >
+                            <Trash2 size={13} /> Delete thread
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
                   {/* AI processing indicator */}
                   <AnimatePresence>
                     {isProcessing && (
@@ -904,141 +917,136 @@ export function InboxView() {
 
       {/* Chat Pane */}
       <div className={`${isMobile ? (mobilePanel === 'thread' ? 'flex w-full' : 'hidden') : 'flex flex-1'} flex-col bg-slate-50 min-w-0`}>
-        {/* Header — compact two-row layout */}
-        <div className="bg-white border-b border-slate-200 px-3 md:px-5 py-2 flex items-center justify-between shrink-0 shadow-sm z-10 gap-2 min-h-[52px]">
-          <div className="flex items-center gap-2 min-w-0 flex-1">
-            {/* Mobile back button */}
-            {isMobile && (
-              <button onClick={() => { setMobilePanel('list'); navigate('/inbox'); }} className="shrink-0 w-8 h-8 rounded-lg flex items-center justify-center text-slate-400 hover:bg-slate-100 hover:text-slate-600 transition-colors">
-                <ArrowLeft size={18} />
-              </button>
-            )}
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-1.5 text-[9px] md:text-[10px] font-bold text-slate-400 uppercase tracking-wider truncate">
-                <span className="truncate max-w-[120px]">{activeTicket.host.name}</span>
-                <ChevronRight size={8} className="shrink-0 text-slate-300"/>
-                <span className="truncate max-w-[100px]">{activeTicket.property}</span>
-                {!isMobile && (<>
-                  <ChevronRight size={8} className="shrink-0 text-slate-300"/>
-                  <span className="truncate max-w-[80px]">{activeTicket.room}</span>
-                </>)}
-              </div>
-              <div className="flex items-center gap-2 mt-0.5">
-                <h1 className="text-base md:text-lg font-bold truncate text-slate-800">{activeTicket.guestName}</h1>
-                <span className="bg-slate-100 text-slate-500 text-[9px] px-1.5 py-0.5 rounded border border-slate-200 flex items-center gap-1 shrink-0">
-                  <activeTicket.channelIcon size={9}/> {activeTicket.channel}
-                </span>
-              </div>
+        {/* Header */}
+        <div className="bg-white border-b border-slate-200 px-3 py-2 flex items-center gap-2 shrink-0 shadow-sm z-10 min-h-[52px]">
+          {/* Mobile back */}
+          {isMobile && (
+            <button onClick={() => { setMobilePanel('list'); navigate('/inbox'); }} className="shrink-0 w-8 h-8 rounded-lg flex items-center justify-center text-slate-400 hover:bg-slate-100 transition-colors">
+              <ArrowLeft size={18} />
+            </button>
+          )}
+
+          {/* Guest info — takes remaining space */}
+          <div className="min-w-0 flex-1">
+            <div className="text-[9px] font-semibold text-slate-400 uppercase tracking-wider truncate">
+              {activeTicket.property}
             </div>
+            <h1 className="text-sm font-bold truncate text-slate-800 leading-tight">{activeTicket.guestName}</h1>
           </div>
-          <div className="flex items-center gap-1 md:gap-1.5 shrink-0">
-            {/* ① AI toggle (editable) + ② Thread status (read-only) */}
-            {activeTicket && (<>
-              {/* AI on/off toggle (disabled when host auto-reply is off) */}
-              {(() => {
-                const hostAutoReply = hostSettings.find(s => s.hostId === activeTicket.host.id)?.autoReply ?? false;
-                const aiOff = !hostAutoReply || activeIsPaused;
-                const canToggle = hostAutoReply;
-                return (
-                  <button
-                    onClick={() => {
-                      if (!hostAutoReply) {
-                        updateHostSettings(activeTicket.host.id, { autoReply: true });
-                        if (activeIsPaused) toggleAutoReplyPause(activeTicket.id);
-                        if (activeIsHandedOff) setAutoReplyHandedOff(activeTicket.id, false);
-                        toast.success('Auto-reply enabled', { description: `AI is now active for ${activeTicket.host.name}.`, duration: 3000 });
-                      } else if (activeIsPaused || activeIsHandedOff) {
-                        if (activeIsPaused) toggleAutoReplyPause(activeTicket.id);
-                        if (activeIsHandedOff) setAutoReplyHandedOff(activeTicket.id, false);
-                        toast.success('AI enabled', { description: `Auto-reply active for ${activeTicket.guestName}.`, duration: 3000 });
-                      } else {
-                        toggleAutoReplyPause(activeTicket.id);
-                        toast('AI paused', { description: `You're handling ${activeTicket.guestName} manually.`, duration: 3000 });
-                      }
-                    }}
-                    className={`flex items-center gap-1 text-[9px] md:text-[10px] font-bold px-2 py-1 rounded-full border transition-colors whitespace-nowrap cursor-pointer ${
-                      !hostAutoReply
-                        ? 'bg-slate-100 text-slate-500 border-slate-200 hover:bg-slate-50 hover:text-slate-700 hover:border-slate-300'
-                        : aiOff
-                        ? 'bg-slate-100 text-slate-400 border-slate-200 hover:bg-violet-50 hover:text-violet-600 hover:border-violet-300'
-                        : 'bg-violet-50 text-violet-600 border-violet-200 hover:bg-slate-100 hover:text-slate-400 hover:border-slate-200'
-                    }`}
-                    title={!hostAutoReply ? 'Click to enable AI' : aiOff ? 'Click to enable AI' : 'Click to pause AI'}
-                  >
-                    {aiOff ? <><PauseCircle size={10} /> AI Off</> : <><Zap size={10} /> AI On</>}
-                  </button>
-                );
-              })()}
-              {/* Thread status (read-only) — hide if resolved */}
-              {(activeSystemStatus || activeIsHandedOff) && (() => {
-                // Override: if handed off, always show "Your Turn" even if latest msg is "AI Handled"
-                const eff = activeIsHandedOff ? 'handed-off' : activeSystemStatus;
-                // Hide status badge for resolved tickets
-                if (eff === 'ai-handled') return null;
-                const statusLabel = eff === 'handed-off' ? 'Your Turn'
-                  : eff === 'partial' ? 'Follow-up'
-                  : eff === 'safety' ? 'Safety Alert'
-                  : null;
-                if (!statusLabel) return null;
-                const StatusIcon = eff === 'handed-off' ? ArrowRightLeft
-                  : eff === 'partial' ? AlertCircle
-                  : ShieldAlert;
-                const statusColor = eff === 'safety' ? 'bg-red-50 text-red-600 border-red-200'
-                  : eff === 'partial' ? 'bg-sky-50 text-sky-600 border-sky-200'
-                  : 'bg-amber-50 text-amber-600 border-amber-200';
-                return (
-                  <span className={`hidden md:flex items-center gap-1 text-[9px] md:text-[10px] font-bold px-2 py-1 rounded-full border whitespace-nowrap ${statusColor}`}>
-                    <StatusIcon size={10} /> {statusLabel}
-                  </span>
-                );
-              })()}
-            </>)}
-            {/* Mobile: details toggle */}
-            {isMobile && (
-              <button
-                onClick={() => setShowMobileDetails(prev => !prev)}
-                className="w-8 h-8 rounded-lg flex items-center justify-center text-slate-400 hover:bg-slate-100 hover:text-slate-600 transition-colors"
-                title="Thread details"
-              >
-                {showMobileDetails ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}
-              </button>
-            )}
-            {/* Desktop: right panel toggle (when collapsed) */}
-            {!isMobile && rightCollapsed && (
+
+          {/* Actions — always visible */}
+          {activeTicket && (() => {
+            const hostAutoReply = hostSettings.find(s => s.hostId === activeTicket.host.id)?.autoReply ?? false;
+            const aiOff = !hostAutoReply || activeIsPaused;
+            return (
               <button
                 onClick={() => {
-                  if (shouldAutoCollapseRight) {
-                    setRightOverlayOpen(prev => !prev);
+                  if (!hostAutoReply) {
+                    updateHostSettings(activeTicket.host.id, { autoReply: true });
+                    if (activeIsPaused) toggleAutoReplyPause(activeTicket.id);
+                    if (activeIsHandedOff) setAutoReplyHandedOff(activeTicket.id, false);
+                    toast.success('Auto-reply enabled', { description: `AI is now active for ${activeTicket.host.name}.`, duration: 3000 });
+                  } else if (activeIsPaused || activeIsHandedOff) {
+                    if (activeIsPaused) toggleAutoReplyPause(activeTicket.id);
+                    if (activeIsHandedOff) setAutoReplyHandedOff(activeTicket.id, false);
+                    toast.success('AI enabled', { description: `Auto-reply active for ${activeTicket.guestName}.`, duration: 3000 });
                   } else {
-                    setRightCollapsed(false);
+                    toggleAutoReplyPause(activeTicket.id);
+                    toast('AI paused', { description: `You're handling ${activeTicket.guestName} manually.`, duration: 3000 });
                   }
                 }}
-                className={`w-8 h-8 rounded-lg flex items-center justify-center transition-colors ${
-                  rightOverlayOpen
-                    ? 'text-indigo-600 bg-indigo-50'
-                    : 'text-slate-400 hover:bg-slate-100 hover:text-slate-600'
+                className={`flex items-center gap-1 text-[9px] font-bold px-2 py-1 rounded-full border transition-colors whitespace-nowrap cursor-pointer shrink-0 ${
+                  aiOff
+                    ? 'bg-slate-100 text-slate-400 border-slate-200 hover:bg-violet-50 hover:text-violet-600 hover:border-violet-300'
+                    : 'bg-violet-50 text-violet-600 border-violet-200 hover:bg-slate-100 hover:text-slate-400 hover:border-slate-200'
                 }`}
-                title={rightOverlayOpen ? 'Close context panel' : 'Open context panel'}
               >
-                {rightOverlayOpen ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}
+                {aiOff ? <><PauseCircle size={9} /> AI Off</> : <><Zap size={9} /> AI On</>}
               </button>
-            )}
-            {!isMobile && !rightCollapsed && (
-              <button
-                onClick={() => { setRightCollapsed(true); setRightOverlayOpen(false); }}
-                className="w-8 h-8 rounded-lg flex items-center justify-center text-slate-400 hover:bg-slate-100 hover:text-slate-600 transition-colors"
-                title="Collapse context panel"
-              >
-                <ChevronsRight size={14} />
-              </button>
-            )}
+            );
+          })()}
+
+          {/* Status badge — hidden on very narrow */}
+          {(activeSystemStatus || activeIsHandedOff) && (() => {
+            const eff = activeIsHandedOff ? 'handed-off' : activeSystemStatus;
+            if (eff === 'ai-handled') return null;
+            const statusLabel = eff === 'handed-off' ? 'Your Turn' : eff === 'partial' ? 'Follow-up' : eff === 'safety' ? 'Safety Alert' : null;
+            if (!statusLabel) return null;
+            const StatusIcon = eff === 'handed-off' ? ArrowRightLeft : eff === 'partial' ? AlertCircle : ShieldAlert;
+            const statusColor = eff === 'safety' ? 'bg-red-50 text-red-500 border-red-200' : eff === 'partial' ? 'bg-sky-50 text-sky-500 border-sky-200' : 'bg-amber-50 text-amber-500 border-amber-200';
+            return (
+              <span className={`hidden sm:flex items-center gap-1 text-[9px] font-bold px-2 py-1 rounded-full border whitespace-nowrap shrink-0 ${statusColor}`}>
+                <StatusIcon size={9} /> {statusLabel}
+              </span>
+            );
+          })()}
+
+          {/* Resolve */}
+          <button
+            onClick={() => setShowResolveConfirm(true)}
+            className="px-2.5 py-1.5 text-xs font-semibold bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 flex items-center gap-1 shadow-sm transition-colors active:scale-95 shrink-0"
+            title="Ctrl+Shift+R"
+          >
+            <CheckCircle size={12} /> Resolve
+          </button>
+
+          {/* ⋮ More menu */}
+          <div className="relative shrink-0">
             <button
-              onClick={() => setShowResolveConfirm(true)}
-              className={`${isMobile ? 'px-2.5 py-1.5 text-xs' : 'px-3 py-1.5 text-sm'} font-medium bg-emerald-600 text-white rounded hover:bg-emerald-700 flex items-center gap-1.5 shadow-sm transition-colors active:scale-95`}
-              title="Ctrl+Shift+R"
+              onClick={() => setHeaderMenuOpen(p => !p)}
+              className="w-8 h-8 rounded-lg flex items-center justify-center text-slate-400 hover:bg-slate-100 hover:text-slate-600 transition-colors"
             >
-              <CheckCircle size={isMobile ? 12 : 14} /> Resolve
+              <MoreVertical size={15} />
             </button>
+            {headerMenuOpen && (
+              <div className="absolute right-0 top-9 bg-white border border-slate-200 rounded-xl shadow-lg py-1 w-52 z-50" onClick={e => e.stopPropagation()}>
+                {/* Status badge on mobile */}
+                {(activeSystemStatus || activeIsHandedOff) && (() => {
+                  const eff = activeIsHandedOff ? 'handed-off' : activeSystemStatus;
+                  if (!eff || eff === 'ai-handled') return null;
+                  const statusLabel = eff === 'handed-off' ? 'Your Turn' : eff === 'partial' ? 'Follow-up' : eff === 'safety' ? 'Safety Alert' : null;
+                  if (!statusLabel) return null;
+                  const StatusIcon = eff === 'handed-off' ? ArrowRightLeft : eff === 'partial' ? AlertCircle : ShieldAlert;
+                  return (
+                    <div className="sm:hidden px-3 py-2 flex items-center gap-2 text-sm text-slate-600 border-b border-slate-100">
+                      <StatusIcon size={13} /> {statusLabel}
+                    </div>
+                  );
+                })()}
+                {/* Channel */}
+                <div className="px-3 py-2 flex items-center gap-2 text-xs text-slate-500 border-b border-slate-100">
+                  <activeTicket.channelIcon size={12} /> {activeTicket.channel}
+                  <span className="text-slate-300 mx-1">·</span>
+                  <span className="truncate text-slate-400">{activeTicket.host.name}</span>
+                </div>
+                {/* Panel toggle */}
+                {!isMobile && (
+                  <button
+                    onClick={() => {
+                      setHeaderMenuOpen(false);
+                      if (rightCollapsed) {
+                        if (shouldAutoCollapseRight) setRightOverlayOpen(p => !p);
+                        else setRightCollapsed(false);
+                      } else {
+                        setRightCollapsed(true); setRightOverlayOpen(false);
+                      }
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50 transition-colors"
+                  >
+                    {rightCollapsed ? <PanelRightOpen size={13} /> : <PanelRightClose size={13} />}
+                    {rightCollapsed ? 'Show context panel' : 'Hide context panel'}
+                  </button>
+                )}
+                {isMobile && (
+                  <button
+                    onClick={() => { setHeaderMenuOpen(false); setShowMobileDetails(p => !p); }}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50 transition-colors"
+                  >
+                    <PanelRightOpen size={13} /> {showMobileDetails ? 'Hide details' : 'Show details'}
+                  </button>
+                )}
+              </div>
+            )}
           </div>
         </div>
 

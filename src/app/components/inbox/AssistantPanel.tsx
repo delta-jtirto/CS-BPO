@@ -3,7 +3,7 @@ import {
   Sparkles, AlertTriangle, ChevronRight, ChevronDown,
   Zap, Shield, MessageSquare,
   BookOpen, ArrowRight, Loader2, Pencil,
-  Bot, ArrowDown, Copy, RotateCcw, Trash2, Send, PawPrint
+  Bot, ArrowDown, Copy, RotateCcw, Trash2, Send, PawPrint, RefreshCw
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useAppContext } from '../../context/AppContext';
@@ -243,6 +243,25 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB }: Assis
   const [aiInquiries, setAiInquiries] = useState<DetectedInquiry[] | null>(null);
   const llmClassifyRef = useRef<string | null>(null); // track ticket.id to avoid duplicate calls
 
+  const handleRefreshInquiries = () => {
+    const guestMessages = ticket.messages.filter(m => m.sender === 'guest').map(m => m.text);
+    setAiInquiries(null);
+    setIsAnalyzing(true);
+    classifyWithLLM(
+      guestMessages,
+      ticket.property,
+      ticket.host.name,
+      (opts) => classifyInquiriesProxy({ ...opts, model: aiModel }),
+      propContext,
+    ).then(result => {
+      setAiInquiries(result.length > 0 ? result : [fallbackGeneralInquiry(ticket)]);
+    }).catch(() => {
+      setAiInquiries(filterGreetingNoise(detectInquiries(guestMessages, ticket.tags, ticket.summary)));
+    }).finally(() => {
+      setIsAnalyzing(false);
+    });
+  };
+
   useEffect(() => {
     const guestMessages = ticket.messages
       .filter(m => m.sender === 'guest')
@@ -285,7 +304,23 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB }: Assis
   }, [ticket.id, ticket, hasApiKey, aiModel, propContext]);
 
   // All inquiries come from LLM (or regex fallback when no API key)
-  const inquiries = filterGreetingNoise(aiInquiries ?? []);
+  // Deduplicate: merge same-type inquiries, combining their details
+  const inquiries = (() => {
+    const filtered = filterGreetingNoise(aiInquiries ?? []);
+    const seen = new Map<string, typeof filtered[0]>();
+    for (const inq of filtered) {
+      if (seen.has(inq.type)) {
+        const existing = seen.get(inq.type)!;
+        // Merge detail if different
+        if (!existing.detail.includes(inq.detail)) {
+          existing.detail = existing.detail + '; ' + inq.detail;
+        }
+      } else {
+        seen.set(inq.type, { ...inq });
+      }
+    }
+    return Array.from(seen.values());
+  })();
 
   // Score knowledge base per inquiry
   const kbMatchesByInquiry = useMemo(() => {
@@ -707,6 +742,13 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB }: Assis
           <div className="flex items-center gap-2 mb-3">
             <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">What the guest needs</span>
             <span className="text-[10px] bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded-full font-bold tabular-nums">{inquiries.length}</span>
+            <button
+              onClick={handleRefreshInquiries}
+              className="text-slate-300 hover:text-slate-500 transition-colors"
+              title="Re-analyse guest needs"
+            >
+              <RefreshCw size={11} className={isAnalyzing ? 'animate-spin' : ''} />
+            </button>
             <span className={`ml-auto text-[8px] font-semibold px-1.5 py-0.5 rounded-full border ${
               hasApiKey
                 ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
