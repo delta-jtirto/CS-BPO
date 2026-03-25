@@ -115,7 +115,7 @@ Answer the agent's question concisely:`;
 
 export const CLASSIFY_INQUIRY_SYSTEM = `You are a hospitality message classifier. Given guest messages from a short-term rental / hotel conversation, identify exactly what the guest is asking about.
 
-Return ONLY a valid JSON array of objects. No markdown, no code fences, no explanation — just the JSON.
+Return ONLY a valid JSON array of objects. No markdown, no code fences, no backticks, no explanation — just the raw JSON array starting with [ and ending with ].
 
 Each object has:
 - "type": a short lowercase slug describing the topic (e.g. "maintenance", "wifi", "checkout", "checkin", "noise", "pet", "food", "nearby", "visitors", "billing", "amenities", "directions"). Choose whatever slug best describes what the guest is actually asking — do NOT force a pet/animal slug for human visitor questions.

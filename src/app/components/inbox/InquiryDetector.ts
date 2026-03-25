@@ -419,7 +419,7 @@ export async function classifyWithLLM(
 ): Promise<DetectedInquiry[]> {
   // Cache key = prompt version + guest messages + first 100 chars of KB
   // Bump PROMPT_V when prompt format changes to bust stale cache
-  const PROMPT_V = 'v6';
+  const PROMPT_V = 'v7';
   const cacheKey = (PROMPT_V + '|' + guestMessages.join('|') + '|' + (kbContext ?? '').slice(0, 100)).slice(0, 300);
   const cached = _classifyCache.get(cacheKey);
   if (cached) return cached;
@@ -440,13 +440,20 @@ export async function classifyWithLLM(
       userPrompt,
     });
 
-    // Parse JSON from the LLM response — strip markdown fences if present
+    // Parse JSON from the LLM response — robustly extract the JSON array
     let jsonText = result.text.trim();
+    // Strip markdown code fences (```json ... ```)
     if (jsonText.startsWith('```')) {
-      jsonText = jsonText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+      jsonText = jsonText.replace(/^```[a-z]*\s*/i, '').replace(/\s*```[\s\S]*$/, '').trim();
+    }
+    // Belt-and-suspenders: find the outermost [ ... ] array even if there's preamble/postamble
+    const arrayStart = jsonText.indexOf('[');
+    const arrayEnd = jsonText.lastIndexOf(']');
+    if (arrayStart !== -1 && arrayEnd > arrayStart) {
+      jsonText = jsonText.slice(arrayStart, arrayEnd + 1);
     }
     // Fix unescaped newlines inside JSON string values (model sometimes outputs real newlines)
-    jsonText = jsonText.replace(/"(?:[^"\\]|\\.)*"/gs, m =>
+    jsonText = jsonText.replace(/"(?:[^"\\]|\\.)*"/gs, (m) =>
       m.replace(/\n/g, '\\n').replace(/\r/g, '')
     );
 
