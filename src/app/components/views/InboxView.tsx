@@ -733,17 +733,22 @@ export function InboxView() {
               <div
                 key={ticket.id}
                 onClick={() => { navigate(`/inbox/${ticket.id}`); setReplyText(''); if (isMobile) setMobilePanel('thread'); if (leftOverlayOpen) setLeftOverlayOpen(false); }}
-                className={`group px-3 py-3 border-b border-slate-100 cursor-pointer transition-all duration-150 relative flex gap-2.5 ${
+                className={`group px-3 py-3 border-b border-slate-100 cursor-pointer relative overflow-hidden flex gap-2.5 ${
                   isActive
                     ? 'bg-indigo-50/80 border-l-[3px] border-l-indigo-500'
-                    : `border-l-[3px] hover:bg-slate-50 hover:translate-x-0.5 ${
+                    : `border-l-[3px] hover:bg-slate-50 ${
                         ticket.status === 'urgent' ? 'border-l-red-400'
                         : ticket.status === 'warning' ? 'border-l-amber-400'
                         : 'border-l-transparent'
                       }`
                 }`}
               >
-                {/* Avatar */}
+                {/* Chevron revealed on hover */}
+                <ChevronRight size={14} className="absolute right-1 top-1/2 -translate-y-1/2 text-slate-300 translate-x-4 group-hover:translate-x-0 transition-transform duration-150" />
+
+                {/* Avatar + Content shift together on hover */}
+                <div className="flex gap-2.5 flex-1 min-w-0 transition-transform duration-150 group-hover:-translate-x-1">
+
                 <div className={`w-9 h-9 rounded-full flex items-center justify-center text-white text-sm font-bold shrink-0 mt-0.5 ${
                   ticket.status === 'urgent' ? 'bg-red-400' : ticket.status === 'warning' ? 'bg-amber-400' : 'bg-slate-300'
                 }`}>
@@ -847,37 +852,38 @@ export function InboxView() {
                       }`}>{previewSender}: </span>
                     )}{previewText}
                   </p>
-                </div>
-                {/* AI processing indicator */}
-                <AnimatePresence>
-                  {isProcessing && (
-                    <motion.div
-                      initial={{ opacity: 0, height: 0 }}
-                      animate={{ opacity: 1, height: 'auto' }}
-                      exit={{ opacity: 0, height: 0 }}
-                      className="mt-1.5 flex items-center gap-1.5 text-[10px] font-bold text-violet-600 uppercase tracking-wider overflow-hidden"
-                    >
-                      <Loader2 size={10} className="animate-spin" />
-                      <span>AI preparing reply…</span>
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          cancelAutoReply(ticket.id);
-                          setShowCancelMenu(true);
-                          navigate(`/inbox/${ticket.id}`);
-                        }}
-                        className="ml-auto text-[9px] px-1.5 py-0.5 rounded bg-violet-100 hover:bg-red-100 hover:text-red-600 transition-colors border border-violet-200"
+                  {/* AI processing indicator */}
+                  <AnimatePresence>
+                    {isProcessing && (
+                      <motion.div
+                        initial={{ opacity: 0, height: 0 }}
+                        animate={{ opacity: 1, height: 'auto' }}
+                        exit={{ opacity: 0, height: 0 }}
+                        className="mt-1.5 flex items-center gap-1.5 text-[10px] font-bold text-violet-600 uppercase tracking-wider overflow-hidden"
                       >
-                        Stop
-                      </button>
-                    </motion.div>
+                        <Loader2 size={10} className="animate-spin" />
+                        <span>AI preparing reply…</span>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            cancelAutoReply(ticket.id);
+                            setShowCancelMenu(true);
+                            navigate(`/inbox/${ticket.id}`);
+                          }}
+                          className="ml-auto text-[9px] px-1.5 py-0.5 rounded bg-violet-100 hover:bg-red-100 hover:text-red-600 transition-colors border border-violet-200"
+                        >
+                          Stop
+                        </button>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                  {draftReplies[ticket.id] && !isProcessing && (
+                    <div className="mt-1 flex items-center gap-1 text-[10px] font-bold text-violet-600 uppercase tracking-wider">
+                      <FileEdit size={10} /> Draft pending
+                    </div>
                   )}
-                </AnimatePresence>
-                {draftReplies[ticket.id] && !isProcessing && (
-                  <div className="mt-1 flex items-center gap-1 text-[10px] font-bold text-violet-600 uppercase tracking-wider">
-                    <FileEdit size={10} /> Draft pending
-                  </div>
-                )}
+                </div>
+                </div>
               </div>
             );
           })}
