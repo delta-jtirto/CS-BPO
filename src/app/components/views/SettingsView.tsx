@@ -128,15 +128,7 @@ function MetricRow({ label, description, children, last }: {
   );
 }
 
-// --- Session-only banner ---
-function SessionBanner() {
-  return (
-    <div className="flex items-center gap-2 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg mb-4 text-xs text-amber-700">
-      <Info size={13} className="shrink-0" />
-      <span><strong>Preview mode</strong> — these settings are saved locally and will reset on page reload.</span>
-    </div>
-  );
-}
+function SessionBanner() { return null; }
 
 // --- Radio Card (consistent pattern for all selection cards) ---
 function RadioCard({ selected, onClick, label, description, icon, compact }: {
