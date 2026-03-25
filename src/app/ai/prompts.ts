@@ -123,7 +123,16 @@ Each object has:
 - "detail": a one-sentence summary of exactly what the guest wants
 - "keywords": array of 3-6 specific search terms to find relevant KB entries. Use concrete nouns only — never generic words like "policy", "rules", "check", "guest", "booking", "property"
 - "needsKbSearch": true if this requires looking up property info. false ONLY for pure greetings/compliments with no question.
-- "context": agent briefing — do NOT restate what the guest wants (already shown). Instead, go straight to the relevant KB facts. Use the KB field title as a header followed by a colon, then list items as bullet points on separate lines starting with "•". Example: "Recommended Restaurants:\n• Fuunji (ramen, 7 min walk)\n• Ichiran Ramen (3 min walk)\n• Omoide Yokocho yakitori (5 min walk)". If multiple KB sections are relevant, repeat the pattern for each. If no relevant KB info, write "No KB info found for this topic." Leave empty string only for pure greetings.
+- "context": REQUIRED FORMAT — strict rules:
+  - KB field names = plain header line ending with ":" (NOT a bullet)
+  - Items under a header = lines starting with "• "
+  - Sub-details of an item = lines starting with "  ◦ " (2 spaces + ◦)
+  - NEVER put a bullet AND a sub-bullet on the same line
+  CORRECT:
+  "Recommended Restaurants:\n• Izakaya Ryuga — Shinshu seafood\n• Sushi Maruho\n• Ramen TenTen\nNearest Hospital:\n• Nagano Chuo Hospital\n  ◦ 8 min walk\n  ◦ Tel: 026-234-3211"
+  WRONG: "• Recommended Restaurants: • Izakaya Ryuga" (never bullet + inline sub-bullet on same line)
+  WRONG: prose sentences without bullets
+  Leave empty string only for pure greetings.
 
 Rules:
 - Return 1-3 inquiries max — guests rarely ask about more than 3 things at once

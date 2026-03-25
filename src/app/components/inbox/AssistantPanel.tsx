@@ -840,18 +840,47 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB }: Assis
                       {/* AI Summary mode — plain text context */}
                       {guestNeedsMode === 'ai-context' && (
                         <div className="px-3 py-2.5 space-y-1">
-                          {inq.context ? (
-                            inq.context.split('\n').map((line, i) => {
-                              if (!line.trim()) return null;
-                              if (line.trimStart().startsWith('•')) return (
-                                <div key={i} className="flex gap-1.5 items-start">
-                                  <span className="text-indigo-400 shrink-0 leading-snug">•</span>
-                                  <span className="text-[11px] text-slate-600 leading-snug">{line.replace(/^•\s*/, '')}</span>
-                                </div>
-                              );
-                              return <p key={i} className="text-[11px] font-semibold text-slate-500 pt-1 first:pt-0">{line}</p>;
-                            })
-                          ) : (
+                          {inq.context ? (() => {
+                            const lines = inq.context.split('\n');
+                            const nodes: React.ReactNode[] = [];
+                            let prevWasBullet = false;
+                            lines.forEach((line, i) => {
+                              if (!line.trim()) { nodes.push(<div key={i} className="h-1" />); prevWasBullet = false; return; }
+                              const trimmed = line.trimStart();
+                              // Sub-bullet ◦
+                              if (trimmed.startsWith('◦')) {
+                                nodes.push(<div key={i} className="flex gap-1.5 items-start ml-4"><span className="text-slate-300 shrink-0 text-[10px]">◦</span><span className="text-[10px] text-slate-500 leading-snug">{trimmed.replace(/^◦\s*/, '')}</span></div>);
+                                prevWasBullet = false; return;
+                              }
+                              // Bullet — check for inline sub-bullets: "• Label: • item1 • item2"
+                              if (trimmed.startsWith('•')) {
+                                const content = trimmed.replace(/^•\s*/, '');
+                                const inlineIdx = content.indexOf(' • ');
+                                if (inlineIdx !== -1) {
+                                  // Split into header + sub-bullets
+                                  const header = content.slice(0, inlineIdx);
+                                  const subs = content.slice(inlineIdx + 3).split(' • ').filter(Boolean);
+                                  nodes.push(<p key={`${i}-h`} className="text-[11px] font-semibold text-slate-500 pt-1">{header}</p>);
+                                  subs.forEach((s, j) => nodes.push(<div key={`${i}-s${j}`} className="flex gap-1.5 items-start ml-4"><span className="text-slate-300 shrink-0 text-[10px]">◦</span><span className="text-[10px] text-slate-500 leading-snug">{s}</span></div>));
+                                } else {
+                                  nodes.push(<div key={i} className="flex gap-1.5 items-start"><span className="text-indigo-400 shrink-0 mt-0.5 leading-none">•</span><span className="text-[11px] text-slate-600 leading-snug">{content}</span></div>);
+                                }
+                                prevWasBullet = true; return;
+                              }
+                              // Section header (ends with colon)
+                              if (trimmed.endsWith(':')) {
+                                nodes.push(<p key={i} className="text-[11px] font-semibold text-slate-500 pt-2 first:pt-0">{trimmed}</p>);
+                                prevWasBullet = false; return;
+                              }
+                              // Plain text after a bullet → render as sub-item
+                              if (prevWasBullet) {
+                                nodes.push(<div key={i} className="flex gap-1.5 items-start ml-4"><span className="text-slate-300 shrink-0 text-[10px]">◦</span><span className="text-[10px] text-slate-500 leading-snug">{trimmed}</span></div>);
+                              } else {
+                                nodes.push(<p key={i} className="text-[11px] text-slate-500 leading-snug">{trimmed}</p>);
+                              }
+                            });
+                            return nodes;
+                          })() : (
                             <p className="text-[10px] text-slate-400 italic">No additional context needed.</p>
                           )}
                         </div>

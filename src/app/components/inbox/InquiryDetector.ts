@@ -417,8 +417,10 @@ export async function classifyWithLLM(
   callAI: (opts: { systemPrompt: string; userPrompt: string }) => Promise<{ text: string }>,
   kbContext?: string,
 ): Promise<DetectedInquiry[]> {
-  // Cache key = guest messages + first 100 chars of KB so stale results are invalidated when KB changes
-  const cacheKey = (guestMessages.join('|') + '|' + (kbContext ?? '').slice(0, 100)).slice(0, 300);
+  // Cache key = prompt version + guest messages + first 100 chars of KB
+  // Bump PROMPT_V when prompt format changes to bust stale cache
+  const PROMPT_V = 'v6';
+  const cacheKey = (PROMPT_V + '|' + guestMessages.join('|') + '|' + (kbContext ?? '').slice(0, 100)).slice(0, 300);
   const cached = _classifyCache.get(cacheKey);
   if (cached) return cached;
 
