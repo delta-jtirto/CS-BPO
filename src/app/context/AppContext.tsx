@@ -314,9 +314,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (typeof prefs.agentName === 'string' && prefs.agentName) setAgentNameRaw(prefs.agentName);
         if (typeof prefs.defaultLanguage === 'string' && prefs.defaultLanguage) setDefaultLanguageRaw(prefs.defaultLanguage);
         if (Array.isArray(prefs.hostSettings)) setHostSettings(prefs.hostSettings);
-        if (Array.isArray(prefs.properties) && prefs.properties.length > 0) setProperties(prefs.properties);
         if (prefs.notificationPrefs && typeof prefs.notificationPrefs === 'object') {
           setNotificationPrefs(prev => ({ ...prev, ...prefs.notificationPrefs }));
+        }
+
+        // Load properties from dedicated table
+        try {
+          const { getProperties } = await getApiClient();
+          const props = await getProperties();
+          if (Array.isArray(props) && props.length > 0) setProperties(props);
+        } catch (err) {
+          console.error('Failed to load properties:', err);
         }
 
         // Load persisted ticket state (messages + resolved IDs)
@@ -731,15 +739,29 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [syncPrefToBackend]);
 
   const addProperty = useCallback((prop: Property) => {
-    setProperties(prev => {
-      const next = [...prev, prop];
-      syncPrefToBackend('properties', next);
-      return next;
-    });
-  }, [syncPrefToBackend]);
+    setProperties(prev => [...prev, prop]);
+    // Best-effort backend save
+    (async () => {
+      try {
+        const { addProperty: addPropApi } = await getApiClient();
+        await addPropApi(prop);
+      } catch (err) {
+        console.error('Failed to persist property to backend:', err);
+      }
+    })();
+  }, []);
 
   const updatePropertyStatus = useCallback((id: string, status: Property['status']) => {
     setProperties(prev => prev.map(p => p.id === id ? { ...p, status } : p));
+    // Best-effort backend save
+    (async () => {
+      try {
+        const { updatePropertyStatus: updatePropApi } = await getApiClient();
+        await updatePropApi(id, status);
+      } catch (err) {
+        console.error('Failed to update property status in backend:', err);
+      }
+    })();
   }, []);
 
   const updatePropertyMeta = useCallback((id: string, updates: Partial<Property>) => {
@@ -747,12 +769,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const deleteProperty = useCallback((id: string) => {
-    setProperties(prev => {
-      const next = prev.filter(p => p.id !== id);
-      syncPrefToBackend('properties', next);
-      return next;
-    });
-  }, [syncPrefToBackend]);
+    setProperties(prev => prev.filter(p => p.id !== id));
+    // Best-effort backend save
+    (async () => {
+      try {
+        const { deleteProperty: deletePropApi } = await getApiClient();
+        await deletePropApi(id);
+      } catch (err) {
+        console.error('Failed to delete property from backend:', err);
+      }
+    })();
+  }, []);
 
   const setOnboardingField = useCallback((propertyId: string, key: string, value: string) => {
     setOnboardingData(prev => ({

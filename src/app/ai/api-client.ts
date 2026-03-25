@@ -124,6 +124,100 @@ export async function savePreferences(prefs: Record<string, any>): Promise<{ sav
   }
 }
 
+// ─── Properties ─────────────────────────────────────────
+
+export interface Property {
+  id: string;
+  name: string;
+  hostId: string;
+  location: string;
+  units: number;
+  status: 'Onboarding' | 'Active' | 'Inactive';
+  portalToken: string;
+  lastSyncedAt: string;
+}
+
+export async function getProperties(): Promise<Property[]> {
+  try {
+    const client = await getSupabaseClient();
+    const { data, error } = await client
+      .from('properties')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    return data?.map((row: any) => ({
+      id: row.id,
+      name: row.name,
+      hostId: row.host_id,
+      location: row.location,
+      units: row.units,
+      status: row.status,
+      portalToken: row.portal_token,
+      lastSyncedAt: row.last_synced_at,
+    })) || [];
+  } catch (err: any) {
+    console.error('Failed to fetch properties:', err);
+    return [];
+  }
+}
+
+export async function addProperty(prop: Property): Promise<Property> {
+  try {
+    const client = await getSupabaseClient();
+    const { data, error } = await client
+      .from('properties')
+      .insert({
+        id: prop.id,
+        name: prop.name,
+        host_id: prop.hostId,
+        location: prop.location,
+        units: prop.units,
+        status: prop.status,
+        portal_token: prop.portalToken,
+        last_synced_at: prop.lastSyncedAt,
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+    return prop;
+  } catch (err: any) {
+    console.error('Failed to add property:', err);
+    throw new Error(err.message || 'Failed to add property');
+  }
+}
+
+export async function deleteProperty(id: string): Promise<void> {
+  try {
+    const client = await getSupabaseClient();
+    const { error } = await client
+      .from('properties')
+      .delete()
+      .eq('id', id);
+
+    if (error) throw error;
+  } catch (err: any) {
+    console.error('Failed to delete property:', err);
+    throw new Error(err.message || 'Failed to delete property');
+  }
+}
+
+export async function updatePropertyStatus(id: string, status: Property['status']): Promise<void> {
+  try {
+    const client = await getSupabaseClient();
+    const { error } = await client
+      .from('properties')
+      .update({ status })
+      .eq('id', id);
+
+    if (error) throw error;
+  } catch (err: any) {
+    console.error('Failed to update property:', err);
+    throw new Error(err.message || 'Failed to update property');
+  }
+}
+
 // ─── AI Proxy Calls ─────────────────────────────────────
 
 interface ProxyCallOptions {
