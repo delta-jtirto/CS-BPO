@@ -9,7 +9,13 @@
       "Bash(./node_modules/.bin/tsc --noEmit)",
       "Bash(node_modules/typescript/bin/tsc --noEmit)",
       "Bash(npm run:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(npx vercel:*)",
+      "Bash(supabase --version)",
+      "Bash(supabase db:*)",
+      "Bash(supabase migration:*)",
+      "Bash(supabase functions:*)",
+      "Bash(vercel --prod)"
     ]
   }
 }
