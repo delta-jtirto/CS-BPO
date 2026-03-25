@@ -1,5 +1,5 @@
 import { detectInquiries, scoreKBForInquiry } from '../inbox/InquiryDetector';
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router';
 import {
   Clock, Send, User,
@@ -8,7 +8,7 @@ import {
   Plus, X, Trash2, Copy, FileEdit, Info, ShieldAlert, ArrowRightLeft,
   Loader2, Square, PauseCircle, SkipForward, Zap, AlertCircle,
   ArrowLeft, PanelRightOpen, PanelRightClose, PanelLeftOpen, PanelLeftClose, ChevronsLeft, ChevronsRight,
-  ArrowDown, MessageSquare as MessageSquareIcon, MoreVertical
+  ArrowDown, MessageSquare as MessageSquareIcon, MoreVertical, Share2, FileText
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { toast } from 'sonner';
@@ -32,10 +32,22 @@ export function InboxView() {
     autoReplyProcessing, cancelAutoReply, autoReplyPausedTickets, toggleAutoReplyPause,
     autoReplyHandedOff, setAutoReplyHandedOff,
     resumeAllAI, hostSettings, notificationPrefs, updateHostSettings,
+    ticketNotes, updateTicketNotes,
   } = useAppContext();
 
   const filteredTickets = activeHostFilter === 'all' ? tickets : tickets.filter(t => t.host.id === activeHostFilter);
   const activeTicket = (ticketId ? filteredTickets.find(t => t.id === ticketId) : filteredTickets[0]) || filteredTickets[0];
+
+  // BPO Step 3 — escalation guidance: map detected inquiry types to host contact strategy
+  const escalationGuidance = useMemo(() => {
+    if (!activeTicket) return null;
+    const guestMsgs = activeTicket.messages.filter(m => m.sender === 'guest').map(m => m.text);
+    const inquiries = detectInquiries(guestMsgs, activeTicket.tags, activeTicket.summary);
+    const types = inquiries.map(i => i.type);
+    if (types.some(t => ['maintenance', 'safety', 'billing'].includes(t))) return 'immediate' as const;
+    if (types.some(t => ['checkin', 'wifi', 'amenities', 'directions'].includes(t))) return 'handle-first' as const;
+    return null;
+  }, [activeTicket]);
 
   // Count paused/handed-off threads for bulk resume button
   const pausedOrHandedOffCount = filteredTickets.filter(t => {
@@ -967,14 +979,25 @@ export function InboxView() {
             );
           })()}
 
-          {/* Resolve */}
+          {/* Notify Host — BPO Step 3, copy LINE WORKS summary */}
           <button
-            onClick={() => setShowResolveConfirm(true)}
-            className="px-2.5 py-1.5 text-xs font-semibold bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 flex items-center gap-1 shadow-sm transition-colors active:scale-95 shrink-0"
-            title="Ctrl+Shift+R"
+            onClick={() => {
+              const summary = [
+                `[Delta Support → Host]`,
+                `Guest: ${activeTicket.guestName} | ${activeTicket.property} · ${activeTicket.room}`,
+                `Issue: ${activeTicket.summary}`,
+                `Initial response sent. Please advise.`,
+                `Booking: ${activeTicket.booking.checkIn} – ${activeTicket.booking.checkOut}`,
+              ].join('\n');
+              navigator.clipboard.writeText(summary).catch(() => {});
+              toast.success('Copied — paste into LINE WORKS', { description: `Summary for ${activeTicket.guestName} ready to share.`, duration: 4000 });
+            }}
+            className="px-2.5 py-1.5 text-xs font-semibold bg-slate-100 text-slate-600 rounded-lg hover:bg-slate-200 flex items-center gap-1 shadow-sm transition-colors active:scale-95 shrink-0"
+            title="Copy host notification summary for LINE WORKS"
           >
-            <CheckCircle size={12} /> Resolve
+            <Share2 size={12} /> Notify Host
           </button>
+
 
           {/* ⋮ More menu */}
           <div className="relative shrink-0">
@@ -1082,6 +1105,22 @@ export function InboxView() {
             </div>
           )}
         </button>
+
+        {/* BPO escalation guidance — Step 3 of Trouble Response Flow */}
+        {escalationGuidance && (
+          <div className={`px-4 py-2 flex items-center gap-2 text-[11px] font-semibold border-b shrink-0 ${
+            escalationGuidance === 'immediate'
+              ? 'bg-red-50 text-red-600 border-red-200'
+              : 'bg-amber-50 text-amber-600 border-amber-200'
+          }`}>
+            {escalationGuidance === 'immediate'
+              ? <ShieldAlert size={12} />
+              : <AlertCircle size={12} />}
+            {escalationGuidance === 'immediate'
+              ? 'Contact host now'
+              : 'Handle first, notify host after'}
+          </div>
+        )}
 
         {/* Chat messages */}
         <div className={`flex-1 overflow-y-auto ${isMobile ? 'p-3 gap-3' : 'p-6 gap-4'} flex flex-col`}>
@@ -1499,6 +1538,20 @@ export function InboxView() {
                   <div><span className="block text-[10px] text-slate-400 mb-0.5">Check-out</span><span className="text-sm font-medium">{activeTicket.booking.checkOut}</span></div>
                   <div><span className="block text-[10px] text-slate-400 mb-0.5">Guests</span><span className="text-sm font-medium flex items-center gap-1"><Users size={12} /> {activeTicket.booking.guests}</span></div>
                   <div><span className="block text-[10px] text-slate-400 mb-0.5">Status</span><span className="text-sm font-medium">{activeTicket.booking.status}</span></div>
+                </div>
+
+                {/* BPO Step 5 — Incident Log / Remarks field */}
+                <div className="mt-4">
+                  <span className="block text-[10px] text-slate-400 mb-1.5 uppercase tracking-wider font-bold flex items-center gap-1">
+                    <FileText size={10} /> Incident Log
+                  </span>
+                  <textarea
+                    value={ticketNotes[activeTicket.id] || ''}
+                    onChange={e => updateTicketNotes(activeTicket.id, e.target.value)}
+                    placeholder="Record issue details, response history, resolution…"
+                    rows={4}
+                    className="w-full text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-lg p-2.5 resize-none focus:outline-none focus:ring-1 focus:ring-indigo-400 focus:border-indigo-400 placeholder:text-slate-300 leading-relaxed"
+                  />
                 </div>
               </div>
 

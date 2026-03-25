@@ -863,7 +863,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB }: Assis
                                   nodes.push(<p key={`${i}-h`} className="text-[11px] font-semibold text-slate-500 pt-1">{header}</p>);
                                   subs.forEach((s, j) => nodes.push(<div key={`${i}-s${j}`} className="flex gap-1.5 items-start ml-4"><span className="text-slate-300 shrink-0 text-[10px]">◦</span><span className="text-[10px] text-slate-500 leading-snug">{s}</span></div>));
                                 } else {
-                                  nodes.push(<div key={i} className="flex gap-1.5 items-start"><span className="text-indigo-400 shrink-0 mt-0.5 leading-none">•</span><span className="text-[11px] text-slate-600 leading-snug">{content}</span></div>);
+                                  nodes.push(<div key={i} className="flex gap-1.5 items-baseline"><span className="text-indigo-400 shrink-0 leading-none">•</span><span className="text-[11px] text-slate-600 leading-snug">{content}</span></div>);
                                 }
                                 prevWasBullet = true; return;
                               }
