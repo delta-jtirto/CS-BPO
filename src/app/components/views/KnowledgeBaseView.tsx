@@ -15,6 +15,7 @@ import { useAppContext } from '../../context/AppContext';
 import { useIsMobile } from '../ui/use-mobile';
 import { ScopeBadge } from '../shared/ScopeBadge';
 import { importDocumentAI } from '../../ai/api-client';
+import { KB_IMPORT_SYSTEM, KB_IMPORT_USER, resolvePrompt, resolveModel, interpolate } from '../../ai/prompts';
 import type { KBEntry } from '../../data/types';
 
 
@@ -151,7 +152,7 @@ export function KnowledgeBaseView() {
   const { propertyId: urlPropertyId } = useParams();
   const navigate = useNavigate();
   const isMobile = useIsMobile();
-  const { activeHostFilter, kbEntries, addKBEntry, updateKBEntry, deleteKBEntry, devMode, properties, importAiModel } = useAppContext();
+  const { activeHostFilter, kbEntries, addKBEntry, updateKBEntry, deleteKBEntry, devMode, properties, promptOverrides } = useAppContext();
 
   const [selectedPropertyId, setSelectedPropertyId] = useState<string | null>(urlPropertyId || null);
   const [showToonViewer, setShowToonViewer] = useState(false);
@@ -240,26 +241,15 @@ export function KnowledgeBaseView() {
         throw new Error('Could not read file');
       }
 
-      // Call Claude to extract KB entries via server proxy (no client-side API key needed)
-      const systemPrompt = `You are an AI that extracts knowledge base entries from documents.
-Respond ONLY with valid JSON (no markdown, no explanation). The JSON should be an array of objects with:
-{ "title": "string", "content": "string", "tags": ["tag1", "tag2"] }`;
-
-      const userPrompt = `Extract knowledge base entries from this document for a property/company knowledge base.
-Each entry should be a fact, rule, instruction, or guidance that guests/staff should know.
-File name: "${file.name}"
-
-File content:
-${fileContent.substring(0, 8000)}
-
-Respond with ONLY a JSON array. Example:
-[
-  { "title": "Check-in Procedure", "content": "Guests check in at...", "tags": ["checkin", "procedures"] },
-  { "title": "WiFi Password", "content": "Network: PropertyWiFi, Password: ...", "tags": ["wifi", "amenities"] }
-]`;
+      // Call AI to extract KB entries via server proxy (no client-side API key needed)
+      const systemPrompt = resolvePrompt('kb_import', 'system', promptOverrides);
+      const userPrompt = interpolate(resolvePrompt('kb_import', 'user', promptOverrides), {
+        fileName: file.name,
+        fileContent: fileContent.substring(0, 8000),
+      });
 
       const result = await importDocumentAI({
-        model: importAiModel,
+        model: resolveModel('kb_import', promptOverrides),
         systemPrompt,
         userPrompt,
         attachment: fileContent.substring(0, 8000),

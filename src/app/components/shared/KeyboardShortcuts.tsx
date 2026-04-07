@@ -11,9 +11,7 @@ const SHORTCUT_GROUPS = [
     title: 'Navigation',
     shortcuts: [
       { keys: ['G', 'I'], description: 'Go to Inbox' },
-      { keys: ['G', 'T'], description: 'Go to Tasks' },
       { keys: ['G', 'K'], description: 'Go to Knowledge Base' },
-      { keys: ['G', 'A'], description: 'Go to Analytics' },
       { keys: ['G', 'S'], description: 'Go to Settings' },
     ],
   },

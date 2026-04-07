@@ -1,5 +1,5 @@
 import { MessageSquare, Globe, Phone } from 'lucide-react';
-import type { Host, Property, Ticket, KBEntry, Task } from './types';
+import type { Host, Property, Ticket, KBEntry } from './types';
 
 /** Helper: convert HH:MM time string into epoch ms for today (mock backfill) */
 function mockTs(time: string): number {
@@ -146,7 +146,3 @@ export const KB_TAG_TAXONOMY: string[] = [
   'House Rules',
 ];
 
-export const INITIAL_TASKS: Task[] = [
-  { id: 'tsk-1', title: 'Fix AC in Master BR', host: 'Delta Luxe', prop: 'Villa Azure', vendor: 'Bali Breeze HVAC', status: 'dispatched', due: 'Today, 18:00' },
-  { id: 'tsk-2', title: 'Mid-stay Cleaning', host: 'Urban Stays', prop: 'Shinjuku Lofts - 402', vendor: 'Tokyo Clean Co', status: 'pending', due: 'Tomorrow, 11:00' },
-];

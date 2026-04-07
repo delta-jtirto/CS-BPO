@@ -11,14 +11,39 @@ import {
   type DetectedInquiry,
   type InquiryKBMatch,
   type InquiryDecision,
+  type ContextItem,
 } from './InquiryDetector';
+
+/**
+ * Serialise ContextItem[] from the Guest Needs Panel into a compact
+ * plain-text block the compose/polish prompts can use as a focused briefing.
+ * Returns an empty string when there are no items (callers skip appending).
+ */
+function buildGuestInsights(inquiries: DetectedInquiry[]): string {
+  const allItems: ContextItem[] = inquiries.flatMap(inq => inq.context ?? []);
+  if (allItems.length === 0) return '';
+
+  const bySection: Record<string, ContextItem[]> = {};
+  for (const item of allItems) {
+    (bySection[item.section] ??= []).push(item);
+  }
+
+  return Object.entries(bySection)
+    .map(([section, items]) => {
+      const lines = items.map(i =>
+        `  • [${i.source === 'kb' ? 'KB' : 'est.'}] ${i.text}`
+      );
+      return `${section}:\n${lines.join('\n')}`;
+    })
+    .join('\n\n');
+}
 import { composeReplyAI } from '../../ai/api-client';
 import {
-  COMPOSE_REPLY_SYSTEM,
   COMPOSE_REPLY_USER,
-  POLISH_DRAFT_SYSTEM,
   POLISH_DRAFT_USER,
   interpolate,
+  resolvePrompt,
+  resolveModel,
 } from '../../ai/prompts';
 
 /** Cache entry stored by InboxView, keyed by ticketId-messageCount */
@@ -34,6 +59,8 @@ interface SmartReplyPanelProps {
   onInsert: (text: string) => void;
   onHide: () => void;
   cacheRef: React.MutableRefObject<Record<string, SmartReplyCache>>;
+  /** AI-classified inquiries with ContextItem[] from AssistantPanel — used to enrich compose/polish */
+  aiInquiries?: DetectedInquiry[];
 }
 
 type Phase = 'draft-detected' | 'analyzing' | 'composing' | 'preview' | 'configure';
@@ -87,8 +114,8 @@ function formatQuestion(inq: DetectedInquiry): string {
   }
 }
 
-export function SmartReplyPanel({ ticket, existingDraft, onInsert, onHide, cacheRef }: SmartReplyPanelProps) {
-  const { kbEntries, agentName, hasApiKey, aiModel } = useAppContext();
+export function SmartReplyPanel({ ticket, existingDraft, onInsert, onHide, cacheRef, aiInquiries }: SmartReplyPanelProps) {
+  const { kbEntries, agentName, hasApiKey, aiModel, promptOverrides } = useAppContext();
 
   // Cache key for this ticket + message state
   const cacheKey = `${ticket.id}-${ticket.messages.length}`;
@@ -197,7 +224,8 @@ export function SmartReplyPanel({ ticket, existingDraft, onInsert, onHide, cache
 
       const guestMessages = ticket.messages.filter(m => m.sender === 'guest').map(m => m.text).join('\n');
 
-      const userPrompt = interpolate(POLISH_DRAFT_USER, {
+      const insights = buildGuestInsights(aiInquiries ?? []);
+      const userPrompt = interpolate(resolvePrompt('polish_draft', 'user', promptOverrides), {
         hostName: ticket.host.name,
         hostTone: ticket.host.tone,
         guestFirstName: ticket.guestName.split(' ')[0],
@@ -207,12 +235,14 @@ export function SmartReplyPanel({ ticket, existingDraft, onInsert, onHide, cache
         agentDraft: draft,
         guestFacingFacts: guestFacts.length > 0 ? guestFacts.join('\n') : '(none available)',
         internalFacts: internalFacts.length > 0 ? internalFacts.join('\n') : '(none)',
-      });
+      }) + (insights ? `\n\nPre-analyzed guest insights (use to verify and enrich the draft):\n${insights}` : '');
 
       const result = await composeReplyAI({
-        systemPrompt: POLISH_DRAFT_SYSTEM,
+        systemPrompt: resolvePrompt('polish_draft', 'system', promptOverrides),
         userPrompt,
-        model: aiModel,
+        model: resolveModel('polish_draft', promptOverrides),
+        temperature: promptOverrides.polish_draft?.temperature,
+        maxTokens: promptOverrides.polish_draft?.maxTokens,
       });
 
       setComposedMessage(result.text);
@@ -255,7 +285,8 @@ export function SmartReplyPanel({ ticket, existingDraft, onInsert, onHide, cache
           ? `\n\nPrevious AI auto-replies already sent to guest (do NOT repeat this info):\n${botMessages.join('\n')}`
           : '';
 
-        const userPrompt = interpolate(COMPOSE_REPLY_USER, {
+        const insights = buildGuestInsights(aiInquiries ?? []);
+        const userPrompt = interpolate(resolvePrompt('compose_reply', 'user', promptOverrides), {
           hostName: ticket.host.name,
           hostTone: ticket.host.tone,
           guestFirstName: ticket.guestName.split(' ')[0],
@@ -265,12 +296,14 @@ export function SmartReplyPanel({ ticket, existingDraft, onInsert, onHide, cache
           inquiryDecisions: inquiryDecisionsText,
           guestFacingFacts: guestFacts.length > 0 ? guestFacts.join('\n') : '(none available)',
           internalFacts: internalFacts.length > 0 ? internalFacts.join('\n') : '(none)',
-        }) + priorBotContext;
+        }) + priorBotContext + (insights ? `\n\nPre-analyzed guest insights (prioritize these facts when composing):\n${insights}` : '');
 
         const result = await composeReplyAI({
-          systemPrompt: COMPOSE_REPLY_SYSTEM,
+          systemPrompt: resolvePrompt('compose_reply', 'system', promptOverrides),
           userPrompt,
-          model: aiModel,
+          model: resolveModel('compose_reply', promptOverrides),
+          temperature: promptOverrides.compose_reply?.temperature,
+          maxTokens: promptOverrides.compose_reply?.maxTokens,
         });
 
         setComposedMessage(result.text);

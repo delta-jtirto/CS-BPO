@@ -313,6 +313,8 @@ export async function composeReplyAI(opts: {
   systemPrompt: string;
   userPrompt: string;
   model?: string;
+  temperature?: number;
+  maxTokens?: number;
   signal?: AbortSignal;
 }): Promise<AIProxyResult> {
   return proxyAICall({
@@ -320,8 +322,8 @@ export async function composeReplyAI(opts: {
     systemPrompt: opts.systemPrompt,
     userPrompt: opts.userPrompt,
     model: opts.model,
-    temperature: 0.7,
-    maxTokens: 1500,
+    temperature: opts.temperature ?? 0.7,
+    maxTokens: opts.maxTokens ?? 1500,
     touchpoint: 'compose-reply',
     signal: opts.signal,
   });
@@ -332,14 +334,16 @@ export async function askAI(opts: {
   systemPrompt: string;
   userPrompt: string;
   model?: string;
+  temperature?: number;
+  maxTokens?: number;
 }): Promise<AIProxyResult> {
   return proxyAICall({
     endpoint: 'ask',
     systemPrompt: opts.systemPrompt,
     userPrompt: opts.userPrompt,
     model: opts.model,
-    temperature: 0.4,
-    maxTokens: 512,
+    temperature: opts.temperature ?? 0.4,
+    maxTokens: opts.maxTokens ?? 512,
     touchpoint: 'ask-ai',
   });
 }
@@ -349,14 +353,16 @@ export async function classifyInquiries(opts: {
   systemPrompt: string;
   userPrompt: string;
   model?: string;
+  temperature?: number;
+  maxTokens?: number;
 }): Promise<AIProxyResult> {
   return proxyAICall({
     endpoint: 'ask',
     systemPrompt: opts.systemPrompt,
     userPrompt: opts.userPrompt,
     model: opts.model,
-    temperature: 0.2,
-    maxTokens: 1500,
+    temperature: opts.temperature ?? 0.2,
+    maxTokens: opts.maxTokens ?? 1500,
     touchpoint: 'classify-inquiry',
   });
 }

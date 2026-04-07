@@ -10,6 +10,17 @@
 
 import type { KBEntry } from '../../data/types';
 
+export type ContextSource = 'kb' | 'ai';
+
+export interface ContextItem {
+  /** Category heading grouping related items, e.g. "Nearby Facilities" */
+  section: string;
+  /** One actionable fact — contact info, hours, procedure, etc. */
+  text: string;
+  /** kb = operator-verified KB/form entry; ai = inferred general hospitality knowledge (treat as estimate) */
+  source: ContextSource;
+}
+
 export interface DetectedInquiry {
   id: string;
   type: InquiryType | string; // string allows LLM-invented slugs
@@ -24,8 +35,8 @@ export interface DetectedInquiry {
   aiClassified?: boolean;
   /** Whether a KB/form lookup is actually needed (false for greetings, social messages, etc.) */
   needsKbSearch?: boolean;
-  /** AI-generated plain-text briefing for the agent (used in ai-context mode) */
-  context?: string;
+  /** Structured source-tagged briefing items for the agent (used in ai-context mode) */
+  context?: ContextItem[];
 }
 
 export type InquiryType =
@@ -416,27 +427,36 @@ export async function classifyWithLLM(
   ticketHostName: string,
   callAI: (opts: { systemPrompt: string; userPrompt: string }) => Promise<{ text: string }>,
   kbContext?: string,
+  overrides?: import('../../ai/prompts').PromptOverrides,
+  mode?: 'ai-context' | 'kb-scoring',
 ): Promise<DetectedInquiry[]> {
-  // Cache key = prompt version + guest messages + first 100 chars of KB
+  // Cache key = prompt version + mode + guest messages + first 100 chars of KB
   // Bump PROMPT_V when prompt format changes to bust stale cache
-  const PROMPT_V = 'v7';
-  const cacheKey = (PROMPT_V + '|' + guestMessages.join('|') + '|' + (kbContext ?? '').slice(0, 100)).slice(0, 300);
+  const PROMPT_V = 'v9';
+  const cacheKey = (PROMPT_V + '|' + (mode ?? 'ai-context') + '|' + guestMessages.join('|') + '|' + (kbContext ?? '').slice(0, 100)).slice(0, 300);
   const cached = _classifyCache.get(cacheKey);
   if (cached) return cached;
 
   // Lazy-import prompts so this module stays pure (no side effects at import time)
-  const { CLASSIFY_INQUIRY_SYSTEM, CLASSIFY_INQUIRY_USER, interpolate } = await import('../../ai/prompts');
+  const { CLASSIFY_INQUIRY_USER, interpolate, resolvePrompt } = await import('../../ai/prompts');
 
-  const userPrompt = interpolate(CLASSIFY_INQUIRY_USER, {
+  const userPrompt = interpolate(resolvePrompt('classify_inquiry', 'user', overrides ?? {}), {
     propertyName: ticketProperty,
     hostName: ticketHostName,
     kbContext: kbContext ?? '(no knowledge base entries)',
     guestMessages: guestMessages.join('\n'),
   });
 
+  // Append the inquiry_summary system prompt when in ai-context mode (the default).
+  // This populates the "context" field with the agent briefing — no extra API call needed.
+  const classifySystem = resolvePrompt('classify_inquiry', 'system', overrides ?? {});
+  const needsSummary = !mode || mode === 'ai-context';
+  const summarySystem = needsSummary ? resolvePrompt('inquiry_summary', 'system', overrides ?? {}) : null;
+  const systemPrompt = summarySystem ? `${classifySystem}\n\n${summarySystem}` : classifySystem;
+
   try {
     const result = await callAI({
-      systemPrompt: CLASSIFY_INQUIRY_SYSTEM,
+      systemPrompt,
       userPrompt,
     });
 
@@ -465,7 +485,7 @@ export async function classifyWithLLM(
       relevantTags?: string[];
       keywords?: string[];
       needsKbSearch?: boolean;
-      context?: string;
+      context?: ContextItem[] | string;
     }>;
 
     if (!Array.isArray(parsed) || parsed.length === 0) {
@@ -495,7 +515,7 @@ export async function classifyWithLLM(
         keywords: finalKeywords,
         aiClassified: true,
         needsKbSearch: item.needsKbSearch !== false,
-        context: item.context || '',
+        context: Array.isArray(item.context) ? item.context : [],
       };
     });
 

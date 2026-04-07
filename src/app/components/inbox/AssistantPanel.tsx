@@ -3,7 +3,7 @@ import {
   Sparkles, AlertTriangle, ChevronRight, ChevronDown,
   Zap, Shield, MessageSquare,
   BookOpen, ArrowRight, Loader2, Pencil,
-  Bot, ArrowDown, Copy, RotateCcw, Trash2, Send, PawPrint, RefreshCw
+  Bot, ArrowDown, Copy, RotateCcw, Trash2, Send, PawPrint, RefreshCw, CornerDownLeft
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useAppContext } from '../../context/AppContext';
@@ -27,9 +27,10 @@ import {
   clearChatHistory,
 } from '../../ai/api-client';
 import {
-  ASK_AI_SYSTEM,
   ASK_AI_USER,
   interpolate,
+  resolvePrompt,
+  resolveModel,
 } from '../../ai/prompts';
 
 // Inquiry type → icon + color mapping
@@ -40,6 +41,8 @@ interface AssistantPanelProps {
   ticket: Ticket;
   onComposeReply: (text: string) => void;
   onNavigateToKB: (propId: string) => void;
+  /** Called whenever inquiry classification finishes — lets parent share context with SmartReplyPanel */
+  onInquiriesClassified?: (inquiries: DetectedInquiry[]) => void;
 }
 
 // ─── Form field extraction ───────────────────────────────────────────────────
@@ -187,8 +190,8 @@ interface ChatMessage {
 // Max conversation turns to send in the prompt (sliding window)
 const MAX_CONTEXT_TURNS = 3; // 3 user+assistant pairs = 6 messages
 
-export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB }: AssistantPanelProps) {
-  const { kbEntries, hasApiKey: hasApiKeyFromCtx, aiModel, onboardingData, formTemplate, properties, hostSettings } = useAppContext();
+export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInquiriesClassified }: AssistantPanelProps) {
+  const { kbEntries, hasApiKey: hasApiKeyFromCtx, aiModel, onboardingData, formTemplate, properties, hostSettings, promptOverrides } = useAppContext();
   const guestNeedsMode = hostSettings?.[0]?.demoFeatures?.guestNeedsMode ?? 'ai-context';
   const [isAnalyzing, setIsAnalyzing] = useState(true);
   const [expandedInquiries, setExpandedInquiries] = useState<Set<string>>(new Set());
@@ -231,20 +234,30 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB }: Assis
   const [aiInquiries, setAiInquiries] = useState<DetectedInquiry[] | null>(null);
   const llmClassifyRef = useRef<string | null>(null); // track ticket.id to avoid duplicate calls
 
+  // Wrapper: set local state + notify parent (SmartReplyPanel consumes via InboxView)
+  const updateAiInquiries = useCallback((result: DetectedInquiry[] | null) => {
+    setAiInquiries(result);
+    if (result !== null) {
+      onInquiriesClassified?.(result);
+    }
+  }, [onInquiriesClassified]);
+
   const handleRefreshInquiries = () => {
     const guestMessages = ticket.messages.filter(m => m.sender === 'guest').map(m => m.text);
-    setAiInquiries(null);
+    updateAiInquiries(null);
     setIsAnalyzing(true);
     classifyWithLLM(
       guestMessages,
       ticket.property,
       ticket.host.name,
-      (opts) => classifyInquiriesProxy({ ...opts, model: aiModel }),
+      (opts) => classifyInquiriesProxy({ ...opts, model: resolveModel('classify_inquiry', promptOverrides), temperature: promptOverrides.classify_inquiry?.temperature, maxTokens: promptOverrides.classify_inquiry?.maxTokens }),
       propContext,
+      promptOverrides,
+      guestNeedsMode,
     ).then(result => {
-      setAiInquiries(result.length > 0 ? result : [fallbackGeneralInquiry(ticket)]);
+      updateAiInquiries(result.length > 0 ? result : [fallbackGeneralInquiry(ticket)]);
     }).catch(() => {
-      setAiInquiries(filterGreetingNoise(detectInquiries(guestMessages, ticket.tags, ticket.summary)));
+      updateAiInquiries(filterGreetingNoise(detectInquiries(guestMessages, ticket.tags, ticket.summary)));
     }).finally(() => {
       setIsAnalyzing(false);
     });
@@ -258,7 +271,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB }: Assis
     if (!hasApiKey) {
       // No API key — fall back to regex synchronously
       const fallback = filterGreetingNoise(detectInquiries(guestMessages, ticket.tags, ticket.summary));
-      setAiInquiries(fallback);
+      updateAiInquiries(fallback);
       setIsAnalyzing(false);
       return;
     }
@@ -268,7 +281,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB }: Assis
     llmClassifyRef.current = ticket.id;
 
     if (guestMessages.length === 0) {
-      setAiInquiries([fallbackGeneralInquiry(ticket)]);
+      updateAiInquiries([fallbackGeneralInquiry(ticket)]);
       setIsAnalyzing(false);
       return;
     }
@@ -277,14 +290,16 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB }: Assis
       guestMessages,
       ticket.property,
       ticket.host.name,
-      (opts) => classifyInquiriesProxy({ ...opts, model: aiModel }),
+      (opts) => classifyInquiriesProxy({ ...opts, model: resolveModel('classify_inquiry', promptOverrides), temperature: promptOverrides.classify_inquiry?.temperature, maxTokens: promptOverrides.classify_inquiry?.maxTokens }),
       propContext,
+      promptOverrides,
+      guestNeedsMode,
     ).then(result => {
       console.log('[AssistantPanel] LLM classified %d inquiries', result.length);
-      setAiInquiries(result.length > 0 ? result : [fallbackGeneralInquiry(ticket)]);
+      updateAiInquiries(result.length > 0 ? result : [fallbackGeneralInquiry(ticket)]);
     }).catch(err => {
       console.error('[AssistantPanel] LLM classification failed, falling back to regex:', err);
-      setAiInquiries(filterGreetingNoise(detectInquiries(guestMessages, ticket.tags, ticket.summary)));
+      updateAiInquiries(filterGreetingNoise(detectInquiries(guestMessages, ticket.tags, ticket.summary)));
     }).finally(() => {
       setIsAnalyzing(false);
     });
@@ -302,6 +317,11 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB }: Assis
         // Merge detail if different
         if (!existing.detail.includes(inq.detail)) {
           existing.detail = existing.detail + '; ' + inq.detail;
+        }
+        // Merge context items, deduping by text
+        if (inq.context?.length) {
+          const existingTexts = new Set((existing.context ?? []).map(c => c.text));
+          existing.context = [...(existing.context ?? []), ...inq.context.filter(c => !existingTexts.has(c.text))];
         }
       } else {
         seen.set(inq.type, { ...inq });
@@ -368,7 +388,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB }: Assis
     setExpandedArticle(null);
     setInputText('');
     setIsThinking(false);
-    setAiInquiries(null);
+    updateAiInquiries(null);
     setChatMessages([]); // Clear old thread's chat immediately
     llmClassifyRef.current = null;
 
@@ -447,7 +467,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB }: Assis
           .map(m => `[${m.sender}] ${m.text}`)
           .join('\n');
 
-        const userPrompt = interpolate(ASK_AI_USER, {
+        const userPrompt = interpolate(resolvePrompt('ask_ai', 'user', promptOverrides), {
           propertyName: ticket.property,
           hostName: ticket.host.name,
           question: question,
@@ -461,9 +481,11 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB }: Assis
         ].filter(Boolean).join('\n');
 
         const result = await askAIProxy({
-          systemPrompt: ASK_AI_SYSTEM,
+          systemPrompt: resolvePrompt('ask_ai', 'system', promptOverrides),
           userPrompt: enrichedPrompt,
-          model: aiModel,
+          model: resolveModel('ask_ai', promptOverrides),
+          temperature: promptOverrides.ask_ai?.temperature,
+          maxTokens: promptOverrides.ask_ai?.maxTokens,
         });
 
         const assistantMsg: ChatMessage = {
@@ -839,50 +861,56 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB }: Assis
 
                       {/* AI Summary mode — plain text context */}
                       {guestNeedsMode === 'ai-context' && (
-                        <div className="px-3 py-2.5 space-y-1">
-                          {inq.context ? (() => {
-                            const lines = inq.context.split('\n');
-                            const nodes: React.ReactNode[] = [];
-                            let prevWasBullet = false;
-                            lines.forEach((line, i) => {
-                              if (!line.trim()) { nodes.push(<div key={i} className="h-1" />); prevWasBullet = false; return; }
-                              const trimmed = line.trimStart();
-                              // Sub-bullet ◦
-                              if (trimmed.startsWith('◦')) {
-                                nodes.push(<div key={i} className="flex gap-1.5 items-start ml-4"><span className="text-slate-300 shrink-0 text-[10px]">◦</span><span className="text-[10px] text-slate-500 leading-snug">{trimmed.replace(/^◦\s*/, '')}</span></div>);
-                                prevWasBullet = false; return;
-                              }
-                              // Bullet — check for inline sub-bullets: "• Label: • item1 • item2"
-                              if (trimmed.startsWith('•')) {
-                                const content = trimmed.replace(/^•\s*/, '');
-                                const inlineIdx = content.indexOf(' • ');
-                                if (inlineIdx !== -1) {
-                                  // Split into header + sub-bullets
-                                  const header = content.slice(0, inlineIdx);
-                                  const subs = content.slice(inlineIdx + 3).split(' • ').filter(Boolean);
-                                  nodes.push(<p key={`${i}-h`} className="text-[11px] font-semibold text-slate-500 pt-1">{header}</p>);
-                                  subs.forEach((s, j) => nodes.push(<div key={`${i}-s${j}`} className="flex gap-1.5 items-start ml-4"><span className="text-slate-300 shrink-0 text-[10px]">◦</span><span className="text-[10px] text-slate-500 leading-snug">{s}</span></div>));
-                                } else {
-                                  nodes.push(<div key={i} className="flex gap-1.5 items-baseline"><span className="text-indigo-400 shrink-0 leading-none">•</span><span className="text-[11px] text-slate-600 leading-snug">{content}</span></div>);
-                                }
-                                prevWasBullet = true; return;
-                              }
-                              // Section header (ends with colon)
-                              if (trimmed.endsWith(':')) {
-                                nodes.push(<p key={i} className="text-[11px] font-semibold text-slate-500 pt-2 first:pt-0">{trimmed}</p>);
-                                prevWasBullet = false; return;
-                              }
-                              // Plain text after a bullet → render as sub-item
-                              if (prevWasBullet) {
-                                nodes.push(<div key={i} className="flex gap-1.5 items-start ml-4"><span className="text-slate-300 shrink-0 text-[10px]">◦</span><span className="text-[10px] text-slate-500 leading-snug">{trimmed}</span></div>);
-                              } else {
-                                nodes.push(<p key={i} className="text-[11px] text-slate-500 leading-snug">{trimmed}</p>);
-                              }
-                            });
-                            return nodes;
-                          })() : (
-                            <p className="text-[10px] text-slate-400 italic">No additional context needed.</p>
-                          )}
+                        <div className="px-3 py-2.5">
+                          {(() => {
+                            const items = inq.context ?? [];
+                            if (items.length === 0) return (
+                              <p className="text-[10px] text-slate-400 italic">No additional context needed.</p>
+                            );
+                            // Group by section
+                            const sections = items.reduce<Record<string, typeof items>>((acc, item) => {
+                              (acc[item.section] ??= []).push(item);
+                              return acc;
+                            }, {});
+                            const hasAiItems = items.some(i => i.source === 'ai');
+                            return (
+                              <div className="space-y-2">
+                                {Object.entries(sections).map(([section, sectionItems]) => (
+                                  <div key={section}>
+                                    <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide mb-1">{section}</p>
+                                    <div className="space-y-0.5">
+                                      {sectionItems.map((item, i) => (
+                                        <div key={i} className="group flex gap-1.5 items-start">
+                                          <span className="text-indigo-400 shrink-0 leading-none mt-[3px]">•</span>
+                                          <span className={`text-[11px] leading-snug flex-1 ${item.source === 'ai' ? 'text-slate-400 italic' : 'text-slate-600'}`}>
+                                            {item.text}
+                                          </span>
+                                          {item.source === 'kb' && (
+                                            <span className="shrink-0 text-[8px] font-semibold text-indigo-600 bg-indigo-50 border border-indigo-100 px-1 py-0.5 rounded leading-none mt-[2px]">KB</span>
+                                          )}
+                                          {item.source === 'ai' && (
+                                            <span className="shrink-0 text-[8px] font-medium text-slate-400 bg-slate-100 px-1 py-0.5 rounded leading-none mt-[2px]">est.</span>
+                                          )}
+                                          <button
+                                            onClick={(e) => { e.stopPropagation(); handleInsertMsg(item.text); }}
+                                            title="Insert into reply"
+                                            className="shrink-0 opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-40 [@media(hover:none)]:active:opacity-100 text-indigo-500 hover:text-indigo-700 transition-opacity mt-[1px]"
+                                          >
+                                            <CornerDownLeft size={10} />
+                                          </button>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                ))}
+                                {hasAiItems && (
+                                  <p className="text-[9px] text-slate-400 italic pt-1 border-t border-slate-100">
+                                    <span className="font-medium">est.</span> = general estimate — verify before sharing with guest
+                                  </p>
+                                )}
+                              </div>
+                            );
+                          })()}
                         </div>
                       )}
 
@@ -938,6 +966,13 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB }: Assis
                                             Seed data
                                           </span>
                                         )}
+                                        <button
+                                          onClick={(e) => { e.stopPropagation(); handleInsertMsg(m.entry.content); }}
+                                          title="Insert into reply"
+                                          className="ml-auto flex items-center gap-0.5 text-[8px] font-medium text-indigo-600 bg-indigo-50 border border-indigo-200 px-1.5 py-0.5 rounded-full hover:bg-indigo-100 transition-colors"
+                                        >
+                                          <CornerDownLeft size={7} /> Insert
+                                        </button>
                                       </div>
                                     )}
                                   </div>
@@ -995,6 +1030,15 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB }: Assis
                                           <span className="text-[8px] text-blue-600 bg-blue-50 border border-blue-200 px-1.5 py-0.5 rounded-full">
                                             {field.roomName}
                                           </span>
+                                        )}
+                                        {field.value && (
+                                          <button
+                                            onClick={(e) => { e.stopPropagation(); handleInsertMsg(field.value); }}
+                                            title="Insert into reply"
+                                            className="ml-auto flex items-center gap-0.5 text-[8px] font-medium text-indigo-600 bg-indigo-50 border border-indigo-200 px-1.5 py-0.5 rounded-full hover:bg-indigo-100 transition-colors"
+                                          >
+                                            <CornerDownLeft size={7} /> Insert
+                                          </button>
                                         )}
                                       </div>
                                     )}

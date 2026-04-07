@@ -29,7 +29,8 @@ import { useEffect, useRef, useCallback } from 'react';
 import { toast } from 'sonner';
 import { useAppContext } from '../../context/AppContext';
 import { composeReplyAI } from '../../ai/api-client';
-import { AUTO_REPLY_SYSTEM, AUTO_REPLY_USER, interpolate } from '../../ai/prompts';
+import { AUTO_REPLY_USER, interpolate, resolvePrompt, resolveModel } from '../../ai/prompts';
+import type { PromptOverrides } from '../../ai/prompts';
 import { MOCK_PROPERTIES } from '../../data/mock-data';
 import { buildPropertyContext } from '../../ai/kb-context';
 import type { Ticket } from '../../data/types';
@@ -90,16 +91,52 @@ function getUrgency(inquiries: DetectedInquiry[]): { level: 'warning' | 'urgent'
 
 // ─── AI Auto-Reply Output Schema ─────────────────────────────────
 
+interface PromisedAction {
+  action: 'dispatch_maintenance' | 'check_availability' | 'confirm_booking_detail' | 'contact_vendor' | 'custom';
+  summary: string;
+  urgency: 'normal' | 'high';
+  confidence: number;
+}
+
 interface AIAutoReplyOutput {
   reply: string;
   outcome: 'answered' | 'partial' | 'escalate';
   escalate_topics: string[];
   risk_score: number;
   reason: string;
+  /** Actions the AI promised in the reply that require human follow-up */
+  promised_actions: PromisedAction[];
+  /** True if the post-processing safety net detected a banned phrase (e.g. "right away") */
+  safetyFlagged?: boolean;
+}
+
+/**
+ * Base banned phrases that must never appear in auto-sent replies.
+ * Combined at runtime with per-property guardrails.bannedPhrases (Phase 3).
+ */
+export const BASE_BANNED_PHRASES = [
+  'right away',
+  'immediately',
+  'within the hour',
+  "i've arranged",
+  'i have arranged',
+  'very soon',
+  'at once',
+];
+
+/**
+ * Build a regex that tests for any banned phrase, combining the base list
+ * with optional property-level additions.
+ */
+export function buildBannedPhraseRegex(extraPhrases: string[] = []): RegExp {
+  const all = [...BASE_BANNED_PHRASES, ...extraPhrases];
+  const escaped = all.map(p => p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  return new RegExp(escaped.join('|'), 'i');
 }
 
 /**
  * Parse the AI's JSON response. Returns a safe fallback on any parse error.
+ * Handles markdown code fences and validates promised_actions shape.
  */
 function parseAIReplyOutput(text: string): AIAutoReplyOutput {
   const fallback: AIAutoReplyOutput = {
@@ -108,8 +145,10 @@ function parseAIReplyOutput(text: string): AIAutoReplyOutput {
     escalate_topics: [],
     risk_score: 10,
     reason: 'JSON parse failure — fallback to escalate',
+    promised_actions: [],
   };
   try {
+    // Strip markdown code fences that models sometimes wrap around JSON
     const stripped = text.replace(/```(?:json)?\n?/g, '').replace(/```/g, '').trim();
     const match = stripped.match(/\{[\s\S]*\}/);
     if (!match) {
@@ -121,12 +160,35 @@ function parseAIReplyOutput(text: string): AIAutoReplyOutput {
       console.log('[AutoReply] JSON parse failure — missing/invalid fields. Raw:', text.slice(0, 200));
       return fallback;
     }
+
+    // Validate promised_actions — silently drop malformed entries
+    let promised_actions: PromisedAction[] = [];
+    if (Array.isArray(parsed.promised_actions)) {
+      promised_actions = parsed.promised_actions
+        .filter((a: unknown) =>
+          a && typeof a === 'object' &&
+          typeof (a as PromisedAction).summary === 'string' &&
+          ['dispatch_maintenance','check_availability','confirm_booking_detail','contact_vendor','custom']
+            .includes((a as PromisedAction).action) &&
+          ['normal','high'].includes((a as PromisedAction).urgency)
+        )
+        .map((a: PromisedAction) => ({
+          action: a.action,
+          summary: String(a.summary).slice(0, 200), // cap length
+          urgency: a.urgency,
+          confidence: typeof a.confidence === 'number'
+            ? Math.max(0, Math.min(1, a.confidence))
+            : 0.5,
+        }));
+    }
+
     return {
       reply: String(parsed.reply),
       outcome: parsed.outcome as 'answered' | 'partial' | 'escalate',
       escalate_topics: Array.isArray(parsed.escalate_topics) ? parsed.escalate_topics.map(String) : [],
       risk_score: typeof parsed.risk_score === 'number' ? parsed.risk_score : 5,
       reason: parsed.reason ? String(parsed.reason) : '',
+      promised_actions,
     };
   } catch {
     console.log('[AutoReply] JSON parse failure. Raw:', text.slice(0, 200));
@@ -151,14 +213,15 @@ function topicsToUrgency(topics: string[]): 'urgent' | 'warning' | 'normal' {
 function buildAutoReplyPrompt(
   ticket: Ticket, guestMessage: string, kbContext: string,
   hostTone: string, conversationHistory: string, channelHint: string,
+  overrides: PromptOverrides = {},
 ): { system: string; user: string } {
   const guestFirstName = ticket.guestName.split(' ')[0];
   const historyBlock = conversationHistory
     ? `Recent conversation:\n${conversationHistory}\n\n`
     : '';
   return {
-    system: AUTO_REPLY_SYSTEM,
-    user: interpolate(AUTO_REPLY_USER, {
+    system: resolvePrompt('auto_reply', 'system', overrides),
+    user: interpolate(resolvePrompt('auto_reply', 'user', overrides), {
       hostName: ticket.host.name,
       hostTone,
       channel: ticket.channel,
@@ -218,6 +281,7 @@ export function useGlobalAutoReply() {
   const formTemplate = ctx?.formTemplate ?? [];
   const hasApiKey = ctx?.hasApiKey ?? false;
   const aiModel = ctx?.aiModel ?? '';
+  const promptOverrides = ctx?.promptOverrides ?? {};
   const addBotMessage = ctx?.addBotMessage ?? (() => {});
   const addSystemMessage = ctx?.addSystemMessage ?? (() => {});
   const addMultipleMessages = ctx?.addMultipleMessages ?? (() => {});
@@ -429,6 +493,7 @@ export function useGlobalAutoReply() {
       const { system: autoReplySystem, user: autoReplyUser } = buildAutoReplyPrompt(
         ticket, lastGuestMsg.text, kbContext,
         hostConfig.tone, conversationHistory, channelHint,
+        promptOverrides,
       );
 
       console.log('[AutoReply] Single AI call for %s — context len: %d chars', ticketId, kbContext.length);
@@ -436,7 +501,9 @@ export function useGlobalAutoReply() {
       const result = await composeReplyAI({
         systemPrompt: autoReplySystem,
         userPrompt: autoReplyUser,
-        model: aiModel,
+        model: resolveModel('auto_reply', promptOverrides),
+        temperature: promptOverrides.auto_reply?.temperature,
+        maxTokens: promptOverrides.auto_reply?.maxTokens,
         signal,
       });
 
@@ -447,23 +514,41 @@ export function useGlobalAutoReply() {
       }
 
       const output = parseAIReplyOutput(result.text);
-      console.log('[AutoReply] AI output for %s: outcome=%s, risk=%d, topics=[%s]',
-        ticketId, output.outcome, output.risk_score, output.escalate_topics.join(', '));
+      console.log('[AutoReply] AI output for %s: outcome=%s, risk=%d, topics=[%s], actions=%d',
+        ticketId, output.outcome, output.risk_score, output.escalate_topics.join(', '), output.promised_actions.length);
 
-      // ─── [STEP 5] Risk Gate ────────────────────────────────────
+      // ─── [STEP 5] Post-processing safety net ─────────────────────
+      // Detect banned time-commitment phrases in the AI reply even when the
+      // prompt instructions are followed imperfectly (LLMs are probabilistic).
+      // Phase 3 will extend this with per-property guardrails.bannedPhrases.
+      const bannedPhraseRegex = buildBannedPhraseRegex(/* extraPhrases from PropertyAISettings go here in Phase 3 */);
+      if (bannedPhraseRegex.test(output.reply)) {
+        console.log('[AutoReply] SAFETY FLAG: banned phrase detected in reply for %s — forcing draft mode', ticketId);
+        output.safetyFlagged = true;
+      }
+
+      // ─── [STEP 5b] Risk Gate ──────────────────────────────────────
       if (output.risk_score >= 8) {
         console.log('[AutoReply] RISK GATE: score=%d — overriding outcome to escalate for %s', output.risk_score, ticketId);
         output.outcome = 'escalate';
       }
 
       // ─── [STEP 6] Route by Outcome + Host Settings ─────────────
+      // Safety-flagged replies are always forced into draft regardless of autoReplyMode,
+      // so the operator can review before sending.
+      const effectiveIsDraft = isDraft || output.safetyFlagged === true;
+
       const outcomeForRouting = (output.outcome === 'partial' && hostConfig.partialCoverage === 'escalate-all')
         ? 'escalate'
         : output.outcome;
 
       if (outcomeForRouting === 'answered') {
-        if (isDraft) {
+        if (effectiveIsDraft) {
           setDraftReply(ticketId, output.reply);
+          if (output.safetyFlagged) {
+            // Add a visible internal note explaining the flag
+            addSystemMessage(ticketId, 'AI Safety: time commitment phrase detected — review before sending');
+          }
           if (notificationPrefs.notifyDraft) {
             toast.info(`AI Draft: ${ticket.guestName}`, {
               description: 'AI composed a reply. Review in the compose box.',
@@ -485,8 +570,11 @@ export function useGlobalAutoReply() {
 
       } else if (outcomeForRouting === 'partial') {
         const topicList = output.escalate_topics.join(', ') || 'some topics';
-        if (isDraft) {
+        if (effectiveIsDraft) {
           setDraftReply(ticketId, output.reply);
+          if (output.safetyFlagged) {
+            addSystemMessage(ticketId, 'AI Safety: time commitment phrase detected — review before sending');
+          }
           if (notificationPrefs.notifyDraft) {
             toast.info(`AI Draft: ${ticket.guestName}`, {
               description: `Partial coverage — review before sending. Uncovered: ${topicList}`,
@@ -519,8 +607,11 @@ export function useGlobalAutoReply() {
         // repeating "someone will be in touch" — just add a quiet agent-visible note instead.
         const alreadyHandedOff = autoReplyHandedOff[ticketId] === true;
 
-        if (isDraft) {
+        if (effectiveIsDraft) {
           if (output.reply) setDraftReply(ticketId, output.reply);
+          if (output.safetyFlagged) {
+            addSystemMessage(ticketId, 'AI Safety: time commitment phrase detected — review before sending');
+          }
           if (notificationPrefs.notifyDraft) {
             toast.info(`AI Draft: ${ticket.guestName}`, {
               description: 'Escalating — review holding message.',
@@ -569,6 +660,15 @@ export function useGlobalAutoReply() {
           }
           startReEscalationTimer(ticketId);
         }
+      }
+
+      // ─── [STEP 7] Safety Flag Toast ────────────────────────────
+      // Shown after routing so it doesn't interfere with routing toasts.
+      if (output.safetyFlagged) {
+        toast.warning(`Review required: ${ticket.guestName}`, {
+          description: 'AI reply held — time commitment phrase detected. Check draft before sending.',
+          duration: 8000,
+        });
       }
 
     } catch (err) {

@@ -4,8 +4,12 @@ import {
   User, Bell, Shield, Code2, Clock, Timer, MessageSquareText,
   GitBranch, Target, Plus, Trash2, Pencil, Zap, AlertTriangle, Users,
   Globe, BarChart3, MessageCircle, Settings2, Bot, Eye, EyeOff, Key, RotateCcw,
-  ChevronDown, ChevronRight, ShieldAlert, Pause, X, Info, Sparkles, Copy
+  ChevronDown, ChevronRight, ShieldAlert, Pause, X, Info, Sparkles, Copy, BrainCircuit,
+  Brain, FileText
 } from 'lucide-react';
+import { PROMPT_DEFAULTS } from '../../ai/prompts';
+import type { OperationId } from '../../ai/prompts';
+import { PromptGroupCard } from './PromptGroupCard';
 import { toast } from 'sonner';
 import { MOCK_HOSTS } from '../../data/mock-data';
 import { useAppContext } from '../../context/AppContext';
@@ -31,7 +35,7 @@ function usePersistedState<T>(key: string, initial: T): [T, (v: T | ((prev: T) =
 }
 
 // --- Types ---
-type SettingsTab = 'agent' | 'notifications' | 'sla' | 'templates' | 'routing' | 'hours' | 'qa' | 'demo';
+type SettingsTab = 'agent' | 'templates' | 'hours' | 'demo' | 'ai' | 'prompts';
 
 interface SLAThreshold {
   priority: string;
@@ -200,9 +204,10 @@ export function SettingsView() {
     saveAIApiKey, saveAIModel, saveImportAiModel, clearAIApiKey,
     aiModel, importAiModel, resetToDemo,
     notificationPrefs, updateNotificationPrefs,
+    promptOverrides, updatePromptOverride, resetPromptOverride,
   } = useAppContext();
 
-  const validTabs: SettingsTab[] = ['agent', 'ai', 'notifications', 'sla', 'templates', 'routing', 'hours', 'qa', 'demo'];
+  const validTabs: SettingsTab[] = ['agent', 'ai', 'templates', 'hours', 'demo', 'prompts'];
   // Map old 'client' tab to new 'ai' tab for backward compatibility
   const resolvedTab = urlTab === 'client' ? 'ai' : urlTab;
   const [settingsTab, setSettingsTab] = useState<SettingsTab>(
@@ -387,12 +392,9 @@ export function SettingsView() {
               {([
                 { tab: 'agent' as SettingsTab, icon: <User size={14} />, label: 'Prefs' },
                 { tab: 'ai' as SettingsTab, icon: <Sparkles size={14} />, label: 'AI' },
-                { tab: 'notifications' as SettingsTab, icon: <Bell size={14} />, label: 'Alerts' },
-                { tab: 'sla' as SettingsTab, icon: <Timer size={14} />, label: 'SLA' },
                 { tab: 'templates' as SettingsTab, icon: <MessageSquareText size={14} />, label: 'Templates' },
-                { tab: 'routing' as SettingsTab, icon: <GitBranch size={14} />, label: 'Routing' },
                 { tab: 'hours' as SettingsTab, icon: <Clock size={14} />, label: 'Hours' },
-                { tab: 'qa' as SettingsTab, icon: <Target size={14} />, label: 'QA' },
+                { tab: 'prompts' as SettingsTab, icon: <BrainCircuit size={14} />, label: 'Prompts' },
                 { tab: 'demo' as SettingsTab, icon: <Sparkles size={14} />, label: 'Demo' },
               ]).map(item => (
                 <button
@@ -416,18 +418,14 @@ export function SettingsView() {
               <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2 ml-2">My Workspace</h3>
               <nav className="space-y-1">
                 {navItem('agent', <User size={16} />, 'My Preferences')}
-                {(hostSettings[0]?.demoFeatures?.showNotifications ?? true) && navItem('notifications', <Bell size={16} />, 'Notifications')}
-                {(hostSettings[0]?.demoFeatures?.showWorkingHours ?? true) && navItem('hours', <Clock size={16} />, 'Working Hours')}
+                {navItem('hours', <Clock size={16} />, 'Working Hours')}
+                {navItem('templates', <MessageSquareText size={16} />, 'Quick Reply Templates')}
               </nav>
             </div>
 
             <div>
               <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2 ml-2">Administration</h3>
               <nav className="space-y-1">
-                {(hostSettings[0]?.demoFeatures?.showResponseTimeRules ?? true) && navItem('sla', <Timer size={16} />, 'Response Time Rules')}
-                {(hostSettings[0]?.demoFeatures?.showQuickReplyTemplates ?? true) && navItem('templates', <MessageSquareText size={16} />, 'Quick Reply Templates')}
-                {(hostSettings[0]?.demoFeatures?.showTicketDistribution ?? true) && navItem('routing', <GitBranch size={16} />, 'Ticket Distribution')}
-                {(hostSettings[0]?.demoFeatures?.showQualityPerformance ?? true) && navItem('qa', <Target size={16} />, 'Quality & Performance')}
                 {navItem('demo', <Sparkles size={16} />, 'Demo Features')}
               </nav>
             </div>
@@ -435,6 +433,8 @@ export function SettingsView() {
             <div>
               <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2 ml-2">Configuration</h3>
               <nav className="space-y-1">
+                {navItem('ai', <Sparkles size={16} />, 'AI Configuration')}
+                {navItem('prompts', <BrainCircuit size={16} />, 'AI Prompts')}
                 <button
                   onClick={() => navigate('/settings/form-builder')}
                   className="w-full flex items-center gap-3 px-3 py-2 text-sm font-medium rounded-lg transition-colors text-slate-600 hover:bg-slate-50"
@@ -497,109 +497,8 @@ export function SettingsView() {
             </div>
           )}
 
-          {/* ===== NOTIFICATIONS ===== */}
-          {(hostSettings[0]?.demoFeatures?.showNotifications ?? true) && settingsTab === 'notifications' && (
-            <div className="max-w-xl mx-auto animate-in fade-in">
-              <h2 className="text-lg font-bold text-slate-800 mb-1">Notifications</h2>
-              <p className="text-xs text-slate-500 mb-6">Control how and when you receive alerts. Changes save automatically.</p>
-              <div className="bg-white border border-slate-200 rounded-xl shadow-sm">
-                <ToggleRow
-                  label="Email Alerts"
-                  description="Get an email when a guest conversation needs your attention."
-                  checked={notificationPrefs.emailAlerts}
-                  onChange={(v) => updateNotificationPrefs({ emailAlerts: v })}
-                />
-                <ToggleRow
-                  label="Sound Alerts"
-                  description="Play a notification sound when a high-priority message arrives."
-                  checked={notificationPrefs.soundAlerts}
-                  onChange={(v) => updateNotificationPrefs({ soundAlerts: v })}
-                />
-                <ToggleRow
-                  label={<span className="flex items-center gap-2">Response Time Warnings <Shield size={14} className="text-red-500" /></span>}
-                  description="Get notified when a conversation is close to exceeding its response time target."
-                  checked={notificationPrefs.escalationAlerts}
-                  onChange={(v) => updateNotificationPrefs({ escalationAlerts: v })}
-                  last
-                />
-              </div>
-
-              <div className="mt-4 px-1">
-                <p className="text-xs text-slate-400 flex items-center gap-1.5">
-                  <Sparkles size={12} /> AI-specific notifications (auto-reply sent, escalation, drafts) are in the <button onClick={() => handleTabChange('ai')} className="text-indigo-600 underline font-medium">AI Auto-Reply</button> tab.
-                </p>
-              </div>
-            </div>
-          )}
-
-          {/* ===== RESPONSE TIME RULES ===== */}
-          {(hostSettings[0]?.demoFeatures?.showResponseTimeRules ?? true) && settingsTab === 'sla' && (
-            <div className="max-w-2xl mx-auto animate-in fade-in">
-              <div className="mb-6">
-                <h2 className="text-lg font-bold text-slate-800">Response Time Rules</h2>
-                <p className="text-xs text-slate-500 mt-1">Set how quickly your team should respond to and resolve guest conversations, based on priority level. All times are in minutes.</p>
-              </div>
-              <SessionBanner />
-
-              {/* Warning threshold */}
-              <div className="bg-white border border-slate-200 rounded-xl shadow-sm mb-4">
-                <MetricRow
-                  label={<span className="flex items-center gap-2"><AlertTriangle size={14} className="text-amber-500" /> Early Warning</span>}
-                  description="Show a warning when this percentage of the allowed time has passed."
-                  last
-                >
-                  <div className="flex items-center gap-1.5">
-                    <input type="number" value={slaWarningPct} onChange={(e) => setSlaWarningPct(Number(e.target.value))} min={50} max={99} className="border border-slate-300 rounded-md text-sm py-1.5 px-2 w-full text-center focus:ring-1 focus:ring-indigo-500 outline-none" />
-                    <span className="text-xs text-slate-400 shrink-0">%</span>
-                  </div>
-                </MetricRow>
-              </div>
-
-              {/* Response time table */}
-              <div className="bg-white border border-slate-200 rounded-xl shadow-sm mb-6 overflow-hidden overflow-x-auto">
-                <table className="w-full text-sm min-w-[480px]">
-                  <thead>
-                    <tr className="bg-slate-50 border-b border-slate-200">
-                      <th className="text-left py-3 px-5 font-bold text-slate-600 text-xs uppercase tracking-wider">Priority</th>
-                      <th className="text-center py-3 px-4 font-bold text-slate-600 text-xs uppercase tracking-wider">First Reply</th>
-                      <th className="text-center py-3 px-4 font-bold text-slate-600 text-xs uppercase tracking-wider">Resolution</th>
-                      <th className="text-center py-3 px-4 font-bold text-slate-600 text-xs uppercase tracking-wider">Escalate</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {slaThresholds.map((sla, idx) => (
-                      <tr key={sla.priority} className={idx < slaThresholds.length - 1 ? 'border-b border-slate-100' : ''}>
-                        <td className="py-3 px-5">
-                          <span className={`inline-flex items-center px-2.5 py-1 rounded-md text-xs font-bold ${sla.color}`}>{sla.priority}</span>
-                        </td>
-                        <td className="py-3 px-4">
-                          <div className="flex items-center justify-center gap-1">
-                            <input type="number" value={sla.firstResponse} onChange={(e) => updateSlaField(idx, 'firstResponse', Number(e.target.value))} min={1} className="border border-slate-300 rounded-md text-sm py-1 px-2 w-16 text-center focus:ring-1 focus:ring-indigo-500 outline-none" />
-                            <span className="text-xs text-slate-400">min</span>
-                          </div>
-                        </td>
-                        <td className="py-3 px-4">
-                          <div className="flex items-center justify-center gap-1">
-                            <input type="number" value={sla.resolution} onChange={(e) => updateSlaField(idx, 'resolution', Number(e.target.value))} min={1} className="border border-slate-300 rounded-md text-sm py-1 px-2 w-16 text-center focus:ring-1 focus:ring-indigo-500 outline-none" />
-                            <span className="text-xs text-slate-400">min</span>
-                          </div>
-                        </td>
-                        <td className="py-3 px-4">
-                          <div className="flex items-center justify-center gap-1">
-                            <input type="number" value={sla.escalateAfter} onChange={(e) => updateSlaField(idx, 'escalateAfter', Number(e.target.value))} min={1} className="border border-slate-300 rounded-md text-sm py-1 px-2 w-16 text-center focus:ring-1 focus:ring-indigo-500 outline-none" />
-                            <span className="text-xs text-slate-400">min</span>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-
           {/* ===== QUICK REPLY TEMPLATES ===== */}
-          {(hostSettings[0]?.demoFeatures?.showQuickReplyTemplates ?? true) && settingsTab === 'templates' && (
+          {settingsTab === 'templates' && (
             <div className="max-w-2xl mx-auto animate-in fade-in">
               <div className="flex items-center justify-between mb-6">
                 <div>
@@ -683,83 +582,8 @@ export function SettingsView() {
             </div>
           )}
 
-          {/* ===== TICKET DISTRIBUTION ===== */}
-          {(hostSettings[0]?.demoFeatures?.showTicketDistribution ?? true) && settingsTab === 'routing' && (
-            <div className="max-w-xl mx-auto animate-in fade-in">
-              <h2 className="text-lg font-bold text-slate-800 mb-1">Ticket Distribution</h2>
-              <p className="text-xs text-slate-500 mb-6">Choose how incoming guest conversations are assigned to your team members.</p>
-              <SessionBanner />
-
-              {/* Routing mode */}
-              <div className="bg-white border border-slate-200 rounded-xl shadow-sm mb-4">
-                <div className="p-5 border-b border-slate-100">
-                  <h3 className="font-bold text-slate-800 text-sm mb-3">Assignment Method</h3>
-                  <div className={`grid ${isMobile ? 'grid-cols-1' : 'grid-cols-3'} gap-2`}>
-                    {[
-                      { id: 'round-robin' as const, label: 'Take Turns', desc: 'Distribute evenly across the team', icon: <GitBranch size={16} /> },
-                      { id: 'skill-based' as const, label: 'Best Match', desc: 'Assign based on agent expertise', icon: <Zap size={16} /> },
-                      { id: 'load-balanced' as const, label: 'Least Busy', desc: 'Give it to whoever has capacity', icon: <BarChart3 size={16} /> },
-                    ].map(m => (
-                      <RadioCard
-                        key={m.id}
-                        selected={routingMode === m.id}
-                        onClick={() => setRoutingMode(m.id)}
-                        label={m.label}
-                        description={m.desc}
-                        icon={m.icon}
-                        compact
-                      />
-                    ))}
-                  </div>
-                </div>
-              </div>
-
-              {/* Routing toggles */}
-              <div className="bg-white border border-slate-200 rounded-xl shadow-sm mb-4">
-                <ToggleRow
-                  label="Auto-Assign New Conversations"
-                  description="Automatically assign incoming conversations instead of sending them to a shared queue."
-                  checked={autoAssign}
-                  onChange={setAutoAssign}
-                />
-                <ToggleRow
-                  label="Prioritize Urgent Messages"
-                  description="Route high-priority conversations to your most experienced team members first."
-                  checked={priorityRouting}
-                  onChange={setPriorityRouting}
-                />
-                <ToggleRow
-                  label="Match by Language"
-                  description="Assign conversations to team members who speak the guest's language."
-                  checked={languageRouting}
-                  onChange={setLanguageRouting}
-                />
-                <ToggleRow
-                  label="Prefer Familiar Agents"
-                  description="When possible, assign returning guests to the same team member who helped them before."
-                  checked={hostAffinity}
-                  onChange={setHostAffinity}
-                  last
-                />
-              </div>
-
-              {/* Numeric settings */}
-              <div className="bg-white border border-slate-200 rounded-xl shadow-sm mb-6">
-                <MetricRow label="Max Active Conversations" description="The most conversations one person can handle at the same time.">
-                  <input type="number" value={maxConcurrent} onChange={(e) => setMaxConcurrent(Number(e.target.value))} min={1} max={20} className="border border-slate-300 rounded-md text-sm py-1.5 px-2 w-full text-center focus:ring-1 focus:ring-indigo-500 outline-none" />
-                </MetricRow>
-                <MetricRow label="Queue Timeout" description="If nobody picks up, move the conversation back to the shared queue after this many minutes." last>
-                  <div className="flex items-center gap-1.5">
-                    <input type="number" value={fallbackTimeout} onChange={(e) => setFallbackTimeout(Number(e.target.value))} min={1} max={30} className="border border-slate-300 rounded-md text-sm py-1.5 px-2 w-full text-center focus:ring-1 focus:ring-indigo-500 outline-none" />
-                    <span className="text-xs text-slate-400 shrink-0">min</span>
-                  </div>
-                </MetricRow>
-              </div>
-            </div>
-          )}
-
           {/* ===== WORKING HOURS ===== */}
-          {(hostSettings[0]?.demoFeatures?.showWorkingHours ?? true) && settingsTab === 'hours' && (
+          {settingsTab === 'hours' && (
             <div className="max-w-xl mx-auto animate-in fade-in">
               <h2 className="text-lg font-bold text-slate-800 mb-1">Working Hours</h2>
               <p className="text-xs text-slate-500 mb-6">Set your availability schedule and control what happens when you're offline.</p>
@@ -872,82 +696,149 @@ export function SettingsView() {
             </div>
           )}
 
-          {/* ===== QUALITY & PERFORMANCE ===== */}
-          {(hostSettings[0]?.demoFeatures?.showQualityPerformance ?? true) && settingsTab === 'qa' && (
-            <div className="max-w-xl mx-auto animate-in fade-in">
-              <h2 className="text-lg font-bold text-slate-800 mb-1">Quality & Performance</h2>
-              <p className="text-xs text-slate-500 mb-6">Define the quality standards and targets for your team's guest interactions.</p>
-              <SessionBanner />
+          {/* ===== AI CONFIGURATION ===== */}
+          {settingsTab === 'ai' && (
+            <div className="max-w-3xl mx-auto animate-in fade-in">
+              <h2 className="text-lg font-bold text-slate-800 mb-1">AI Configuration</h2>
+              <p className="text-xs text-slate-500 mb-6">Manage AI-powered features and capabilities for guest interactions.</p>
 
-              {/* KPI Targets */}
-              <div className="bg-white border border-slate-200 rounded-xl shadow-sm mb-4">
-                <div className="p-4 bg-slate-50 border-b border-slate-200">
-                  <h3 className="font-bold text-sm text-slate-700">Performance Targets</h3>
-                  <p className="text-xs text-slate-400 mt-0.5">The benchmarks your team should aim to meet or exceed.</p>
-                </div>
-                <MetricRow label="Guest Satisfaction Score" description="Minimum average rating from guest feedback (on a 1 to 5 scale).">
-                  <div className="flex items-center gap-1.5">
-                    <input type="number" step="0.1" value={csatTarget} onChange={(e) => setCsatTarget(Number(e.target.value))} min={1} max={5} className="border border-slate-300 rounded-md text-sm py-1.5 px-2 w-full text-center focus:ring-1 focus:ring-indigo-500 outline-none" />
-                    <span className="text-xs text-slate-400 shrink-0">/ 5</span>
-                  </div>
-                </MetricRow>
-                <MetricRow label="First Reply Time" description="How quickly the team should send the first response to a guest (in minutes).">
-                  <div className="flex items-center gap-1.5">
-                    <input type="number" value={firstResponseTarget} onChange={(e) => setFirstResponseTarget(Number(e.target.value))} min={1} className="border border-slate-300 rounded-md text-sm py-1.5 px-2 w-full text-center focus:ring-1 focus:ring-indigo-500 outline-none" />
-                    <span className="text-xs text-slate-400 shrink-0">min</span>
-                  </div>
-                </MetricRow>
-                <MetricRow label="Resolution Rate" description="Percentage of conversations resolved within the allowed response time." last>
-                  <div className="flex items-center gap-1.5">
-                    <input type="number" value={resolutionRateTarget} onChange={(e) => setResolutionRateTarget(Number(e.target.value))} min={1} max={100} className="border border-slate-300 rounded-md text-sm py-1.5 px-2 w-full text-center focus:ring-1 focus:ring-indigo-500 outline-none" />
-                    <span className="text-xs text-slate-400 shrink-0">%</span>
-                  </div>
-                </MetricRow>
-              </div>
-
-              {/* Automated QA */}
-              <div className="bg-white border border-slate-200 rounded-xl shadow-sm mb-4">
-                <div className="p-4 bg-slate-50 border-b border-slate-200">
-                  <h3 className="font-bold text-sm text-slate-700">Automated Quality Checks</h3>
-                  <p className="text-xs text-slate-400 mt-0.5">Let the system help monitor and improve reply quality.</p>
-                </div>
-                <ToggleRow
-                  label="AI Reply Scoring"
-                  description="Automatically rate each agent reply on empathy, accuracy, and tone so managers can spot coaching opportunities."
-                  checked={autoQA}
-                  onChange={setAutoQA}
-                />
-                <ToggleRow
-                  label={<span className="flex items-center gap-2">Guest Mood Alerts <AlertTriangle size={14} className="text-amber-500" /></span>}
-                  description="Notify a supervisor when a guest seems unhappy or frustrated based on their messages."
-                  checked={sentimentAlert}
-                  onChange={setSentimentAlert}
-                />
-                <MetricRow label="Random Review Sample" description="Percentage of resolved conversations randomly picked for a manager to manually review.">
-                  <div className="flex items-center gap-1.5">
-                    <input type="number" value={qaAuditPct} onChange={(e) => setQaAuditPct(Number(e.target.value))} min={1} max={100} className="border border-slate-300 rounded-md text-sm py-1.5 px-2 w-full text-center focus:ring-1 focus:ring-indigo-500 outline-none" />
-                    <span className="text-xs text-slate-400 shrink-0">%</span>
-                  </div>
-                </MetricRow>
-                <MetricRow label="Auto-Escalation Trigger" description="Number of negative guest signals (e.g., complaints, bad ratings) before automatically alerting a supervisor." last>
-                  <input type="number" value={escalationThreshold} onChange={(e) => setEscalationThreshold(Number(e.target.value))} min={1} max={10} className="border border-slate-300 rounded-md text-sm py-1.5 px-2 w-full text-center focus:ring-1 focus:ring-indigo-500 outline-none" />
-                </MetricRow>
-              </div>
-
-              {/* Performance summary card */}
-              <div className="bg-gradient-to-r from-indigo-50 to-purple-50 border border-indigo-200 rounded-xl p-5 mb-6">
-                <h3 className="font-bold text-sm text-indigo-800 mb-3">How Your Team Is Doing (Sample Data)</h3>
-                <div className={`grid ${isMobile ? 'grid-cols-1' : 'grid-cols-3'} gap-4`}>
-                  {[
-                    { label: 'Guest Satisfaction', value: '4.6', target: csatTarget.toString(), good: 4.6 >= csatTarget },
-                    { label: 'Avg. First Reply', value: '8m', target: `${firstResponseTarget}m`, good: 8 <= firstResponseTarget },
-                    { label: 'Resolution Rate', value: '94%', target: `${resolutionRateTarget}%`, good: 94 >= resolutionRateTarget },
-                  ].map(kpi => (
-                    <div key={kpi.label} className="bg-white/80 rounded-lg p-3 text-center">
-                      <p className="text-[10px] text-slate-500 uppercase tracking-wider font-bold mb-1">{kpi.label}</p>
-                      <p className={`text-lg font-bold ${kpi.good ? 'text-emerald-600' : 'text-red-600'}`}>{kpi.value}</p>
-                      <p className="text-[10px] text-slate-400">Target: {kpi.target}</p>
+              {/* AI Features Overview */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+                <div className="bg-gradient-to-br from-indigo-50 to-indigo-100 border border-indigo-200 rounded-xl p-5">
+                  <div className="flex items-start gap-3">
+                    <Sparkles size={20} className="text-indigo-600 shrink-0 mt-0.5" />
+                    <div>
+                      <h3 className="font-bold text-sm text-indigo-900">Smart Replies</h3>
+                      <p className="text-xs text-indigo-700 mt-1">AI generates personalized reply suggestions based on guest messages and your property info.</p>
                     </div>
+                  </div>
+                </div>
+
+                <div className="bg-gradient-to-br from-emerald-50 to-emerald-100 border border-emerald-200 rounded-xl p-5">
+                  <div className="flex items-start gap-3">
+                    <Zap size={20} className="text-emerald-600 shrink-0 mt-0.5" />
+                    <div>
+                      <h3 className="font-bold text-sm text-emerald-900">Auto-Reply</h3>
+                      <p className="text-xs text-emerald-700 mt-1">Automatically respond to guest messages outside working hours using AI that understands your policies.</p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-gradient-to-br from-purple-50 to-purple-100 border border-purple-200 rounded-xl p-5">
+                  <div className="flex items-start gap-3">
+                    <Brain size={20} className="text-purple-600 shrink-0 mt-0.5" />
+                    <div>
+                      <h3 className="font-bold text-sm text-purple-900">Inquiry Detection</h3>
+                      <p className="text-xs text-purple-700 mt-1">Automatically categorize guest inquiries (maintenance, booking, billing, etc.) for smart routing.</p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-gradient-to-br from-amber-50 to-amber-100 border border-amber-200 rounded-xl p-5">
+                  <div className="flex items-start gap-3">
+                    <FileText size={20} className="text-amber-600 shrink-0 mt-0.5" />
+                    <div>
+                      <h3 className="font-bold text-sm text-amber-900">Knowledge Base</h3>
+                      <p className="text-xs text-amber-700 mt-1">Import documents to teach AI about your policies, rates, and procedures for better guest answers.</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Configuration Links */}
+              <div className="bg-white border border-slate-200 rounded-xl p-6 mb-6">
+                <h3 className="font-bold text-sm text-slate-700 mb-4">Customize AI Behavior</h3>
+                <p className="text-xs text-slate-500 mb-4">Each AI feature uses customizable prompts to match your brand voice and business rules.</p>
+                <button
+                  onClick={() => {
+                    setSettingsTab('prompts');
+                    setTimeout(() => {
+                      document.querySelector('[data-operation="compose_reply"]')?.scrollIntoView({ behavior: 'smooth' });
+                    }, 100);
+                  }}
+                  className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg transition-colors"
+                >
+                  <BrainCircuit size={16} />
+                  Customize AI Prompts
+                </button>
+              </div>
+
+              {/* Status */}
+              <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-5">
+                <div className="flex items-start gap-3">
+                  <div className="w-2 h-2 bg-emerald-500 rounded-full mt-1.5 shrink-0" />
+                  <div>
+                    <p className="text-sm font-bold text-emerald-900">All AI Features Active</p>
+                    <p className="text-xs text-emerald-700 mt-0.5">Your AI features are enabled and ready to use. Configure prompt templates and behavior in the AI Prompts section.</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ===== AI PROMPTS ===== */}
+          {settingsTab === 'prompts' && (
+            <div className="max-w-3xl mx-auto animate-in fade-in">
+              <h2 className="text-lg font-bold text-slate-800 mb-1">AI Prompts</h2>
+              <p className="text-xs text-slate-500 mb-6">
+                Customize the system and user prompts for each AI operation. Changes are saved automatically and persist across sessions.
+                Use <code className="bg-slate-100 px-1 rounded text-[10px]">{'{{variable}}'}</code> placeholders shown below each field — they are filled in at runtime.
+              </p>
+
+              {/* Group: Reply & Drafting */}
+              <div className="mb-6">
+                <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2 ml-1">Reply &amp; Drafting</h3>
+                <div className="flex flex-col gap-3">
+                  {(['compose_reply', 'polish_draft', 'auto_reply'] as OperationId[]).map((op, i) => (
+                    <PromptGroupCard
+                      key={op}
+                      operationId={op}
+                      defaults={PROMPT_DEFAULTS[op]}
+                      override={promptOverrides[op]}
+                      onUpdate={(field, value) => updatePromptOverride(op, field, value)}
+                      onReset={(field) => resetPromptOverride(op, field)}
+                      initiallyOpen={i === 0}
+                    />
+                  ))}
+                </div>
+              </div>
+
+              {/* Group: Detection & Analysis */}
+              <div className="mb-6">
+                <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2 ml-1">Detection &amp; Analysis</h3>
+                <p className="text-[11px] text-slate-400 mb-2 ml-1">
+                  <span className="font-medium text-slate-500">Classify Inquiry</span> categorises what the guest is asking.{' '}
+                  <span className="font-medium text-slate-500">Inquiry Summary</span> appended to it when <span className="font-medium">AI Summary</span> mode is active — controls the agent briefing in the Guest Needs panel.
+                </p>
+                <div className="flex flex-col gap-3">
+                  {(['classify_inquiry', 'inquiry_summary'] as OperationId[]).map((op) => (
+                    <PromptGroupCard
+                      key={op}
+                      operationId={op}
+                      defaults={PROMPT_DEFAULTS[op]}
+                      override={promptOverrides[op]}
+                      onUpdate={(field, value) => updatePromptOverride(op, field, value)}
+                      onReset={(field) => resetPromptOverride(op, field)}
+                      initiallyOpen={false}
+                    />
+                  ))}
+                </div>
+              </div>
+
+              {/* Group: Knowledge & Assistant */}
+              <div className="mb-6">
+                <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2 ml-1">Knowledge &amp; Assistant</h3>
+                <div className="flex flex-col gap-3">
+                  {(['ask_ai', 'kb_import'] as OperationId[]).map((op) => (
+                    <PromptGroupCard
+                      key={op}
+                      operationId={op}
+                      defaults={PROMPT_DEFAULTS[op]}
+                      override={promptOverrides[op]}
+                      onUpdate={(field, value) => updatePromptOverride(op, field, value)}
+                      onReset={(field) => resetPromptOverride(op, field)}
+                      initiallyOpen={false}
+                    />
                   ))}
                 </div>
               </div>
@@ -961,117 +852,12 @@ export function SettingsView() {
               <p className="text-xs text-slate-500 mb-6">Configure demo and development features for this workspace.</p>
               <SessionBanner />
 
-              {/* Sidebar Visibility */}
+              {/* Display Options */}
               <div className="bg-white border border-slate-200 rounded-xl shadow-sm mb-4">
                 <div className="p-4 bg-slate-50 border-b border-slate-200">
-                  <h3 className="font-bold text-sm text-slate-700">Sidebar Visibility</h3>
-                  <p className="text-xs text-slate-400 mt-0.5">Control which demo features appear in the navigation sidebar.</p>
+                  <h3 className="font-bold text-sm text-slate-700">Display Options</h3>
+                  <p className="text-xs text-slate-400 mt-0.5">Control display preferences for the workspace.</p>
                 </div>
-                <ToggleRow
-                  label="Show Tasks in Sidebar"
-                  description="Display the Tasks navigation item for dispatch and operations management."
-                  checked={hostSettings[0]?.demoFeatures?.showTasks ?? true}
-                  onChange={(checked) => updateHostSettings(hostSettings[0]?.hostId || '', {
-                    ...hostSettings[0],
-                    demoFeatures: {
-                      ...hostSettings[0]?.demoFeatures,
-                      showTasks: checked
-                    }
-                  })}
-                />
-                <ToggleRow
-                  label="Show Analytics in Sidebar"
-                  description="Display the Analytics navigation item for reporting and insights."
-                  checked={hostSettings[0]?.demoFeatures?.showAnalytics ?? true}
-                  onChange={(checked) => updateHostSettings(hostSettings[0]?.hostId || '', {
-                    ...hostSettings[0],
-                    demoFeatures: {
-                      ...hostSettings[0]?.demoFeatures,
-                      showAnalytics: checked
-                    }
-                  })}
-                  last
-                />
-              </div>
-
-              {/* Settings Visibility */}
-              <div className="bg-white border border-slate-200 rounded-xl shadow-sm mb-4">
-                <div className="p-4 bg-slate-50 border-b border-slate-200">
-                  <h3 className="font-bold text-sm text-slate-700">Settings Visibility</h3>
-                  <p className="text-xs text-slate-400 mt-0.5">Control which settings tabs appear in the settings panel.</p>
-                </div>
-                <ToggleRow
-                  label="Show Notifications"
-                  description="Display the Notifications settings tab."
-                  checked={hostSettings[0]?.demoFeatures?.showNotifications ?? true}
-                  onChange={(checked) => updateHostSettings(hostSettings[0]?.hostId || '', {
-                    ...hostSettings[0],
-                    demoFeatures: {
-                      ...hostSettings[0]?.demoFeatures,
-                      showNotifications: checked
-                    }
-                  })}
-                />
-                <ToggleRow
-                  label="Show Working Hours"
-                  description="Display the Working Hours settings tab."
-                  checked={hostSettings[0]?.demoFeatures?.showWorkingHours ?? true}
-                  onChange={(checked) => updateHostSettings(hostSettings[0]?.hostId || '', {
-                    ...hostSettings[0],
-                    demoFeatures: {
-                      ...hostSettings[0]?.demoFeatures,
-                      showWorkingHours: checked
-                    }
-                  })}
-                />
-                <ToggleRow
-                  label="Show Response Time Rules"
-                  description="Display the Response Time Rules (SLA) settings tab."
-                  checked={hostSettings[0]?.demoFeatures?.showResponseTimeRules ?? true}
-                  onChange={(checked) => updateHostSettings(hostSettings[0]?.hostId || '', {
-                    ...hostSettings[0],
-                    demoFeatures: {
-                      ...hostSettings[0]?.demoFeatures,
-                      showResponseTimeRules: checked
-                    }
-                  })}
-                />
-                <ToggleRow
-                  label="Show Quick Reply Templates"
-                  description="Display the Quick Reply Templates settings tab."
-                  checked={hostSettings[0]?.demoFeatures?.showQuickReplyTemplates ?? true}
-                  onChange={(checked) => updateHostSettings(hostSettings[0]?.hostId || '', {
-                    ...hostSettings[0],
-                    demoFeatures: {
-                      ...hostSettings[0]?.demoFeatures,
-                      showQuickReplyTemplates: checked
-                    }
-                  })}
-                />
-                <ToggleRow
-                  label="Show Ticket Distribution"
-                  description="Display the Ticket Distribution settings tab."
-                  checked={hostSettings[0]?.demoFeatures?.showTicketDistribution ?? true}
-                  onChange={(checked) => updateHostSettings(hostSettings[0]?.hostId || '', {
-                    ...hostSettings[0],
-                    demoFeatures: {
-                      ...hostSettings[0]?.demoFeatures,
-                      showTicketDistribution: checked
-                    }
-                  })}
-                />
-                <ToggleRow
-                  label="Show Quality & Performance"
-                  description="Display the Quality & Performance settings tab."
-                  checked={hostSettings[0]?.demoFeatures?.showQualityPerformance ?? true}
-                  onChange={(checked) => updateHostSettings(hostSettings[0]?.hostId || '', {
-                    ...hostSettings[0],
-                    demoFeatures: {
-                      ...hostSettings[0]?.demoFeatures,
-                      showQualityPerformance: checked
-                    }
-                  })}
-                />
                 <ToggleRow
                   label="Show Zoom Control"
                   description="Display the zoom control in the top bar. Disable to use browser native zooming."
@@ -1091,7 +877,7 @@ export function SettingsView() {
               <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3 ml-1">Guest Needs Panel</h3>
               <div className="bg-white border border-slate-200 rounded-xl shadow-sm mb-6 overflow-hidden">
                 {[
-                  { value: 'ai-context', label: 'AI Summary', description: 'AI writes a plain-text briefing for each inquiry — what the guest needs and relevant context in one sentence.' },
+                  { value: 'ai-context', label: 'AI Summary', description: 'AI writes a source-tagged briefing for each inquiry — KB facts, web results, and estimated info are clearly labelled.' },
                   { value: 'kb-scoring', label: 'KB Matching', description: 'Matches each inquiry against your Knowledge Base and onboarding form fields to show structured source entries.' },
                 ].map((option, i, arr) => {
                   const current = hostSettings[0]?.demoFeatures?.guestNeedsMode ?? 'ai-context';
@@ -1204,7 +990,7 @@ const PRESET_MODELS = [
   { value: 'openai/gpt-4.1-nano', label: 'openai/gpt-4.1-nano (fastest)' },
   { value: 'anthropic/claude-sonnet-4', label: 'anthropic/claude-sonnet-4' },
   { value: 'anthropic/claude-3.5-haiku', label: 'anthropic/claude-3.5-haiku' },
-  { value: 'google/gemini-2.5-flash-lite-preview', label: 'google/gemini-2.5-flash-lite (fast, cheap)' },
+  { value: 'google/gemini-2.5-flash-lite', label: 'google/gemini-2.5-flash-lite (fast, cheap)' },
   { value: 'google/gemini-2.0-flash-001', label: 'google/gemini-2.0-flash' },
   { value: 'google/gemini-3.1-flash-lite-preview', label: 'google/gemini-3.1-flash-lite' },
   { value: 'meta-llama/llama-3.3-70b-instruct', label: 'meta-llama/llama-3.3-70b' },

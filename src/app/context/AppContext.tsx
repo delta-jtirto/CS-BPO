@@ -1,12 +1,13 @@
 import React, { createContext, useContext, useState, useCallback, useEffect, useRef } from 'react';
-import type { Ticket, Task, KBEntry, Host, Message } from '../data/types';
-import { MOCK_TICKETS, INITIAL_TASKS, MOCK_KB, MOCK_HOSTS, MOCK_PROPERTIES } from '../data/mock-data';
+import type { Ticket, KBEntry, Host, Message } from '../data/types';
+import { MOCK_TICKETS, MOCK_KB, MOCK_HOSTS, MOCK_PROPERTIES } from '../data/mock-data';
 import type { Property } from '../data/types';
 import { parseThreadStatus } from '../data/types';
 import { PREFILLED_ONBOARDING } from '../data/onboarding-prefill';
 import { ONBOARDING_SECTIONS as STATIC_SECTIONS } from '../data/onboarding-template';
 import type { OnboardingSection, OnboardingField } from '../data/onboarding-template';
 import { clearDebugEntries } from '../ai/debug-store';
+import type { OperationId, PromptOverride, PromptOverrides } from '../ai/prompts';
 import { MessageSquare } from 'lucide-react';
 import { detectInquiries } from '../components/inbox/InquiryDetector';
 import { projectId, publicAnonKey } from '/utils/supabase/info';
@@ -27,7 +28,7 @@ export interface Notification {
   message: string;
   time: string;
   read: boolean;
-  type: 'ticket' | 'task' | 'system';
+  type: 'ticket' | 'system';
 }
 
 export interface HostSettings {
@@ -50,8 +51,6 @@ export interface HostSettings {
     displayHours: string; // Human-readable, e.g. "9am–9pm daily"
   };
   demoFeatures: {
-    showTasks: boolean;               // Show Tasks in sidebar
-    showAnalytics: boolean;           // Show Analytics in sidebar
     showNotifications: boolean;       // Show Notifications settings tab
     showWorkingHours: boolean;        // Show Working Hours settings tab
     showResponseTimeRules: boolean;   // Show Response Time Rules (SLA) settings tab
@@ -124,13 +123,6 @@ interface AppState {
   ticketNotes: Record<string, string>;
   updateTicketNotes: (ticketId: string, notes: string) => void;
 
-  // Tasks
-  tasks: Task[];
-  setTasks: React.Dispatch<React.SetStateAction<Task[]>>;
-  addTask: (task: Omit<Task, 'id'>) => void;
-  updateTaskStatus: (id: string, status: Task['status']) => void;
-  deleteTask: (id: string) => void;
-
   // KB
   kbEntries: KBEntry[];
   addKBEntry: (entry: Omit<KBEntry, 'id'>) => void;
@@ -170,6 +162,11 @@ interface AppState {
   // Notification preferences
   notificationPrefs: NotificationPrefs;
   updateNotificationPrefs: (updates: Partial<NotificationPrefs>) => void;
+
+  // Prompt overrides
+  promptOverrides: PromptOverrides;
+  updatePromptOverride: (op: OperationId, field: keyof PromptOverride, value: string | number | undefined) => void;
+  resetPromptOverride: (op: OperationId, field?: keyof PromptOverride) => void;
 
   // Agent preferences
   darkMode: boolean;
@@ -245,8 +242,6 @@ function makeDefaultHostSettings(h: Host): HostSettings {
     safetyKeywords: [...DEFAULT_SAFETY_KEYWORDS],
     activeHours: { enabled: false, startHour: 9, endHour: 21, displayHours: '9am–9pm daily' },
     demoFeatures: {
-      showTasks: false,
-      showAnalytics: false,
       showNotifications: false,
       showWorkingHours: false,
       showResponseTimeRules: false,
@@ -262,7 +257,6 @@ function makeDefaultHostSettings(h: Host): HostSettings {
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const [activeHostFilter, setActiveHostFilter] = useState('all');
   const [tickets, setTickets] = useState<Ticket[]>(MOCK_TICKETS);
-  const [tasks, setTasks] = useState<Task[]>(INITIAL_TASKS);
   const [kbEntries, setKbEntries] = useState<KBEntry[]>(MOCK_KB);
   const [darkMode, setDarkModeRaw] = useState(false);
   const [devModeRaw, setDevModeRaw] = useState(false);
@@ -322,6 +316,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (Array.isArray(prefs.hostSettings)) setHostSettings(prefs.hostSettings);
         if (prefs.notificationPrefs && typeof prefs.notificationPrefs === 'object') {
           setNotificationPrefs(prev => ({ ...prev, ...prefs.notificationPrefs }));
+        }
+        if (prefs.promptOverrides && typeof prefs.promptOverrides === 'object') {
+          setPromptOverridesRaw(prefs.promptOverrides);
+          try { localStorage.setItem('promptOverrides', JSON.stringify(prefs.promptOverrides)); } catch {}
         }
 
         // Load properties from dedicated table
@@ -429,7 +427,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const [notifications, setNotifications] = useState<Notification[]>([
     { id: 'n1', title: 'New Escalation', message: 'Elena Rodriguez - AC issue at Villa Azure escalated by AI', time: '2 min ago', read: false, type: 'ticket' },
-    { id: 'n2', title: 'Task Overdue', message: 'Mid-stay Cleaning for Shinjuku Lofts 402 is approaching deadline', time: '15 min ago', read: false, type: 'task' },
     { id: 'n3', title: 'Knowledge Base Updated', message: 'Urban Stays Co. luggage policy was modified by Admin', time: '1 hr ago', read: true, type: 'system' },
   ]);
 
@@ -447,6 +444,41 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setNotificationPrefs(prev => {
       const next = { ...prev, ...updates };
       syncPrefToBackend('notificationPrefs', next);
+      return next;
+    });
+  }, [syncPrefToBackend]);
+
+  const [promptOverrides, setPromptOverridesRaw] = useState<PromptOverrides>(() => {
+    try { return JSON.parse(localStorage.getItem('promptOverrides') || '{}'); } catch { return {}; }
+  });
+
+  const updatePromptOverride = useCallback((op: OperationId, field: keyof PromptOverride, value: string | number | undefined) => {
+    setPromptOverridesRaw(prev => {
+      const next: PromptOverrides = { ...prev, [op]: { ...prev[op], [field]: value } };
+      if (value === undefined) {
+        const opOverride = { ...next[op] };
+        delete opOverride[field];
+        next[op] = Object.keys(opOverride).length ? opOverride : undefined;
+      }
+      try { localStorage.setItem('promptOverrides', JSON.stringify(next)); } catch {}
+      syncPrefToBackend('promptOverrides', next);
+      return next;
+    });
+  }, [syncPrefToBackend]);
+
+  const resetPromptOverride = useCallback((op: OperationId, field?: keyof PromptOverride) => {
+    setPromptOverridesRaw(prev => {
+      let next: PromptOverrides;
+      if (field) {
+        const opOverride = { ...prev[op] };
+        delete opOverride[field];
+        next = { ...prev, [op]: Object.keys(opOverride).length ? opOverride : undefined };
+      } else {
+        next = { ...prev };
+        delete next[op];
+      }
+      try { localStorage.setItem('promptOverrides', JSON.stringify(next)); } catch {}
+      syncPrefToBackend('promptOverrides', next);
       return next;
     });
   }, [syncPrefToBackend]);
@@ -701,23 +733,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setAutoReplyHandedOffState(prev => { const n = { ...prev }; delete n[ticketId]; return n; });
     setAutoReplyProcessingState(prev => { const n = { ...prev }; delete n[ticketId]; return n; });
     setDraftRepliesState(prev => { const n = { ...prev }; delete n[ticketId]; return n; });
-  }, []);
-
-  const addTask = useCallback((task: Omit<Task, 'id'>) => {
-    const newTask: Task = { ...task, id: `tsk-${Date.now()}` };
-    setTasks(prev => [newTask, ...prev]);
-    setNotifications(prev => [
-      { id: `n-${Date.now()}`, title: 'Task Created', message: `New task: ${task.title}`, time: 'Just now', read: false, type: 'task' },
-      ...prev,
-    ]);
-  }, []);
-
-  const updateTaskStatus = useCallback((id: string, status: Task['status']) => {
-    setTasks(prev => prev.map(t => t.id === id ? { ...t, status } : t));
-  }, []);
-
-  const deleteTask = useCallback((id: string) => {
-    setTasks(prev => prev.filter(t => t.id !== id));
   }, []);
 
   const addKBEntry = useCallback((entry: Omit<KBEntry, 'id'>) => {
@@ -1122,7 +1137,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setActiveHostFilter('all');
     skipNextTicketSaveRef.current = true;
     setTickets(MOCK_TICKETS);
-    setTasks(INITIAL_TASKS);
     setKbEntries(MOCK_KB);
     setDarkModeRaw(false);
     setDevModeRaw(false);
@@ -1132,7 +1146,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setAiModelRaw('openai/gpt-4o-mini');
     setNotifications([
       { id: 'n1', title: 'New Escalation', message: 'Elena Rodriguez - AC issue at Villa Azure escalated by AI', time: '2 min ago', read: false, type: 'ticket' },
-      { id: 'n2', title: 'Task Overdue', message: 'Mid-stay Cleaning for Shinjuku Lofts 402 is approaching deadline', time: '15 min ago', read: false, type: 'task' },
       { id: 'n3', title: 'Knowledge Base Updated', message: 'Urban Stays Co. luggage policy was modified by Admin', time: '1 hr ago', read: true, type: 'system' },
     ]);
     const resetHostSettings = MOCK_HOSTS.map(h => makeDefaultHostSettings(h));
@@ -1313,7 +1326,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       tickets, resolveTicket, addMessageToTicket, injectGuestMessage, addBotMessage, addSystemMessage, addMultipleMessages, escalateTicketStatus, escalateTicketWithUrgency, deescalateTicket, deleteMessageFromTicket, deleteThread,
       draftReplies, setDraftReply, clearDraftReply,
       ticketNotes, updateTicketNotes,
-      tasks, setTasks, addTask, updateTaskStatus, deleteTask,
       kbEntries, addKBEntry, updateKBEntry, deleteKBEntry, deleteKBEntriesBySource,
       properties, addProperty, updatePropertyStatus, updatePropertyMeta, deleteProperty,
       onboardingData, setOnboardingField, setOnboardingBulk,
@@ -1344,6 +1356,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       resetToDemo,
       createTestTicket,
       notificationPrefs, updateNotificationPrefs,
+      promptOverrides, updatePromptOverride, resetPromptOverride,
       autoReplyProcessing, setAutoReplyProcessing,
       autoReplyCancelledRef,
       autoReplyAbortControllers,

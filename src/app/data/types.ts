@@ -70,16 +70,6 @@ export interface KBEntry {
   sectionId?: string; // maps back to the form section that generated this entry
 }
 
-export interface Task {
-  id: string;
-  title: string;
-  host: string;
-  prop: string;
-  vendor: string;
-  status: 'pending' | 'dispatched' | 'resolved';
-  due: string;
-}
-
 /** Structured thread status — avoids brittle string prefix parsing (#23) */
 export type ThreadStatus = 'ai-handled' | 'handed-off' | 'partial' | 'safety' | null;
 

@@ -126,7 +126,7 @@ app.delete("/make-server-ab702ee0/ai/settings/key", async (c) => {
 // Returns all saved agent preferences (devMode, agentName, etc.)
 app.get("/make-server-ab702ee0/preferences", async (c) => {
   try {
-    const prefKeys = ["devMode", "agentName", "darkMode", "defaultLanguage", "hostSettings", "ticketState", "properties"];
+    const prefKeys = ["devMode", "agentName", "darkMode", "defaultLanguage", "hostSettings", "ticketState", "properties", "promptOverrides"];
     const results = await Promise.all(
       prefKeys.map(k => kv.get(`${KV_PREFS_PREFIX}${k}`))
     );

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import type React from 'react';
 import { Outlet, useNavigate, useLocation } from 'react-router';
-import { MessageSquare, CheckSquare, Building2, Settings, Keyboard, BarChart3 } from 'lucide-react';
+import { MessageSquare, Building2, Settings, Keyboard } from 'lucide-react';
 import { Toaster } from 'sonner';
 import { TopBar } from './TopBar';
 import { NavItem } from './NavItem';
@@ -30,17 +30,10 @@ function AppInner({
   useGlobalAutoReply();
   const appContext = useAppContext();
 
-  // Get first host's demo feature settings
-  const hostSettings = appContext.hostSettings?.[0];
-  const showTasks = hostSettings?.demoFeatures?.showTasks ?? true;
-  const showAnalytics = hostSettings?.demoFeatures?.showAnalytics ?? true;
-
-  // Build nav items with conditional rendering
+  // Build nav items
   const navItems = [
-    { icon: MessageSquare, path: '/inbox', label: 'Inbox', tooltip: 'Omnichannel Inbox', shortcut: 'I' },
-    ...(showTasks ? [{ icon: CheckSquare, path: '/tasks', label: 'Tasks', tooltip: 'Dispatch & Operations', shortcut: 'T' }] : []),
-    { icon: Building2, path: '/kb', label: 'Props', tooltip: 'Property Info Forms', shortcut: 'K' },
-    ...(showAnalytics ? [{ icon: BarChart3, path: '/analytics', label: 'Analytics', tooltip: 'Analytics & Reporting', shortcut: 'A' }] : []),
+    { icon: MessageSquare, path: '/inbox', label: 'Inbox', tooltip: 'Omnichannel Inbox', shortcut: 'I', badge: undefined as number | undefined },
+    { icon: Building2, path: '/kb', label: 'Props', tooltip: 'Property Info Forms', shortcut: 'K', badge: undefined as number | undefined },
   ];
 
   return (
@@ -53,7 +46,7 @@ function AppInner({
           <div className="w-[72px] bg-white border-r border-slate-200 flex flex-col items-center py-3 shrink-0 shadow-sm z-20">
             <nav className="flex flex-col gap-1 w-full px-2">
               {navItems.map(item => (
-                <NavItem key={item.path} icon={item.icon} active={isActive(item.path)} onClick={() => navigate(item.path)} tooltip={item.tooltip} label={item.label} shortcut={item.shortcut} />
+                <NavItem key={item.path} icon={item.icon} active={isActive(item.path)} onClick={() => navigate(item.path)} tooltip={item.tooltip} label={item.label} shortcut={item.shortcut} badge={item.badge} />
               ))}
             </nav>
             <div className="mt-auto flex flex-col gap-1 w-full px-2">
@@ -87,7 +80,14 @@ function AppInner({
                   active ? 'text-indigo-600' : 'text-slate-400'
                 }`}
               >
-                <item.icon size={20} strokeWidth={active ? 2.5 : 2} />
+                <div className="relative">
+                  <item.icon size={20} strokeWidth={active ? 2.5 : 2} />
+                  {item.badge != null && item.badge > 0 && (
+                    <span className="absolute -top-1.5 -right-2 min-w-[14px] h-[14px] flex items-center justify-center rounded-full bg-white border border-orange-400 text-orange-500 text-[7px] font-bold leading-none px-0.5">
+                      {item.badge > 99 ? '99+' : item.badge}
+                    </span>
+                  )}
+                </div>
                 <span className="text-[9px] font-bold">{item.label}</span>
               </button>
             );
@@ -137,9 +137,7 @@ export function AppLayout() {
 
     // G+key navigation (two-key combo via sequential press)
     if (e.key === 'i' && !e.ctrlKey) { navigate('/inbox'); return; }
-    if (e.key === 't' && !e.ctrlKey) { navigate('/tasks'); return; }
     if (e.key === 'k' && !e.ctrlKey) { navigate('/kb'); return; }
-    if (e.key === 'a' && !e.ctrlKey) { navigate('/analytics'); return; }
     if (e.key === 's' && !e.ctrlKey) { navigate('/settings'); return; }
   }, [navigate]);
 

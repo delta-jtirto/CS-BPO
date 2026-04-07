@@ -1,4 +1,4 @@
-import { detectInquiries, scoreKBForInquiry } from '../inbox/InquiryDetector';
+import { detectInquiries, scoreKBForInquiry, type DetectedInquiry } from '../inbox/InquiryDetector';
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router';
 import {
@@ -8,7 +8,7 @@ import {
   Plus, X, Trash2, Copy, FileEdit, Info, ShieldAlert, ArrowRightLeft,
   Loader2, Square, PauseCircle, SkipForward, Zap, AlertCircle,
   ArrowLeft, PanelRightOpen, PanelRightClose, PanelLeftOpen, PanelLeftClose, ChevronsLeft, ChevronsRight,
-  ArrowDown, MessageSquare as MessageSquareIcon, MoreVertical, Share2, FileText
+  ArrowDown, MessageSquare as MessageSquareIcon, MoreVertical, Share2, FileText, Settings
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { toast } from 'sonner';
@@ -79,6 +79,7 @@ export function InboxView() {
   const [rightTab, setRightTab] = useState<'assistant' | 'details'>('assistant');
   const [guestMode, setGuestMode] = useState(false);
   const [showSmartReply, setShowSmartReply] = useState(false);
+  const [classifiedInquiries, setClassifiedInquiries] = useState<DetectedInquiry[]>([]);
   const [summaryCollapsed, setSummaryCollapsed] = useState(true);
   const [viewedTickets, setViewedTickets] = useState<Record<string, number>>({});
   const [cardMenuOpen, setCardMenuOpen] = useState<string | null>(null);
@@ -90,6 +91,10 @@ export function InboxView() {
     return () => { clearTimeout(t); document.removeEventListener('click', close); };
   }, [cardMenuOpen, headerMenuOpen]);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  /** Ref to the main reply compose textarea — used for cursor-position insertion */
+  const composeTextareaRef = useRef<HTMLTextAreaElement>(null);
+  /** Tracks whether a highlight flash animation is active on the compose box */
+  const [composeHighlight, setComposeHighlight] = useState(false);
   const isMobile = useIsMobile();
   // Mobile panel: 'list' = inbox sidebar, 'thread' = chat, 'details' = right panel
   const [mobilePanel, setMobilePanel] = useState<'list' | 'thread' | 'details'>(ticketId ? 'thread' : 'list');
@@ -462,7 +467,8 @@ export function InboxView() {
     }
   };
 
-  const handleResolve = () => {
+  /** Core resolve logic — navigates away and shows KB nudge */
+  const doResolve = () => {
     const guestMessages = activeTicket.messages.filter(m => m.sender === 'guest').map(m => m.text);
     const inquiries = detectInquiries(guestMessages, activeTicket.tags, activeTicket.summary);
     const activeProp = MOCK_PROPERTIES.find(p => p.name === activeTicket.property);
@@ -500,6 +506,10 @@ export function InboxView() {
     }
   };
 
+  const handleResolve = () => {
+    doResolve();
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
@@ -508,7 +518,32 @@ export function InboxView() {
   };
 
   const handleComposeReply = (text: string) => {
-    setReplyText(text);
+    const el = composeTextareaRef.current;
+    if (el) {
+      // Insert at cursor position — never replace existing text or blindly append
+      const start = el.selectionStart ?? el.value.length;
+      const end = el.selectionEnd ?? el.value.length;
+      const before = el.value.slice(0, start);
+      const after = el.value.slice(end);
+      const separator = before.length > 0 && !before.endsWith(' ') && !before.endsWith('\n') ? ' ' : '';
+      const newValue = before + separator + text + after;
+      setReplyText(newValue);
+      // Restore cursor to after inserted text and refocus
+      requestAnimationFrame(() => {
+        el.focus();
+        const newCursor = start + separator.length + text.length;
+        el.setSelectionRange(newCursor, newCursor);
+        // Auto-resize
+        el.style.height = 'auto';
+        el.style.height = `${Math.min(el.scrollHeight, 220)}px`;
+      });
+    } else {
+      // Fallback if ref not available yet
+      setReplyText((prev) => prev ? prev + ' ' + text : text);
+    }
+    // Brief highlight flash to draw eye to where text was inserted
+    setComposeHighlight(true);
+    setTimeout(() => setComposeHighlight(false), 400);
   };
 
   const handleSmartReplyInsert = (text: string) => {
@@ -964,6 +999,44 @@ export function InboxView() {
             );
           })()}
 
+          {/* Gear icon — link to company-level AI settings */}
+          {(() => {
+            const hostConfig = activeTicket ? hostSettings.find(s => s.hostId === activeTicket.host.id) : null;
+            if (!hostConfig) return null;
+            return (
+              <button
+                onClick={() => navigate('/settings?tab=ai')}
+                title="Company AI settings"
+                className="shrink-0 p-1 rounded-full text-slate-300 hover:text-slate-500 hover:bg-slate-100 transition-colors"
+              >
+                <Settings size={11} />
+              </button>
+            );
+          })()}
+
+          {/* AI mode pill — clickable, navigates to Settings > AI */}
+          {(() => {
+            const hostConfig = activeTicket ? hostSettings.find(s => s.hostId === activeTicket.host.id) : null;
+            if (!hostConfig) return null;
+            const mode = hostConfig.autoReplyMode;
+            const label = mode === 'auto' ? 'AI: Auto' : mode === 'draft' ? 'AI: Draft' : 'AI: Off';
+            const pillColor = mode === 'auto'
+              ? 'bg-indigo-50 text-indigo-500 border-indigo-200 hover:bg-indigo-100'
+              : mode === 'draft'
+              ? 'bg-amber-50 text-amber-500 border-amber-200 hover:bg-amber-100'
+              : 'bg-slate-100 text-slate-400 border-slate-200 hover:bg-slate-200';
+            return (
+              <button
+                onClick={() => navigate('/settings?tab=ai')}
+                title="View company AI settings"
+                className={`hidden sm:flex items-center gap-1 text-[9px] font-bold px-2 py-1 rounded-full border whitespace-nowrap shrink-0 transition-colors ${pillColor}`}
+              >
+                <Sparkles size={8} />
+                {label}
+              </button>
+            );
+          })()}
+
           {/* Status badge — hidden on very narrow */}
           {(activeSystemStatus || activeIsHandedOff) && (() => {
             const eff = activeIsHandedOff ? 'handed-off' : activeSystemStatus;
@@ -1027,6 +1100,26 @@ export function InboxView() {
                   <activeTicket.channelIcon size={12} /> {activeTicket.channel}
                   <span className="text-slate-300 mx-1">·</span>
                   <span className="truncate text-slate-400">{activeTicket.host.name}</span>
+                  {(() => {
+                    const hostConfig = hostSettings.find(s => s.hostId === activeTicket.host.id);
+                    if (!hostConfig) return null;
+                    const mode = hostConfig.autoReplyMode;
+                    const label = mode === 'auto' ? 'AI: Auto' : mode === 'draft' ? 'AI: Draft' : 'AI: Off';
+                    const pillColor = mode === 'auto'
+                      ? 'bg-indigo-50 text-indigo-500 border-indigo-200'
+                      : mode === 'draft'
+                      ? 'bg-amber-50 text-amber-500 border-amber-200'
+                      : 'bg-slate-100 text-slate-400 border-slate-200';
+                    return (
+                      <button
+                        onClick={() => { setHeaderMenuOpen(false); navigate('/settings?tab=ai'); }}
+                        className={`ml-auto flex items-center gap-1 text-[9px] font-bold px-2 py-0.5 rounded-full border shrink-0 ${pillColor}`}
+                      >
+                        <Sparkles size={8} />
+                        {label}
+                      </button>
+                    );
+                  })()}
                 </div>
                 {/* Panel toggle */}
                 {!isMobile && (
@@ -1282,6 +1375,7 @@ export function InboxView() {
             onInsert={handleSmartReplyInsert}
             onHide={() => setShowSmartReply(false)}
             cacheRef={smartReplyCacheRef}
+            aiInquiries={classifiedInquiries}
           />
         )}
 
@@ -1344,6 +1438,7 @@ export function InboxView() {
           )}
           <textarea
             ref={(el) => {
+              (composeTextareaRef as { current: HTMLTextAreaElement | null }).current = el;
               if (el) {
                 el.style.height = 'auto';
                 el.style.height = `${Math.min(el.scrollHeight, isMobile ? 120 : 220)}px`;
@@ -1362,10 +1457,12 @@ export function InboxView() {
                 ? `Chat as ${activeTicket.guestName.split(' ')[0]}...`
                 : `Reply to ${activeTicket.guestName.split(' ')[0]}... (${navigator.platform.includes('Mac') ? '\u2318' : 'Ctrl'}+Enter)`
             }
-            className={`w-full rounded-xl ${isMobile ? 'p-2.5 text-[13px] min-h-[48px] max-h-[120px]' : 'p-3 text-sm min-h-[72px] max-h-[220px]'} focus:outline-none resize-none transition-colors ${
-              guestMode
-                ? 'border-2 border-emerald-300 bg-white focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 placeholder:text-emerald-400'
-                : 'border border-slate-200 bg-slate-50/60 focus:ring-2 focus:ring-indigo-400 focus:border-indigo-300 placeholder:text-slate-400'
+            className={`w-full rounded-xl ${isMobile ? 'p-2.5 text-[13px] min-h-[48px] max-h-[120px]' : 'p-3 text-sm min-h-[72px] max-h-[220px]'} focus:outline-none resize-none transition-all duration-300 ${
+              composeHighlight
+                ? 'ring-2 ring-indigo-300 bg-indigo-50/40 border-indigo-200'
+                : guestMode
+                  ? 'border-2 border-emerald-300 bg-white focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 placeholder:text-emerald-400'
+                  : 'border border-slate-200 bg-slate-50/60 focus:ring-2 focus:ring-indigo-400 focus:border-indigo-300 placeholder:text-slate-400'
             }`}
           />
           <div className="flex items-center justify-between mt-1.5 gap-2">
@@ -1528,6 +1625,7 @@ export function InboxView() {
               ticket={activeTicket}
               onComposeReply={handleComposeReply}
               onNavigateToKB={(propId) => navigate(`/kb/${propId}`)}
+              onInquiriesClassified={setClassifiedInquiries}
             />
           ) : (
             <div>
@@ -1616,6 +1714,7 @@ export function InboxView() {
         onConfirm={() => { setShowResolveConfirm(false); handleResolve(); }}
         onCancel={() => setShowResolveConfirm(false)}
       />
+
 
       {/* Delete thread confirmation */}
       <ConfirmDialog
