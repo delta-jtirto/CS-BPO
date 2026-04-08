@@ -999,44 +999,6 @@ export function InboxView() {
             );
           })()}
 
-          {/* Gear icon — link to company-level AI settings */}
-          {(() => {
-            const hostConfig = activeTicket ? hostSettings.find(s => s.hostId === activeTicket.host.id) : null;
-            if (!hostConfig) return null;
-            return (
-              <button
-                onClick={() => navigate('/settings?tab=ai')}
-                title="Company AI settings"
-                className="shrink-0 p-1 rounded-full text-slate-300 hover:text-slate-500 hover:bg-slate-100 transition-colors"
-              >
-                <Settings size={11} />
-              </button>
-            );
-          })()}
-
-          {/* AI mode pill — clickable, navigates to Settings > AI */}
-          {(() => {
-            const hostConfig = activeTicket ? hostSettings.find(s => s.hostId === activeTicket.host.id) : null;
-            if (!hostConfig) return null;
-            const mode = hostConfig.autoReplyMode;
-            const label = mode === 'auto' ? 'AI: Auto' : mode === 'draft' ? 'AI: Draft' : 'AI: Off';
-            const pillColor = mode === 'auto'
-              ? 'bg-indigo-50 text-indigo-500 border-indigo-200 hover:bg-indigo-100'
-              : mode === 'draft'
-              ? 'bg-amber-50 text-amber-500 border-amber-200 hover:bg-amber-100'
-              : 'bg-slate-100 text-slate-400 border-slate-200 hover:bg-slate-200';
-            return (
-              <button
-                onClick={() => navigate('/settings?tab=ai')}
-                title="View company AI settings"
-                className={`hidden sm:flex items-center gap-1 text-[9px] font-bold px-2 py-1 rounded-full border whitespace-nowrap shrink-0 transition-colors ${pillColor}`}
-              >
-                <Sparkles size={8} />
-                {label}
-              </button>
-            );
-          })()}
-
           {/* Status badge — hidden on very narrow */}
           {(activeSystemStatus || activeIsHandedOff) && (() => {
             const eff = activeIsHandedOff ? 'handed-off' : activeSystemStatus;
@@ -1051,26 +1013,6 @@ export function InboxView() {
               </span>
             );
           })()}
-
-          {/* Notify Host — BPO Step 3, copy LINE WORKS summary */}
-          <button
-            onClick={() => {
-              const summary = [
-                `[Delta Support → Host]`,
-                `Guest: ${activeTicket.guestName} | ${activeTicket.property} · ${activeTicket.room}`,
-                `Issue: ${activeTicket.summary}`,
-                `Initial response sent. Please advise.`,
-                `Booking: ${activeTicket.booking.checkIn} – ${activeTicket.booking.checkOut}`,
-              ].join('\n');
-              navigator.clipboard.writeText(summary).catch(() => {});
-              toast.success('Copied — paste into LINE WORKS', { description: `Summary for ${activeTicket.guestName} ready to share.`, duration: 4000 });
-            }}
-            className="px-2.5 py-1.5 text-xs font-semibold bg-slate-100 text-slate-600 rounded-lg hover:bg-slate-200 flex items-center gap-1 shadow-sm transition-colors active:scale-95 shrink-0"
-            title="Copy host notification summary for LINE WORKS"
-          >
-            <Share2 size={12} /> Notify Host
-          </button>
-
 
           {/* ⋮ More menu */}
           <div className="relative shrink-0">
@@ -1100,27 +1042,64 @@ export function InboxView() {
                   <activeTicket.channelIcon size={12} /> {activeTicket.channel}
                   <span className="text-slate-300 mx-1">·</span>
                   <span className="truncate text-slate-400">{activeTicket.host.name}</span>
-                  {(() => {
-                    const hostConfig = hostSettings.find(s => s.hostId === activeTicket.host.id);
-                    if (!hostConfig) return null;
-                    const mode = hostConfig.autoReplyMode;
-                    const label = mode === 'auto' ? 'AI: Auto' : mode === 'draft' ? 'AI: Draft' : 'AI: Off';
-                    const pillColor = mode === 'auto'
-                      ? 'bg-indigo-50 text-indigo-500 border-indigo-200'
-                      : mode === 'draft'
-                      ? 'bg-amber-50 text-amber-500 border-amber-200'
-                      : 'bg-slate-100 text-slate-400 border-slate-200';
-                    return (
-                      <button
-                        onClick={() => { setHeaderMenuOpen(false); navigate('/settings?tab=ai'); }}
-                        className={`ml-auto flex items-center gap-1 text-[9px] font-bold px-2 py-0.5 rounded-full border shrink-0 ${pillColor}`}
-                      >
-                        <Sparkles size={8} />
-                        {label}
-                      </button>
-                    );
-                  })()}
                 </div>
+                {/* AI toggle */}
+                {(() => {
+                  const hostConfig = activeTicket ? hostSettings.find(s => s.hostId === activeTicket.host.id) : null;
+                  if (!hostConfig) return null;
+                  const hostAutoReply = hostConfig.autoReply;
+                  const activeIsPaused = autoReplyPausedTickets[activeTicket.id];
+                  const activeIsHandedOff2 = autoReplyHandedOff[activeTicket.id] === true;
+                  const aiOff2 = !hostAutoReply || activeIsPaused || activeIsHandedOff2;
+                  return (
+                    <button
+                      onClick={() => {
+                        setHeaderMenuOpen(false);
+                        if (!hostAutoReply) {
+                          updateHostSettings(activeTicket.host.id, { autoReply: true });
+                          if (activeIsPaused) toggleAutoReplyPause(activeTicket.id);
+                          if (activeIsHandedOff2) setAutoReplyHandedOff(activeTicket.id, false);
+                          toast.success('Auto-reply enabled', { description: `AI is now active for ${activeTicket.host.name}.`, duration: 3000 });
+                        } else if (activeIsPaused || activeIsHandedOff2) {
+                          if (activeIsPaused) toggleAutoReplyPause(activeTicket.id);
+                          if (activeIsHandedOff2) setAutoReplyHandedOff(activeTicket.id, false);
+                          toast.success('AI enabled', { description: `Auto-reply active for ${activeTicket.guestName}.`, duration: 3000 });
+                        } else {
+                          toggleAutoReplyPause(activeTicket.id);
+                          toast('AI paused', { description: `You're handling ${activeTicket.guestName} manually.`, duration: 3000 });
+                        }
+                      }}
+                      className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50 transition-colors"
+                    >
+                      {aiOff2 ? <><PauseCircle size={13} /> Enable AI</> : <><Zap size={13} /> Pause AI</>}
+                    </button>
+                  );
+                })()}
+                {/* AI settings */}
+                <button
+                  onClick={() => { setHeaderMenuOpen(false); navigate('/settings?tab=ai'); }}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50 transition-colors"
+                >
+                  <Settings size={13} /> AI Settings
+                </button>
+                {/* Notify Host */}
+                <button
+                  onClick={() => {
+                    setHeaderMenuOpen(false);
+                    const summary = [
+                      `[Delta Support → Host]`,
+                      `Guest: ${activeTicket.guestName} | ${activeTicket.property} · ${activeTicket.room}`,
+                      `Issue: ${activeTicket.summary}`,
+                      `Initial response sent. Please advise.`,
+                      `Booking: ${activeTicket.booking.checkIn} – ${activeTicket.booking.checkOut}`,
+                    ].join('\n');
+                    navigator.clipboard.writeText(summary).catch(() => {});
+                    toast.success('Copied — paste into LINE WORKS', { description: `Summary for ${activeTicket.guestName} ready to share.`, duration: 4000 });
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50 transition-colors border-b border-slate-100"
+                >
+                  <Share2 size={13} /> Notify Host
+                </button>
                 {/* Panel toggle */}
                 {!isMobile && (
                   <button
