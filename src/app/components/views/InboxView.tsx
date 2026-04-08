@@ -1,8 +1,9 @@
 import { detectInquiries, scoreKBForInquiry, type DetectedInquiry } from '../inbox/InquiryDetector';
-import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo, useDeferredValue } from 'react';
+import Fuse from 'fuse.js';
 import { useParams, useNavigate } from 'react-router';
 import {
-  Clock, Send, User,
+  Clock, Send, User, Search,
   Sparkles, CheckCircle, ChevronRight, ChevronDown, Briefcase,
   Building, Key, Bot, Users, Globe2, Tag, UserCircle, Home,
   Plus, X, Trash2, Copy, FileEdit, Info, ShieldAlert, ArrowRightLeft,
@@ -19,6 +20,11 @@ import { ConfirmDialog } from '../shared/ConfirmDialog';
 import { AssistantPanel } from '../inbox/AssistantPanel';
 import { SmartReplyPanel, type SmartReplyCache } from '../inbox/SmartReplyPanel';
 import { useIsMobile } from '../ui/use-mobile';
+import { useFirestoreMessages } from '@/hooks/use-firestore-messages';
+import { ConnectionStatusBar } from '../ConnectionStatusBar';
+import { SLABadge, getSLAStatus } from '../inbox/SLABadge';
+import { computeTags, getLastGuestMessageAt } from '@/lib/compute-ticket-state';
+import { fetchBookingDetails, type BookingDetails } from '@/lib/pms-api';
 
 export function InboxView() {
   const { ticketId } = useParams();
@@ -33,15 +39,145 @@ export function InboxView() {
     autoReplyHandedOff, setAutoReplyHandedOff,
     resumeAllAI, hostSettings, notificationPrefs, updateHostSettings,
     ticketNotes, updateTicketNotes,
+    activeMessages, setActiveMessages,
+    firestoreConnections, firestoreInitializing,
   } = useAppContext();
 
   const filteredTickets = activeHostFilter === 'all' ? tickets : tickets.filter(t => t.host.id === activeHostFilter);
-  const activeTicket = (ticketId ? filteredTickets.find(t => t.id === ticketId) : filteredTickets[0]) || filteredTickets[0];
+
+  // ─── Search + Filters ─────────────────────────────────────
+  const [searchQuery, setSearchQuery] = useState('');
+  const deferredQuery = useDeferredValue(searchQuery);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const [filterCompany, setFilterCompany] = useState('');
+  const [filterChannel, setFilterChannel] = useState('');
+  const [showFilters, setShowFilters] = useState(false);
+
+  // Categorical filters (AND logic, applied before fuzzy search)
+  const categoryFiltered = useMemo(() => filteredTickets.filter(t => {
+    if (filterCompany && (t.companyName || t.host.name) !== filterCompany) return false;
+    if (filterChannel && t.channel !== filterChannel) return false;
+    return true;
+  }), [filteredTickets, filterCompany, filterChannel]);
+
+  // Fuse.js fuzzy search on the filtered set
+  const fuse = useMemo(() => new Fuse(categoryFiltered, {
+    keys: [
+      { name: 'guestName', weight: 0.6 },
+      { name: 'bookingId', weight: 0.3 },
+      { name: 'summary', weight: 0.1 },
+    ],
+    threshold: 0.3,
+    ignoreLocation: true,
+  }), [categoryFiltered]);
+
+  const searchedTickets = deferredQuery.trim()
+    ? fuse.search(deferredQuery).map(r => r.item)
+    : categoryFiltered;
+
+  const isSearchActive = Boolean(deferredQuery.trim() || filterCompany || filterChannel);
+
+  // Unique values for filter dropdowns (only show if >1 option)
+  const uniqueCompanies = useMemo(() => [...new Set(filteredTickets.map(t => t.companyName || t.host.name).filter(Boolean))], [filteredTickets]);
+  const uniqueChannels = useMemo(() => [...new Set(filteredTickets.map(t => t.channel).filter(Boolean))], [filteredTickets]);
+
+  // "/" keyboard shortcut to focus search
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === '/' && !['INPUT', 'TEXTAREA', 'SELECT'].includes((e.target as HTMLElement).tagName)) {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      }
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, []);
+
+  const activeTicket = (ticketId ? searchedTickets.find(t => t.id === ticketId) : searchedTickets[0]) || searchedTickets[0];
+
+  // ─── Firestore messages: subscribe to active ticket's thread ───
+  // Find the Firestore db instance for the active ticket's company
+  const activeTicketDb = useMemo(() => {
+    if (!activeTicket?.firestoreHostId) return null;
+    const conn = firestoreConnections.find(c => c.hostId === activeTicket.firestoreHostId && c.status === 'connected');
+    return conn?.db || null;
+  }, [activeTicket?.firestoreHostId, firestoreConnections]);
+
+  const { messages: firestoreMessages, isLoading: messagesLoading } = useFirestoreMessages(
+    activeTicket?.firestoreThreadId || null,
+    activeTicketDb,
+    activeTicket?.firestoreGuestUserId,
+  );
+
+  // Sync Firestore messages into context so other components can access them
+  useEffect(() => {
+    if (firestoreMessages.length > 0) {
+      setActiveMessages(firestoreMessages);
+    } else if (!activeTicket?.firestoreThreadId) {
+      // Non-Firestore ticket — clear active messages
+      setActiveMessages([]);
+    }
+  }, [firestoreMessages, activeTicket?.firestoreThreadId, setActiveMessages]);
+
+  // Helper: get messages for a ticket — from Firestore (activeMessages) for active ticket,
+  // or from embedded messages (mock/devMode), defaulting to empty array.
+  const getMessages = useCallback((ticket: typeof activeTicket) => {
+    if (!ticket) return [];
+    // For active ticket with Firestore thread: use Firestore messages
+    if (ticket.firestoreThreadId && ticket.id === activeTicket?.id && activeMessages.length > 0) {
+      return activeMessages;
+    }
+    return ticket.messages || [];
+  }, [activeTicket?.id, activeMessages]);
+
+  // Check if the active ticket's connection is stale (expired/disconnected)
+  const isActiveTicketStale = useMemo(() => {
+    if (!activeTicket?.firestoreHostId) return false;
+    const conn = firestoreConnections.find(c => c.hostId === activeTicket.firestoreHostId);
+    return conn ? conn.status !== 'connected' : false;
+  }, [activeTicket?.firestoreHostId, firestoreConnections]);
+
+  // ─── 30s SLA tick for thread list ──────────────────────────
+  const [, setSlaListTick] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => setSlaListTick(t => t + 1), 30_000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // ─── PMS booking details (lazy fetch on active ticket) ────
+  const [bookingDetails, setBookingDetails] = useState<BookingDetails | null>(null);
+  const [bookingLoading, setBookingLoading] = useState(false);
+  useEffect(() => {
+    if (!activeTicket?.bookingId || !activeTicket?.firestoreHostId) {
+      setBookingDetails(null);
+      return;
+    }
+    const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
+    const token = tokens[activeTicket.firestoreHostId];
+    if (!token) return;
+
+    setBookingLoading(true);
+    fetchBookingDetails(activeTicket.bookingId, token)
+      .then(d => setBookingDetails(d))
+      .finally(() => setBookingLoading(false));
+  }, [activeTicket?.bookingId, activeTicket?.firestoreHostId]);
+
+  // ─── Computed tags for active ticket (detail view only) ───
+  const activeTags = useMemo(() => {
+    if (!activeTicket) return activeTicket?.tags || [];
+    const msgs = getMessages(activeTicket);
+    if (msgs.length === 0) return activeTicket.tags || [];
+    // For Firestore threads: compute tags from messages
+    if (activeTicket.firestoreThreadId) {
+      return computeTags(activeTicket.id, msgs);
+    }
+    return activeTicket.tags || [];
+  }, [activeTicket?.id, activeMessages.length, getMessages, activeTicket]);
 
   // BPO Step 3 — escalation guidance: map detected inquiry types to host contact strategy
   const escalationGuidance = useMemo(() => {
     if (!activeTicket) return null;
-    const guestMsgs = activeTicket.messages.filter(m => m.sender === 'guest').map(m => m.text);
+    const guestMsgs = getMessages(activeTicket).filter(m => m.sender === 'guest').map(m => m.text);
     const inquiries = detectInquiries(guestMsgs, activeTicket.tags, activeTicket.summary);
     const types = inquiries.map(i => i.type);
     if (types.some(t => ['maintenance', 'safety', 'billing'].includes(t))) return 'immediate' as const;
@@ -55,7 +191,7 @@ export function InboxView() {
     if (autoReplyHandedOff[t.id] === true) return true;
     // Check system message for handed-off status (not explicitly resumed)
     if (autoReplyHandedOff[t.id] !== false) {
-      const lastSys = [...t.messages].reverse().find(m => m.sender === 'system');
+      const lastSys = [...(t.messages || [])].reverse().find(m => m.sender === 'system');
       if (lastSys?.text.toLowerCase().startsWith('routed to team') || lastSys?.text.toLowerCase().startsWith('silently routed')) return true;
     }
     return false;
@@ -66,7 +202,7 @@ export function InboxView() {
 
   // ─── Active ticket AI status (for thread header chip) ──────────
   const activeIsPaused = activeTicket ? autoReplyPausedTickets[activeTicket.id] : false;
-  const activeLastSysMsg = activeTicket ? [...activeTicket.messages].reverse().find(m => m.sender === 'system') : null;
+  const activeLastSysMsg = activeTicket ? [...getMessages(activeTicket)].reverse().find(m => m.sender === 'system') : null;
   // #23: Use structured status parser instead of brittle string prefix matching
   const activeSystemStatus = activeLastSysMsg ? parseThreadStatus(activeLastSysMsg.text) : null;
   const activeIsHandedOff = activeTicket ? (
@@ -361,7 +497,7 @@ export function InboxView() {
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [activeTicket?.messages.length]);
+  }, [activeTicket?.messages?.length]);
 
   // When ticket changes, switch mobile to thread view if a ticketId is in the URL
   useEffect(() => {
@@ -375,21 +511,22 @@ export function InboxView() {
     setRightTab('assistant');
     setShowSmartReply(false);
     setGuestMode(false);
-    setViewedTickets(prev => ({ ...prev, [activeTicket.id]: activeTicket.messages.length }));
+    setViewedTickets(prev => ({ ...prev, [activeTicket.id]: getMessages(activeTicket).length }));
   }, [activeTicket?.id]);
 
   useEffect(() => {
     if (!activeTicket) return;
-    setViewedTickets(prev => ({ ...prev, [activeTicket.id]: activeTicket.messages.length }));
-  }, [activeTicket?.messages.length]);
+    setViewedTickets(prev => ({ ...prev, [activeTicket.id]: getMessages(activeTicket).length }));
+  }, [activeTicket?.messages?.length]);
 
   // #10: Toast notification for new guest messages on non-active threads
   const prevTicketCountsRef = useRef<Record<string, number>>({});
   useEffect(() => {
     for (const t of filteredTickets) {
       const prevCount = prevTicketCountsRef.current[t.id];
-      if (prevCount !== undefined && t.messages.length > prevCount) {
-        const newMsgs = t.messages.slice(prevCount);
+      const msgs = t.messages || [];
+      if (prevCount !== undefined && msgs.length > prevCount) {
+        const newMsgs = msgs.slice(prevCount);
         const newGuestMsgs = newMsgs.filter(m => m.sender === 'guest' && !m.isGuestMode);
         if (newGuestMsgs.length > 0 && t.id !== activeTicket?.id && notificationPrefs.soundAlerts) {
           toast(`New message from ${t.guestName}`, {
@@ -402,7 +539,7 @@ export function InboxView() {
           });
         }
       }
-      prevTicketCountsRef.current[t.id] = t.messages.length;
+      prevTicketCountsRef.current[t.id] = msgs.length;
     }
   }, [filteredTickets, activeTicket?.id, notificationPrefs.soundAlerts, navigate]);
 
@@ -455,7 +592,7 @@ export function InboxView() {
         addSystemMessage(activeTicket.id, `Draft sent as-is — Agent sent the AI-drafted reply without edits.`);
       }
       // Auto-clear Follow-up badge when agent replies after a partial status
-      const lastSys = [...activeTicket.messages].reverse().find(m => m.sender === 'system');
+      const lastSys = [...getMessages(activeTicket)].reverse().find(m => m.sender === 'system');
       if (lastSys && parseThreadStatus(lastSys.text) === 'partial') {
         addSystemMessage(activeTicket.id, `AI handled — Agent followed up.`);
       }
@@ -469,7 +606,7 @@ export function InboxView() {
 
   /** Core resolve logic — navigates away and shows KB nudge */
   const doResolve = () => {
-    const guestMessages = activeTicket.messages.filter(m => m.sender === 'guest').map(m => m.text);
+    const guestMessages = getMessages(activeTicket).filter(m => m.sender === 'guest').map(m => m.text);
     const inquiries = detectInquiries(guestMessages, activeTicket.tags, activeTicket.summary);
     const activeProp = MOCK_PROPERTIES.find(p => p.name === activeTicket.property);
     const scopeKb = kbEntries.filter(kb =>
@@ -633,9 +770,39 @@ export function InboxView() {
               >
                 <Plus size={14} />
               </button>
-              <span className="bg-slate-200 text-slate-600 text-xs px-2 py-1 rounded-full">{filteredTickets.length}</span>
+              <span className="bg-slate-200 text-slate-600 text-xs px-2 py-1 rounded-full">
+                {isSearchActive ? `${searchedTickets.length}/${filteredTickets.length}` : filteredTickets.length}
+              </span>
             </div>
           </h2>
+        </div>
+
+        {/* Compact search bar */}
+        <div className="px-3 py-1.5 border-b border-slate-100">
+          <div className="relative">
+            <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-300 pointer-events-none" />
+            <input
+              ref={searchInputRef}
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') { setSearchQuery(''); searchInputRef.current?.blur(); }
+              }}
+              placeholder="Search guests, bookings..."
+              className="w-full text-[11px] pl-6 pr-12 py-1 rounded-md bg-slate-50 border-0 focus:ring-1 focus:ring-indigo-300 focus:bg-white outline-none placeholder:text-slate-300 transition-colors"
+            />
+            {searchQuery ? (
+              <button
+                onClick={() => { setSearchQuery(''); searchInputRef.current?.focus(); }}
+                className="absolute right-1.5 top-1/2 -translate-y-1/2 text-slate-300 hover:text-slate-500 p-0.5"
+              >
+                <X size={11} />
+              </button>
+            ) : (
+              <kbd className="absolute right-2 top-1/2 -translate-y-1/2 text-[9px] text-slate-300 bg-slate-100 px-1 py-0.5 rounded font-mono">/</kbd>
+            )}
+          </div>
         </div>
 
         {showNewThread && (
@@ -724,20 +891,43 @@ export function InboxView() {
           </div>
         )}
 
+        {/* Connection status bar — visible when any connection is unhealthy */}
+        <ConnectionStatusBar
+          connections={firestoreConnections}
+          isInitializing={firestoreInitializing}
+          onReconnectClick={(hostId) => navigate('/settings/inboxes')}
+        />
+
         <div className="overflow-y-auto flex-1">
-          {filteredTickets.map(ticket => {
+          {/* Empty state when search/filter yields no results */}
+          {searchedTickets.length === 0 && isSearchActive && (
+            <div className="flex flex-col items-center justify-center py-12 px-6 text-center">
+              <Search size={28} className="text-slate-200 mb-3" />
+              <p className="text-sm font-medium text-slate-500 mb-1">
+                No conversations found{deferredQuery ? ` for "${deferredQuery}"` : ''}
+              </p>
+              <p className="text-xs text-slate-400 mb-3">Try adjusting your search or filters</p>
+              <button
+                onClick={() => { setSearchQuery(''); setFilterCompany(''); setFilterChannel(''); }}
+                className="text-xs text-indigo-600 hover:text-indigo-700 font-medium"
+              >
+                Clear all filters
+              </button>
+            </div>
+          )}
+          {searchedTickets.map(ticket => {
             const isActive = activeTicket.id === ticket.id;
-            const unread = hasUnread(ticket.id, ticket.messages.length);
+            const unread = hasUnread(ticket.id, (ticket.messages || []).length);
             const isProcessing = autoReplyProcessing[ticket.id];
             const isPaused = autoReplyPausedTickets[ticket.id];
-            const lastGuestMsg = [...ticket.messages].reverse().find(m => m.sender === 'guest');
+            const lastGuestMsg = [...(ticket.messages || [])].reverse().find(m => m.sender === 'guest');
 
             // ─── Smart preview: last message in thread (whoever sent it) ──
-            const lastSystemMsg = [...ticket.messages].reverse().find(m => m.sender === 'system');
+            const lastSystemMsg = [...(ticket.messages || [])].reverse().find(m => m.sender === 'system');
             const systemStatus = lastSystemMsg ? parseThreadStatus(lastSystemMsg.text) : null;
 
             // Last non-system message for the preview card
-            const lastNonSystemMsg = [...ticket.messages].reverse().find(m => m.sender !== 'system');
+            const lastNonSystemMsg = [...(ticket.messages || [])].reverse().find(m => m.sender !== 'system');
             const previewSender = lastNonSystemMsg?.sender === 'guest' ? ticket.guestName.split(' ')[0]
               : lastNonSystemMsg?.sender === 'bot' ? 'AI'
               : lastNonSystemMsg?.sender === 'agent' ? 'You'
@@ -746,7 +936,7 @@ export function InboxView() {
             const previewText = lastNonSystemMsg?.text || ticket.aiHandoverReason || '';
 
             // #11/#25: Use createdAt epoch for accurate time-since calculation
-            const guestMsgCount = ticket.messages.filter(m => m.sender === 'guest').length;
+            const guestMsgCount = (ticket.messages || []).filter(m => m.sender === 'guest').length;
             let timeSinceGuest = '';
             if (lastGuestMsg) {
               const ts = lastGuestMsg.createdAt;
@@ -765,11 +955,18 @@ export function InboxView() {
             const isHandedOff = autoReplyHandedOff[ticket.id] === true
               || (autoReplyHandedOff[ticket.id] !== false && systemStatus === 'handed-off');
 
+            // Stale ticket: Firestore connection expired/disconnected
+            const ticketStale = ticket.firestoreHostId
+              ? !firestoreConnections.some(c => c.hostId === ticket.firestoreHostId && c.status === 'connected')
+              : false;
+
             return (
               <div
                 key={ticket.id}
                 onClick={() => { navigate(`/inbox/${ticket.id}`); setReplyText(''); if (isMobile) setMobilePanel('thread'); if (leftOverlayOpen) setLeftOverlayOpen(false); }}
                 className={`group px-3 py-3 border-b border-slate-100 cursor-pointer relative overflow-hidden flex gap-2.5 ${
+                  ticketStale ? 'opacity-50' : ''
+                } ${
                   isActive
                     ? 'bg-indigo-50/80 border-l-[3px] border-l-indigo-500'
                     : `border-l-[3px] hover:bg-slate-50 ${
@@ -866,8 +1063,11 @@ export function InboxView() {
                       );
                     })()}
 
-                    {/* Meta: property · time */}
-                    <span className="text-[10px] text-slate-400 truncate ml-0.5">{ticket.property} · {timeSinceGuest}</span>
+                    {/* Meta: property · company · time */}
+                    <span className="text-[10px] text-slate-400 truncate ml-0.5">
+                      {ticket.property || ticket.companyName || ticket.host.name}
+                      {timeSinceGuest && ` · ${timeSinceGuest}`}
+                    </span>
                   </div>
 
                   {/* Row 3: preview + chevron on hover */}
@@ -1091,7 +1291,7 @@ export function InboxView() {
                       `Guest: ${activeTicket.guestName} | ${activeTicket.property} · ${activeTicket.room}`,
                       `Issue: ${activeTicket.summary}`,
                       `Initial response sent. Please advise.`,
-                      `Booking: ${activeTicket.booking.checkIn} – ${activeTicket.booking.checkOut}`,
+                      activeTicket.booking ? `Booking: ${activeTicket.booking.checkIn} – ${activeTicket.booking.checkOut}` : activeTicket.bookingId ? `Booking ID: #${activeTicket.bookingId}` : '',
                     ].join('\n');
                     navigator.clipboard.writeText(summary).catch(() => {});
                     toast.success('Copied — paste into LINE WORKS', { description: `Summary for ${activeTicket.guestName} ready to share.`, duration: 4000 });
@@ -1196,7 +1396,7 @@ export function InboxView() {
 
         {/* Chat messages */}
         <div className={`flex-1 overflow-y-auto ${isMobile ? 'p-3 gap-3' : 'p-6 gap-4'} flex flex-col`}>
-          {activeTicket.messages.map((msg) => (
+          {getMessages(activeTicket).map((msg) => (
             <div key={msg.id} className={`flex flex-col transition-all duration-300 ${
               pendingDeletes.has(msg.id) ? 'opacity-20 scale-95 pointer-events-none' : ''
             } ${
@@ -1406,6 +1606,22 @@ export function InboxView() {
               </div>
             </div>
           )}
+          {/* Context switching protection: show which company/channel this reply goes to */}
+          {activeTicket.companyName && !guestMode && (
+            <div className="flex items-center gap-1.5 mb-1.5 text-[10px] text-slate-400">
+              <span className="font-medium">Replying as</span>
+              <span className="font-bold text-slate-600">{activeTicket.companyName}</span>
+              <span>via</span>
+              <span className="font-bold text-slate-600">{activeTicket.channel}</span>
+            </div>
+          )}
+          {/* Stale ticket: disable composer when connection is lost */}
+          {isActiveTicketStale && (
+            <div className="flex items-center gap-2 mb-2 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-700">
+              <AlertCircle size={14} className="shrink-0" />
+              <span>Connection lost — <button onClick={() => navigate('/settings/inboxes')} className="underline font-medium hover:no-underline">reconnect this inbox</button> to reply</span>
+            </div>
+          )}
           {guestMode && (
             <div className="flex items-center gap-2 mb-2 animate-in fade-in duration-150">
               <UserCircle size={12} className="text-emerald-600" />
@@ -1431,10 +1647,13 @@ export function InboxView() {
               el.style.height = `${Math.min(el.scrollHeight, isMobile ? 120 : 220)}px`;
             }}
             onKeyDown={handleKeyDown}
+            disabled={isActiveTicketStale}
             placeholder={
-              guestMode
-                ? `Chat as ${activeTicket.guestName.split(' ')[0]}...`
-                : `Reply to ${activeTicket.guestName.split(' ')[0]}... (${navigator.platform.includes('Mac') ? '\u2318' : 'Ctrl'}+Enter)`
+              isActiveTicketStale
+                ? 'Connection lost — reconnect to reply'
+                : guestMode
+                  ? `Chat as ${activeTicket.guestName.split(' ')[0]}...`
+                  : `Reply to ${activeTicket.guestName.split(' ')[0]}... (${navigator.platform.includes('Mac') ? '\u2318' : 'Ctrl'}+Enter)`
             }
             className={`w-full rounded-xl ${isMobile ? 'p-2.5 text-[13px] min-h-[48px] max-h-[120px]' : 'p-3 text-sm min-h-[72px] max-h-[220px]'} focus:outline-none resize-none transition-all duration-300 ${
               composeHighlight
@@ -1611,10 +1830,21 @@ export function InboxView() {
               <div className="p-5 border-b border-slate-100">
                 <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-4 flex items-center gap-2"><User size={14} /> Guest & Booking</h3>
                 <div className="grid grid-cols-2 gap-4">
-                  <div><span className="block text-[10px] text-slate-400 mb-0.5">Check-in</span><span className="text-sm font-medium">{activeTicket.booking.checkIn}</span></div>
-                  <div><span className="block text-[10px] text-slate-400 mb-0.5">Check-out</span><span className="text-sm font-medium">{activeTicket.booking.checkOut}</span></div>
-                  <div><span className="block text-[10px] text-slate-400 mb-0.5">Guests</span><span className="text-sm font-medium flex items-center gap-1"><Users size={12} /> {activeTicket.booking.guests}</span></div>
-                  <div><span className="block text-[10px] text-slate-400 mb-0.5">Status</span><span className="text-sm font-medium">{activeTicket.booking.status}</span></div>
+                  {activeTicket.booking ? (
+                    <>
+                      <div><span className="block text-[10px] text-slate-400 mb-0.5">Check-in</span><span className="text-sm font-medium">{activeTicket.booking.checkIn}</span></div>
+                      <div><span className="block text-[10px] text-slate-400 mb-0.5">Check-out</span><span className="text-sm font-medium">{activeTicket.booking.checkOut}</span></div>
+                      <div><span className="block text-[10px] text-slate-400 mb-0.5">Guests</span><span className="text-sm font-medium flex items-center gap-1"><Users size={12} /> {activeTicket.booking.guests}</span></div>
+                      <div><span className="block text-[10px] text-slate-400 mb-0.5">Status</span><span className="text-sm font-medium">{activeTicket.booking.status}</span></div>
+                    </>
+                  ) : activeTicket.bookingId ? (
+                    <>
+                      <div><span className="block text-[10px] text-slate-400 mb-0.5">Booking ID</span><span className="text-sm font-medium">#{activeTicket.bookingId}</span></div>
+                      <div><span className="block text-[10px] text-slate-400 mb-0.5">Status</span><span className="text-sm font-medium">{activeTicket.bookingStatus || 'Unknown'}</span></div>
+                    </>
+                  ) : (
+                    <div className="col-span-2 text-xs text-slate-400">No booking data available</div>
+                  )}
                 </div>
 
                 {/* BPO Step 5 — Incident Log / Remarks field */}
@@ -1699,7 +1929,7 @@ export function InboxView() {
       <ConfirmDialog
         open={showDeleteConfirm}
         title="Delete this thread?"
-        description={`This will permanently remove ${activeTicket.guestName}'s entire conversation (${activeTicket.messages.length} messages). This action cannot be undone.`}
+        description={`This will permanently remove ${activeTicket.guestName}'s entire conversation (${getMessages(activeTicket).length} messages). This action cannot be undone.`}
         confirmLabel="Delete Thread"
         cancelLabel="Cancel"
         variant="danger"

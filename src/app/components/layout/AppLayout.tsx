@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import type React from 'react';
 import { Outlet, useNavigate, useLocation } from 'react-router';
-import { MessageSquare, Building2, Settings, Keyboard } from 'lucide-react';
+import { MessageSquare, Building2, Settings, Keyboard, Zap, PauseCircle } from 'lucide-react';
 import { Toaster } from 'sonner';
 import { TopBar } from './TopBar';
 import { NavItem } from './NavItem';
@@ -50,6 +50,29 @@ function AppInner({
               ))}
             </nav>
             <div className="mt-auto flex flex-col gap-1 w-full px-2">
+              {/* Global AI Toggle */}
+              {(() => {
+                const { hostSettings, updateHostSettings } = appContext;
+                const anyHostConnected = hostSettings.length > 0;
+                const allAiOn = anyHostConnected && hostSettings.every(s => s.autoReply);
+                return anyHostConnected ? (
+                  <button
+                    onClick={() => {
+                      const newVal = !allAiOn;
+                      hostSettings.forEach(s => updateHostSettings(s.hostId, { autoReply: newVal }));
+                    }}
+                    title={allAiOn ? 'Disable AI for all hosts' : 'Enable AI for all hosts'}
+                    className={`py-2 px-1 rounded-xl transition-all flex flex-col items-center justify-center w-full gap-0.5 ${
+                      allAiOn
+                        ? 'text-violet-600 bg-violet-50 hover:bg-violet-100'
+                        : 'text-slate-300 hover:bg-slate-50 hover:text-slate-500'
+                    }`}
+                  >
+                    {allAiOn ? <Zap size={16} /> : <PauseCircle size={16} />}
+                    <span className="text-[8px] font-bold tracking-wide leading-none">{allAiOn ? 'AI On' : 'AI Off'}</span>
+                  </button>
+                ) : null;
+              })()}
               <NavItem icon={Settings} active={isActive('/settings')} onClick={() => navigate('/settings')} tooltip="Platform Settings" label="Settings" shortcut="S" />
               <button
                 onClick={() => setShowShortcuts(true)}

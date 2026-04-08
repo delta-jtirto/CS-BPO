@@ -118,7 +118,7 @@ export function SmartReplyPanel({ ticket, existingDraft, onInsert, onHide, cache
   const { kbEntries, agentName, hasApiKey, aiModel, promptOverrides } = useAppContext();
 
   // Cache key for this ticket + message state
-  const cacheKey = `${ticket.id}-${ticket.messages.length}`;
+  const cacheKey = `${ticket.id}-${(ticket.messages || []).length}`;
   const hasDraft = existingDraft.trim().length > 10;
 
   const [phase, setPhase] = useState<Phase>(() => {
@@ -151,7 +151,7 @@ export function SmartReplyPanel({ ticket, existingDraft, onInsert, onHide, cache
   }, [kbEntries, ticket.host.id, activeProp?.id]);
 
   const inquiries = useMemo(() => {
-    const guestMessages = ticket.messages.filter(m => m.sender === 'guest').map(m => m.text);
+    const guestMessages = (ticket.messages || []).filter(m => m.sender === 'guest').map(m => m.text);
     return detectInquiries(guestMessages, ticket.tags, ticket.summary);
   }, [ticket]);
 
@@ -222,7 +222,7 @@ export function SmartReplyPanel({ ticket, existingDraft, onInsert, onHide, cache
         }
       }
 
-      const guestMessages = ticket.messages.filter(m => m.sender === 'guest').map(m => m.text).join('\n');
+      const guestMessages = (ticket.messages || []).filter(m => m.sender === 'guest').map(m => m.text).join('\n');
 
       const insights = buildGuestInsights(aiInquiries ?? []);
       const userPrompt = interpolate(resolvePrompt('polish_draft', 'user', promptOverrides), {
@@ -277,10 +277,10 @@ export function SmartReplyPanel({ ticket, existingDraft, onInsert, onHide, cache
           }
         }
 
-        const guestMessages = ticket.messages.filter(m => m.sender === 'guest').map(m => m.text).join('\n');
+        const guestMessages = (ticket.messages || []).filter(m => m.sender === 'guest').map(m => m.text).join('\n');
 
         // Include bot auto-replies so the AI knows what was already said to the guest
-        const botMessages = ticket.messages.filter(m => m.sender === 'bot').map(m => m.text);
+        const botMessages = (ticket.messages || []).filter(m => m.sender === 'bot').map(m => m.text);
         const priorBotContext = botMessages.length > 0
           ? `\n\nPrevious AI auto-replies already sent to guest (do NOT repeat this info):\n${botMessages.join('\n')}`
           : '';

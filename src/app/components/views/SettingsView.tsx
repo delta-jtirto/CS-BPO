@@ -14,6 +14,8 @@ import { toast } from 'sonner';
 import { MOCK_HOSTS } from '../../data/mock-data';
 import { useAppContext } from '../../context/AppContext';
 import { useIsMobile } from '../ui/use-mobile';
+import { validateToken, maskToken, AuthError } from '@/lib/unibox-auth';
+import { Wifi, WifiOff, Plug, CheckCircle2, Loader2 } from 'lucide-react';
 
 // ─── Helper: localStorage-backed state ─────────────────────────
 function usePersistedState<T>(key: string, initial: T): [T, (v: T | ((prev: T) => T)) => void] {
@@ -35,7 +37,7 @@ function usePersistedState<T>(key: string, initial: T): [T, (v: T | ((prev: T) =
 }
 
 // --- Types ---
-type SettingsTab = 'agent' | 'templates' | 'hours' | 'demo' | 'ai' | 'prompts';
+type SettingsTab = 'agent' | 'templates' | 'hours' | 'demo' | 'ai' | 'prompts' | 'inboxes';
 
 interface SLAThreshold {
   priority: string;
@@ -207,7 +209,7 @@ export function SettingsView() {
     promptOverrides, updatePromptOverride, resetPromptOverride,
   } = useAppContext();
 
-  const validTabs: SettingsTab[] = ['agent', 'ai', 'templates', 'hours', 'demo', 'prompts'];
+  const validTabs: SettingsTab[] = ['agent', 'ai', 'templates', 'hours', 'demo', 'prompts', 'inboxes'];
   // Map old 'client' tab to new 'ai' tab for backward compatibility
   const resolvedTab = urlTab === 'client' ? 'ai' : urlTab;
   const [settingsTab, setSettingsTab] = useState<SettingsTab>(
@@ -390,6 +392,7 @@ export function SettingsView() {
           <div className="bg-white border-b border-slate-200 shrink-0 overflow-x-auto">
             <div className="flex gap-1 px-3 py-2 min-w-max">
               {([
+                { tab: 'inboxes' as SettingsTab, icon: <Globe size={14} />, label: 'Inboxes' },
                 { tab: 'agent' as SettingsTab, icon: <User size={14} />, label: 'Prefs' },
                 { tab: 'ai' as SettingsTab, icon: <Sparkles size={14} />, label: 'AI' },
                 { tab: 'templates' as SettingsTab, icon: <MessageSquareText size={14} />, label: 'Templates' },
@@ -414,6 +417,13 @@ export function SettingsView() {
         ) : (
           /* Desktop: Sidebar */
           <div className="w-64 bg-white border-r border-slate-200 p-4 shrink-0 flex flex-col gap-6 overflow-y-auto">
+            <div>
+              <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2 ml-2">Connections</h3>
+              <nav className="space-y-1">
+                {navItem('inboxes', <Globe size={16} />, 'Connected Inboxes')}
+              </nav>
+            </div>
+
             <div>
               <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2 ml-2">My Workspace</h3>
               <nav className="space-y-1">
@@ -448,6 +458,11 @@ export function SettingsView() {
 
         {/* Content */}
         <div className={`flex-1 ${isMobile ? 'p-4' : 'p-8'} overflow-y-auto`}>
+
+          {/* ===== CONNECTED INBOXES ===== */}
+          {settingsTab === 'inboxes' && (
+            <ConnectedInboxesPanel />
+          )}
 
           {/* ===== MY PREFERENCES ===== */}
           {settingsTab === 'agent' && (
@@ -1172,6 +1187,329 @@ function AIKeyFieldBackend({ hasApiKey, maskedApiKey, loading, onSave, onClear }
       ) : (
         <button onClick={() => setEditing(true)} className="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 flex items-center gap-2">
           <Key size={14} /> Add API Key
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ─── Connected Inboxes Panel ─────────────────────────────────
+function ConnectedInboxesPanel() {
+  const { properties, hostSettings, addFirestoreConnection, removeFirestoreConnection, firestoreConnections } = useAppContext();
+
+  // Local state for the "Connect Inbox" flow
+  const [showForm, setShowForm] = useState(false);
+  const [tokenInput, setTokenInput] = useState('');
+  const [showToken, setShowToken] = useState(false);
+  const [validating, setValidating] = useState(false);
+  const [validatedCompany, setValidatedCompany] = useState<{ name: string; userId: string } | null>(null);
+  const [selectedHostId, setSelectedHostId] = useState('');
+  const [validationError, setValidationError] = useState('');
+
+  // Saved connections — persisted in localStorage for prototype (Supabase KV later)
+  const [savedInboxes, setSavedInboxes] = usePersistedState<Array<{
+    hostId: string;
+    companyName: string;
+    maskedToken: string;
+    connectedAt: string;
+  }>>('connected_inboxes', []);
+
+  const [testingId, setTestingId] = useState<string | null>(null);
+  const [disconnectingId, setDisconnectingId] = useState<string | null>(null);
+
+  const handleValidate = async () => {
+    if (!tokenInput.trim()) return;
+    setValidating(true);
+    setValidationError('');
+    setValidatedCompany(null);
+
+    try {
+      const user = await validateToken(tokenInput.trim());
+      setValidatedCompany({ name: user.name, userId: user.unibox_user_id });
+      if (MOCK_HOSTS.length === 1) setSelectedHostId(MOCK_HOSTS[0].id);
+    } catch (err) {
+      if (err instanceof AuthError) {
+        setValidationError(err.message);
+      } else {
+        setValidationError('Failed to validate token. Check your network and try again.');
+      }
+    } finally {
+      setValidating(false);
+    }
+  };
+
+  const handleConnect = () => {
+    if (!validatedCompany || !selectedHostId) return;
+
+    const host = MOCK_HOSTS.find(h => h.id === selectedHostId);
+    if (!host) return;
+
+    if (savedInboxes.some(i => i.hostId === selectedHostId)) {
+      toast.error('This host is already connected to an inbox.');
+      return;
+    }
+
+    // Save to localStorage for persistence across refreshes
+    setSavedInboxes(prev => [...prev, {
+      hostId: selectedHostId,
+      companyName: validatedCompany.name,
+      maskedToken: maskToken(tokenInput.trim()),
+      connectedAt: new Date().toISOString(),
+    }]);
+    try {
+      const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
+      tokens[selectedHostId] = tokenInput.trim();
+      localStorage.setItem('settings_inbox_tokens', JSON.stringify(tokens));
+    } catch { /* ignore */ }
+
+    // Activate the connection in AppContext — triggers Firebase auth + Firestore subscription
+    addFirestoreConnection(tokenInput.trim(), host).catch(err => {
+      toast.error('Failed to activate connection', { description: err.message });
+    });
+
+    toast.success(`Connected "${validatedCompany.name}" to ${host.name}`);
+    setShowForm(false);
+    setTokenInput('');
+    setValidatedCompany(null);
+    setSelectedHostId('');
+    setShowToken(false);
+  };
+
+  const handleDisconnect = (hostId: string) => {
+    setDisconnectingId(hostId);
+  };
+
+  const confirmDisconnect = (hostId: string) => {
+    setSavedInboxes(prev => prev.filter(i => i.hostId !== hostId));
+    try {
+      const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
+      delete tokens[hostId];
+      localStorage.setItem('settings_inbox_tokens', JSON.stringify(tokens));
+    } catch { /* ignore */ }
+    // Tear down Firebase app + unsubscribe from Firestore
+    removeFirestoreConnection(hostId).catch(() => {});
+    setDisconnectingId(null);
+    toast.success('Inbox disconnected');
+  };
+
+  const handleTestConnection = async (hostId: string) => {
+    setTestingId(hostId);
+    try {
+      const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
+      const token = tokens[hostId];
+      if (!token) {
+        toast.error('Token not found — please reconnect this inbox.');
+        return;
+      }
+      await validateToken(token);
+      toast.success('Connection is healthy');
+    } catch (err) {
+      if (err instanceof AuthError) {
+        toast.error(err.message);
+      } else {
+        toast.error('Connection test failed');
+      }
+    } finally {
+      setTestingId(null);
+    }
+  };
+
+  const availableHosts = MOCK_HOSTS.filter(h => !savedInboxes.some(i => i.hostId === h.id));
+
+  return (
+    <div className="max-w-xl mx-auto animate-in fade-in">
+      <h2 className="text-lg font-bold text-slate-800 mb-1">Connected Inboxes</h2>
+      <p className="text-xs text-slate-500 mb-6">
+        Connect your Unified Inbox accounts to receive real-time guest conversations from Airbnb, Booking.com, and other channels.
+      </p>
+
+      {/* Connected inboxes list */}
+      {savedInboxes.length > 0 && (
+        <div className="space-y-3 mb-6">
+          {savedInboxes.map((inbox) => {
+            const host = MOCK_HOSTS.find(h => h.id === inbox.hostId);
+            const isDisconnecting = disconnectingId === inbox.hostId;
+            const isTesting = testingId === inbox.hostId;
+
+            return (
+              <div key={inbox.hostId} className="bg-white border border-slate-200 rounded-xl shadow-sm p-4">
+                {isDisconnecting ? (
+                  <div className="space-y-3">
+                    <p className="text-sm text-slate-700">
+                      Disconnect <strong>{inbox.companyName}</strong> from <strong>{host?.name}</strong>? Active conversations from this inbox will no longer be visible.
+                    </p>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => confirmDisconnect(inbox.hostId)}
+                        className="px-3 py-1.5 bg-red-600 text-white rounded-lg text-xs font-medium hover:bg-red-700"
+                      >
+                        Disconnect
+                      </button>
+                      <button
+                        onClick={() => setDisconnectingId(null)}
+                        className="px-3 py-1.5 bg-slate-100 text-slate-600 rounded-lg text-xs font-medium hover:bg-slate-200"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-3">
+                    <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-white text-xs font-bold ${host?.brandColor || 'bg-slate-400'}`}>
+                      {(host?.name || '?').charAt(0)}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-semibold text-slate-800 truncate">{inbox.companyName}</span>
+                        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-600 text-[10px] font-medium">
+                          <Wifi size={10} /> Connected
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2 text-[11px] text-slate-400">
+                        <span>Mapped to {host?.name || 'Unknown'}</span>
+                        <span>·</span>
+                        <span>Token: {inbox.maskedToken}</span>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <button
+                        onClick={() => handleTestConnection(inbox.hostId)}
+                        disabled={isTesting}
+                        className="px-2.5 py-1.5 text-[11px] font-medium text-slate-600 bg-slate-50 border border-slate-200 rounded-lg hover:bg-slate-100 disabled:opacity-50"
+                      >
+                        {isTesting ? <Loader2 size={12} className="animate-spin" /> : 'Test'}
+                      </button>
+                      <button
+                        onClick={() => handleDisconnect(inbox.hostId)}
+                        className="px-2.5 py-1.5 text-[11px] font-medium text-red-500 bg-red-50 border border-red-200 rounded-lg hover:bg-red-100"
+                      >
+                        Disconnect
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Empty state */}
+      {savedInboxes.length === 0 && !showForm && (
+        <div className="bg-white border border-dashed border-slate-300 rounded-xl p-8 text-center mb-6">
+          <Plug size={32} className="mx-auto text-slate-300 mb-3" />
+          <p className="text-sm font-medium text-slate-600 mb-1">No inboxes connected</p>
+          <p className="text-xs text-slate-400 mb-4">Connect your first Unified Inbox to start receiving real guest conversations.</p>
+          <button
+            onClick={() => setShowForm(true)}
+            className="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 inline-flex items-center gap-2"
+          >
+            <Plus size={14} /> Connect Inbox
+          </button>
+        </div>
+      )}
+
+      {/* Connect Inbox form */}
+      {showForm && (
+        <div className="bg-white border border-indigo-200 rounded-xl shadow-sm p-5 mb-6">
+          <h3 className="font-bold text-slate-800 text-sm mb-1 flex items-center gap-2">
+            <Plug size={14} className="text-indigo-500" /> Connect a New Inbox
+          </h3>
+          <p className="text-xs text-slate-500 mb-4">
+            Paste your Unified Inbox access token. You can find it in your browser's localStorage (key: <code className="text-[10px] bg-slate-100 px-1 rounded">access_token</code>) when logged into the Unified Inbox.
+          </p>
+
+          {/* Step 1: Token input */}
+          <div className="mb-4">
+            <label className="block text-[11px] font-semibold text-slate-600 mb-1.5">Access Token</label>
+            <div className="flex gap-2">
+              <div className="flex-1 relative">
+                <input
+                  type={showToken ? 'text' : 'password'}
+                  value={tokenInput}
+                  onChange={(e) => { setTokenInput(e.target.value); setValidatedCompany(null); setValidationError(''); }}
+                  placeholder="Paste your Unified Inbox access token..."
+                  className="w-full border border-slate-200 rounded-lg text-sm py-2 px-3 pr-8 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-300 outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowToken(!showToken)}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                >
+                  {showToken ? <EyeOff size={14} /> : <Eye size={14} />}
+                </button>
+              </div>
+              <button
+                onClick={handleValidate}
+                disabled={!tokenInput.trim() || validating}
+                className="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 disabled:opacity-50 flex items-center gap-1.5 shrink-0"
+              >
+                {validating ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
+                Validate
+              </button>
+            </div>
+            {validationError && (
+              <p className="mt-2 text-xs text-red-500 flex items-center gap-1">
+                <AlertTriangle size={12} /> {validationError}
+              </p>
+            )}
+          </div>
+
+          {/* Step 2: Company name + host mapping */}
+          {validatedCompany && (
+            <div className="border-t border-slate-100 pt-4 space-y-4">
+              <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3 flex items-center gap-2">
+                <CheckCircle2 size={14} className="text-emerald-600 shrink-0" />
+                <div>
+                  <p className="text-sm font-medium text-emerald-700">Token validated</p>
+                  <p className="text-xs text-emerald-600">Company: <strong>{validatedCompany.name}</strong></p>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-semibold text-slate-600 mb-1.5">Map to BPO Host</label>
+                <select
+                  value={selectedHostId}
+                  onChange={(e) => setSelectedHostId(e.target.value)}
+                  className="w-full border border-slate-200 rounded-lg text-sm py-2 px-3 focus:ring-2 focus:ring-indigo-500 outline-none"
+                >
+                  <option value="">Select a host...</option>
+                  {availableHosts.map(h => (
+                    <option key={h.id} value={h.id}>{h.name}</option>
+                  ))}
+                </select>
+                <p className="mt-1 text-[10px] text-slate-400">
+                  This maps real-time chats from "{validatedCompany.name}" to the selected BPO host profile for SLA and tag routing.
+                </p>
+              </div>
+
+              <div className="flex gap-2 pt-2">
+                <button
+                  onClick={handleConnect}
+                  disabled={!selectedHostId}
+                  className="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 disabled:opacity-50 flex items-center gap-1.5"
+                >
+                  <Plug size={14} /> Connect Inbox
+                </button>
+                <button
+                  onClick={() => { setShowForm(false); setTokenInput(''); setValidatedCompany(null); setSelectedHostId(''); setValidationError(''); setShowToken(false); }}
+                  className="px-4 py-2 bg-slate-100 text-slate-600 rounded-lg text-sm font-medium hover:bg-slate-200"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Add more button */}
+      {savedInboxes.length > 0 && !showForm && availableHosts.length > 0 && (
+        <button
+          onClick={() => setShowForm(true)}
+          className="w-full border border-dashed border-slate-300 rounded-xl p-3 text-sm text-slate-500 hover:border-indigo-300 hover:text-indigo-600 hover:bg-indigo-50/50 transition-colors flex items-center justify-center gap-2"
+        >
+          <Plus size={14} /> Connect Another Inbox
         </button>
       )}
     </div>

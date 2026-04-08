@@ -240,7 +240,7 @@ function buildConversationHistory(ticket: Ticket): string {
   // Exclude system messages — they are internal routing notes, not conversation content.
   // Feeding them to the AI pollutes tone assessment and confuses context.
   // Expanded from 10 to 20 messages for better context depth.
-  const recentMessages = ticket.messages
+  const recentMessages = (ticket.messages || [])
     .filter(m => m.sender !== 'system')
     .slice(-20);
 
@@ -335,7 +335,7 @@ export function useGlobalAutoReply() {
       const ticket = ticketsRef.current.find(t => t.id === ticketId);
       if (!ticket) return;
 
-      const recentHuman = ticket.messages.slice(-10).some(
+      const recentHuman = (ticket.messages || []).slice(-10).some(
         m => m.sender === 'agent' || m.sender === 'host'
       );
 
@@ -409,12 +409,12 @@ export function useGlobalAutoReply() {
       const safetyKeywords = hostConfig.safetyKeywords || [];
       if (safetyKeywords.length > 0) {
         // Dedup: only fire the safety alert once per thread (don't re-add on every new message)
-        const alreadySafety = ticket.messages.some(
+        const alreadySafety = (ticket.messages || []).some(
           m => m.sender === 'system' && m.text.toLowerCase().startsWith('safety alert')
         );
         if (!alreadySafety) {
           // Scan ALL guest messages in the thread — a safety keyword anywhere should escalate
-          const allGuestMsgs = ticket.messages.filter(m => m.sender === 'guest');
+          const allGuestMsgs = (ticket.messages || []).filter(m => m.sender === 'guest');
           const guestText = allGuestMsgs.map(m => m.text).join(' ').toLowerCase();
           const triggeredKeywords = safetyKeywords.filter(kw => {
             const escaped = kw.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -441,7 +441,7 @@ export function useGlobalAutoReply() {
       // ─── Cooldown check — pause AI after agent reply (#1) ──
       if (hostConfig.cooldownEnabled && (hostConfig.cooldownMinutes || 10) > 0) {
         const cooldownMs = (hostConfig.cooldownMinutes || 10) * 60_000;
-        const recentAgentMsg = [...ticket.messages].reverse().find(m => m.sender === 'agent' || m.sender === 'host');
+        const recentAgentMsg = [...(ticket.messages || [])].reverse().find(m => m.sender === 'agent' || m.sender === 'host');
         if (recentAgentMsg && recentAgentMsg.createdAt) {
           const elapsed = Date.now() - recentAgentMsg.createdAt;
           if (elapsed < cooldownMs) {
@@ -460,7 +460,7 @@ export function useGlobalAutoReply() {
           /\b(cancel|modify).{0,30}(booking|reservation|stay)\b/i,
           /\b(lawyer|sue|legal action|chargeback)\b/i,
         ];
-        const allGuestTextForTransactional = ticket.messages
+        const allGuestTextForTransactional = (ticket.messages || [])
           .filter(m => m.sender === 'guest').map(m => m.text).join(' ');
         if (TRANSACTIONAL_PATTERNS.some(p => p.test(allGuestTextForTransactional))) {
           console.log('[AutoReply] TRANSACTIONAL OVERRIDE on %s — escalating immediately', ticketId);
@@ -482,7 +482,7 @@ export function useGlobalAutoReply() {
       }
 
       // ─── [STEP 4] Single AI Call with Full KB ─────────────────
-      const lastGuestMsg = [...ticket.messages].reverse().find(m => m.sender === 'guest');
+      const lastGuestMsg = [...(ticket.messages || [])].reverse().find(m => m.sender === 'guest');
       if (!lastGuestMsg) return;
 
       const kbContext = buildKBContext(ticket);
@@ -703,7 +703,7 @@ export function useGlobalAutoReply() {
       if (!hostConfig?.autoReply) continue;
       if (hostConfig.autoReplyMode === 'assist') continue;
 
-      const currentCount = ticket.messages.length;
+      const currentCount = (ticket.messages || []).length;
       const prevCount = prevCountsRef.current[ticket.id];
 
       // Initialize on first encounter
@@ -715,7 +715,7 @@ export function useGlobalAutoReply() {
         // and its last message is from a guest, treat it as a new guest message
         // so auto-reply can process it.
         const isPostMount = Date.now() - mountTimeRef.current > 1500;
-        const lastMsg = ticket.messages[ticket.messages.length - 1];
+        const lastMsg = (ticket.messages || [])[(ticket.messages || []).length - 1];
         if (isPostMount && lastMsg?.sender === 'guest') {
           const ticketId = ticket.id;
           console.log('[AutoReply] New ticket %s detected post-mount with guest message — processing', ticketId);
@@ -740,7 +740,7 @@ export function useGlobalAutoReply() {
 
       // Detect new messages
       if (currentCount > (prevCount || 0)) {
-        const newMessages = ticket.messages.slice(prevCount || 0);
+        const newMessages = (ticket.messages || []).slice(prevCount || 0);
         // #7: Include guest-mode test messages — auto-reply should respond to them too
         const hasNewGuestMsg = newMessages.some(m => m.sender === 'guest');
 
@@ -762,7 +762,7 @@ export function useGlobalAutoReply() {
           // ─── Cooldown pre-check: don't show pending indicator if cooldown is active ──
           if (hostConfig.cooldownEnabled && (hostConfig.cooldownMinutes || 10) > 0) {
             const cooldownMs = (hostConfig.cooldownMinutes || 10) * 60_000;
-            const recentAgentMsg = [...ticket.messages].reverse().find(
+            const recentAgentMsg = [...(ticket.messages || [])].reverse().find(
               m => m.sender === 'agent' || m.sender === 'host'
             );
             if (recentAgentMsg?.createdAt && Date.now() - recentAgentMsg.createdAt < cooldownMs) {

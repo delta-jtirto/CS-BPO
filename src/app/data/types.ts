@@ -27,8 +27,10 @@ export interface Message {
   time: string;
   createdAt: number; // epoch ms — used for cooldown, SLA, time-since calculations
   isGuestMode?: boolean; // true when injected via guest-mode testing — AI should skip
+  senderName?: string; // display name from Firestore
 }
 
+/** @deprecated Use bookingId + bookingStatus on Ticket instead */
 export interface Booking {
   checkIn: string;
   checkOut: string;
@@ -51,9 +53,19 @@ export interface Ticket {
   summary: string;
   tags: string[];
   language: string;
-  messages: Message[];
-  booking: Booking;
+  messages?: Message[]; // optional — lazy-loaded from Firestore per-thread
+  /** @deprecated Use bookingId + bookingStatus instead */
+  booking?: Booking;
+  bookingId?: number; // from Firestore thread data
+  bookingStatus?: string; // from Firestore thread data
   resolvedAt?: number; // epoch ms — set when ticket is resolved
+  // Firestore linkage
+  firestoreThreadId?: string;
+  firestoreHostId?: string; // which Firebase app instance owns this thread
+  firestoreGuestUserId?: string; // guest's unibox_user_id — used to identify guest messages
+  // Firestore metadata
+  unreadCount?: number;
+  companyName?: string; // for display in thread list
 }
 
 export interface KBEntry {

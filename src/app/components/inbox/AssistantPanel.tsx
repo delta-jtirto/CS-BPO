@@ -243,7 +243,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
   }, [onInquiriesClassified]);
 
   const handleRefreshInquiries = () => {
-    const guestMessages = ticket.messages.filter(m => m.sender === 'guest').map(m => m.text);
+    const guestMessages = (ticket.messages || []).filter(m => m.sender === 'guest').map(m => m.text);
     updateAiInquiries(null);
     setIsAnalyzing(true);
     classifyWithLLM(
@@ -264,7 +264,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
   };
 
   useEffect(() => {
-    const guestMessages = ticket.messages
+    const guestMessages = (ticket.messages || [])
       .filter(m => m.sender === 'guest')
       .map(m => m.text);
 
@@ -462,7 +462,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
               .join('\n')
           : '';
 
-        const recentGuestMessages = ticket.messages
+        const recentGuestMessages = (ticket.messages || [])
           .slice(-6)
           .map(m => `[${m.sender}] ${m.text}`)
           .join('\n');

@@ -11,6 +11,11 @@ import type { OperationId, PromptOverride, PromptOverrides } from '../ai/prompts
 import { MessageSquare } from 'lucide-react';
 import { detectInquiries } from '../components/inbox/InquiryDetector';
 import { projectId, publicAnonKey } from '/utils/supabase/info';
+import { useFirestoreConnections, type SavedConnection, type InboxConnection } from '@/hooks/use-firestore-connections';
+import { useFirestoreThreads, type FirestoreConnection, type BPOOverlayState } from '@/hooks/use-firestore-threads';
+import { type EscalationOverride } from '@/lib/compute-ticket-state';
+import { sendGuestMessage } from '@/lib/unibox-send';
+import { toast } from 'sonner';
 
 // Lazy-load the API client so a module-level error in api-client.ts
 // cannot crash the entire AppProvider during initialization.
@@ -89,6 +94,23 @@ interface AppState {
 
   // Tickets
   tickets: Ticket[];
+  setTickets: React.Dispatch<React.SetStateAction<Ticket[]>>;
+  // Lazy-loaded messages for the active thread (from Firestore)
+  activeMessages: Message[];
+  setActiveMessages: React.Dispatch<React.SetStateAction<Message[]>>;
+
+  // Firestore connections
+  firestoreConnections: import('@/hooks/use-firestore-connections').InboxConnection[];
+  firestoreInitializing: boolean;
+  addFirestoreConnection: (accessToken: string, host: Host) => Promise<void>;
+  removeFirestoreConnection: (hostId: string) => Promise<void>;
+  reconnectFirestore: (hostId: string, newToken: string) => Promise<void>;
+
+  // BPO overlay state (persisted in Supabase KV)
+  escalationOverrides: Record<string, import('@/lib/compute-ticket-state').EscalationOverride>;
+  handoverReasons: Record<string, { reason: string; writtenAt: number }>;
+  setHandoverReason: (threadId: string, reason: string) => void;
+
   resolveTicket: (id: string) => void;
   addMessageToTicket: (ticketId: string, text: string) => void;
   injectGuestMessage: (ticketId: string, text: string, isGuestMode?: boolean) => void;
@@ -256,8 +278,121 @@ function makeDefaultHostSettings(h: Host): HostSettings {
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const [activeHostFilter, setActiveHostFilter] = useState('all');
-  const [tickets, setTickets] = useState<Ticket[]>(MOCK_TICKETS);
+  // Start empty — Firestore threads merge in once connections authenticate.
+  // MOCK_TICKETS only loaded when devMode is explicitly enabled.
+  const [tickets, setTickets] = useState<Ticket[]>([]);
   const [kbEntries, setKbEntries] = useState<KBEntry[]>(MOCK_KB);
+  // Messages for the currently active thread — lazy-loaded from Firestore
+  const [activeMessages, setActiveMessages] = useState<Message[]>([]);
+
+  // ─── Firestore connections ────────────────────────────────
+  // Load saved connections once from localStorage (prototype; Supabase KV in prod)
+  const [initialSavedConnections] = useState<SavedConnection[]>(() => {
+    try {
+      const raw = localStorage.getItem('settings_connected_inboxes');
+      const inboxes = raw ? JSON.parse(raw) : [];
+      const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
+      return inboxes.map((inbox: any) => ({
+        hostId: inbox.hostId,
+        companyName: inbox.companyName,
+        host: MOCK_HOSTS.find(h => h.id === inbox.hostId) || MOCK_HOSTS[0],
+        accessToken: tokens[inbox.hostId] || '',
+        maskedToken: inbox.maskedToken || '',
+      })).filter((c: SavedConnection) => c.accessToken);
+    } catch { return []; }
+  });
+
+  const handleConnectionHealthChange = useCallback((hostId: string, companyName: string, health: string, message: string) => {
+    if (health === 'expired') {
+      toast.error(`${companyName}: Token expired`, { description: 'Go to Settings > Connected Inboxes to reconnect.' });
+    } else if (health === 'network-error') {
+      toast.error(`${companyName}: Connection lost`, { description: message });
+    }
+  }, []);
+
+  const {
+    connections: firestoreConnections,
+    isInitializing: firestoreInitializing,
+    addConnection: addFirestoreConnection,
+    removeConnection: removeFirestoreConnection,
+    reconnect: reconnectFirestore,
+  } = useFirestoreConnections(
+    initialSavedConnections,
+    handleConnectionHealthChange,
+  );
+
+  // Build FirestoreConnection array from healthy connections for the thread list hook
+  // Memoize to prevent useFirestoreThreads from re-subscribing on every render
+  const healthyConnections: FirestoreConnection[] = React.useMemo(() =>
+    firestoreConnections
+      .filter(c => c.status === 'connected' && c.userId && c.db)
+      .map(c => ({
+        hostId: c.hostId,
+        userId: c.userId!,
+        db: c.db!,
+        companyName: c.companyName,
+        host: c.host,
+      })),
+    // Re-compute only when connection count or statuses change
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [firestoreConnections.map(c => `${c.hostId}:${c.status}`).join(',')],
+  );
+
+  // ─── BPO overlay state (persisted in Supabase KV) ──────────
+  const [escalationOverrides, setEscalationOverrides] = useState<Record<string, EscalationOverride>>(() => {
+    try { return JSON.parse(localStorage.getItem('bpo_escalations') || '{}'); } catch { return {}; }
+  });
+  const [handoverReasons, setHandoverReasons] = useState<Record<string, { reason: string; writtenAt: number }>>(() => {
+    try { return JSON.parse(localStorage.getItem('bpo_handover_reasons') || '{}'); } catch { return {}; }
+  });
+
+  // Persist BPO overlay to localStorage when it changes
+  // (Supabase KV sync happens via the existing preferences save path on mount)
+  useEffect(() => {
+    try { localStorage.setItem('bpo_escalations', JSON.stringify(escalationOverrides)); } catch {}
+  }, [escalationOverrides]);
+
+  useEffect(() => {
+    try { localStorage.setItem('bpo_handover_reasons', JSON.stringify(handoverReasons)); } catch {}
+  }, [handoverReasons]);
+
+  const setHandoverReason = useCallback((threadId: string, reason: string) => {
+    setHandoverReasons(prev => ({ ...prev, [threadId]: { reason, writtenAt: Date.now() } }));
+  }, []);
+
+  const bpoOverlayState: BPOOverlayState = React.useMemo(() => ({
+    escalationOverrides,
+    resolvedIds: {}, // TODO: wire resolvedIds with timestamps when refactoring resolve flow
+    handoverReasons: Object.fromEntries(
+      Object.entries(handoverReasons).map(([k, v]) => [k, v.reason]),
+    ),
+  }), [escalationOverrides, handoverReasons]);
+
+  // Subscribe to thread lists from all healthy connections
+  const { threads: firestoreThreads, isLoading: firestoreThreadsLoading } = useFirestoreThreads(
+    healthyConnections,
+    null,
+    bpoOverlayState,
+  );
+
+  // Merge Firestore threads into the tickets state
+  useEffect(() => {
+    if (firestoreThreads.length === 0) return;
+    setTickets(prev => {
+      const nonFirestore = prev.filter(t => !t.firestoreThreadId);
+      const merged = [...nonFirestore, ...firestoreThreads];
+      const deduped = Array.from(new Map(merged.map(t => [t.id, t])).values());
+      // Sort: Firestore threads by last_message_at (newest first), mock tickets keep relative order
+      deduped.sort((a, b) => {
+        // Both have slaSetAt or createdAt — use most recent activity
+        const aTime = a.slaSetAt || (a.messages?.[a.messages.length - 1]?.createdAt) || 0;
+        const bTime = b.slaSetAt || (b.messages?.[b.messages.length - 1]?.createdAt) || 0;
+        return bTime - aTime; // newest first
+      });
+      return deduped;
+    });
+  }, [firestoreThreads]);
+
   const [darkMode, setDarkModeRaw] = useState(false);
   const [devModeRaw, setDevModeRaw] = useState(false);
   const [agentNameRaw, setAgentNameRaw] = useState('Agent Felix');
@@ -332,7 +467,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         }
 
         // Load persisted ticket state (messages + resolved IDs)
-        if (prefs.ticketState) {
+        // Only restore mock ticket state in devMode — in production mode,
+        // tickets come from Firestore connections.
+        const isDevMode = typeof prefs.devMode === 'boolean' ? prefs.devMode : devModeRaw;
+        if (isDevMode && prefs.ticketState) {
           try {
             const state = typeof prefs.ticketState === 'string'
               ? JSON.parse(prefs.ticketState) : prefs.ticketState;
@@ -348,16 +486,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 ? { ...t, messages: messages[t.id] }
                 : t
               );
-            // Restore custom (test) tickets that were created via createTestTicket
             const restoredCustom = (customTickets || []).map((ct: any) => ({
               ...ct,
-              channelIcon: MessageSquare, // Re-attach icon component (not serializable)
+              channelIcon: MessageSquare,
             }));
             setTickets([...restoredCustom, ...restoredMock]);
           } catch (parseErr) {
             console.error('Failed to parse saved ticket state:', parseErr);
           }
+        } else if (isDevMode) {
+          // devMode but no saved state — load mock data
+          setTickets(MOCK_TICKETS);
         }
+        // If not devMode, tickets stay empty — Firestore connections will populate them
         ticketsLoadedRef.current = true;
       } catch (err) {
         console.error('Failed to load preferences from backend:', err);
@@ -616,10 +757,33 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const addMessageToTicket = useCallback((ticketId: string, text: string) => {
+    const ticket = tickets.find(t => t.id === ticketId);
+
+    // For Firestore threads: send via Unibox API — message appears via onSnapshot
+    if (ticket?.firestoreThreadId && ticket?.firestoreHostId) {
+      const conn = firestoreConnections.find(c => c.hostId === ticket.firestoreHostId && c.status === 'connected');
+      if (conn?.userId) {
+        // Get the access token from localStorage
+        const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
+        const token = tokens[ticket.firestoreHostId];
+        if (token) {
+          sendGuestMessage(ticket.firestoreThreadId, conn.userId, text, token).catch(err => {
+            toast.error('Failed to send message', { description: err.message });
+          });
+          setAutoReplyHandedOff(ticketId, false);
+          return;
+        }
+      }
+      toast.error('Cannot send — inbox connection not found. Check Settings > Connected Inboxes.');
+      return;
+    }
+
+    // For mock/devMode threads: in-memory push
     const now = Date.now();
     setTickets(prev => prev.map(t => {
       if (t.id !== ticketId) return t;
-      const maxId = t.messages.length > 0 ? Math.max(...t.messages.map(m => m.id)) : 0;
+      const msgs = t.messages || [];
+      const maxId = msgs.length > 0 ? Math.max(...msgs.map(m => m.id)) : 0;
       const newMsg: Message = {
         id: maxId + 1,
         sender: 'agent' as const,
@@ -627,17 +791,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         time: new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         createdAt: now,
       };
-      return { ...t, messages: [...t.messages, newMsg] };
+      return { ...t, messages: [...msgs, newMsg] };
     }));
-    // #2: Proactively clear handedOff when agent replies
     setAutoReplyHandedOff(ticketId, false);
-  }, [setAutoReplyHandedOff]);
+  }, [tickets, firestoreConnections, setAutoReplyHandedOff]);
 
   const injectGuestMessage = useCallback((ticketId: string, text: string, isGuestModeFlag = false) => {
     const now = Date.now();
     setTickets(prev => prev.map(t => {
       if (t.id !== ticketId) return t;
-      const maxId = t.messages.length > 0 ? Math.max(...t.messages.map(m => m.id)) : 0;
+      const maxId = (t.messages || []).length > 0 ? Math.max(...(t.messages || []).map(m => m.id)) : 0;
       const newMsg: Message = {
         id: maxId + 1,
         sender: 'guest' as const,
@@ -646,7 +809,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         createdAt: now,
         isGuestMode: isGuestModeFlag || undefined, // #7: flag test messages so AI skips them
       };
-      return { ...t, messages: [...t.messages, newMsg] };
+      return { ...t, messages: [...(t.messages || []), newMsg] };
     }));
   }, []);
 
@@ -654,13 +817,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const now = Date.now();
     setTickets(prev => prev.map(t => {
       if (t.id !== ticketId) return t;
-      const maxId = t.messages.length > 0 ? Math.max(...t.messages.map(m => m.id)) : 0;
+      const maxId = (t.messages || []).length > 0 ? Math.max(...(t.messages || []).map(m => m.id)) : 0;
       const newMsg: Message = {
         id: maxId + 1, sender: 'bot' as const, text,
         time: new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         createdAt: now,
       };
-      return { ...t, messages: [...t.messages, newMsg] };
+      return { ...t, messages: [...(t.messages || []), newMsg] };
     }));
   }, []);
 
@@ -668,13 +831,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const now = Date.now();
     setTickets(prev => prev.map(t => {
       if (t.id !== ticketId) return t;
-      const maxId = t.messages.length > 0 ? Math.max(...t.messages.map(m => m.id)) : 0;
+      const maxId = (t.messages || []).length > 0 ? Math.max(...(t.messages || []).map(m => m.id)) : 0;
       const newMsg: Message = {
         id: maxId + 1, sender: 'system' as const, text,
         time: new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         createdAt: now,
       };
-      return { ...t, messages: [...t.messages, newMsg] };
+      return { ...t, messages: [...(t.messages || []), newMsg] };
     }));
   }, []);
 
@@ -682,13 +845,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const now = Date.now();
     setTickets(prev => prev.map(t => {
       if (t.id !== ticketId) return t;
-      const maxId = t.messages.length > 0 ? Math.max(...t.messages.map(m => m.id)) : 0;
+      const maxId = (t.messages || []).length > 0 ? Math.max(...(t.messages || []).map(m => m.id)) : 0;
       const newMsgs: Message[] = messages.map((m, i) => ({
         id: maxId + 1 + i, sender: m.sender, text: m.text,
         time: new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         createdAt: now,
       }));
-      return { ...t, messages: [...t.messages, ...newMsgs] };
+      return { ...t, messages: [...(t.messages || []), ...newMsgs] };
     }));
   }, []);
 
@@ -704,14 +867,28 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const escalateTicketWithUrgency = useCallback((ticketId: string, level: 'warning' | 'urgent', sla: string) => {
     const now = Date.now();
+    // Persist escalation override for Firestore threads
+    setEscalationOverrides(prev => ({ ...prev, [ticketId]: { level, setAt: now } }));
+    // Also update in-memory ticket for immediate UI feedback
     setTickets(prev => prev.map(t => {
       if (t.id !== ticketId) return t;
-      return { ...t, status: level, sla, slaSetAt: now }; // #8: track SLA set time
+      return { ...t, status: level, sla, slaSetAt: now };
     }));
   }, []);
 
-  // #12: De-escalation path — lets agent downgrade urgency back to normal
   const deescalateTicket = useCallback((ticketId: string) => {
+    // Clear escalation override
+    setEscalationOverrides(prev => {
+      const next = { ...prev };
+      delete next[ticketId];
+      return next;
+    });
+    // Clear handover reason on de-escalation
+    setHandoverReasons(prev => {
+      const next = { ...prev };
+      delete next[ticketId];
+      return next;
+    });
     setTickets(prev => prev.map(t => {
       if (t.id !== ticketId) return t;
       return { ...t, status: 'normal' as const, sla: '24:00', slaSetAt: Date.now() };
@@ -721,7 +898,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const deleteMessageFromTicket = useCallback((ticketId: string, messageId: number) => {
     setTickets(prev => prev.map(t => {
       if (t.id !== ticketId) return t;
-      const newMessages = t.messages.filter(m => m.id !== messageId);
+      const newMessages = (t.messages || []).filter(m => m.id !== messageId);
       return { ...t, messages: newMessages };
     }));
   }, []);
@@ -1323,7 +1500,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   return (
     <AppContext.Provider value={{
       activeHostFilter, setActiveHostFilter,
-      tickets, resolveTicket, addMessageToTicket, injectGuestMessage, addBotMessage, addSystemMessage, addMultipleMessages, escalateTicketStatus, escalateTicketWithUrgency, deescalateTicket, deleteMessageFromTicket, deleteThread,
+      tickets, setTickets, activeMessages, setActiveMessages,
+      firestoreConnections, firestoreInitializing,
+      addFirestoreConnection, removeFirestoreConnection, reconnectFirestore,
+      escalationOverrides, handoverReasons, setHandoverReason,
+      resolveTicket, addMessageToTicket, injectGuestMessage, addBotMessage, addSystemMessage, addMultipleMessages, escalateTicketStatus, escalateTicketWithUrgency, deescalateTicket, deleteMessageFromTicket, deleteThread,
       draftReplies, setDraftReply, clearDraftReply,
       ticketNotes, updateTicketNotes,
       kbEntries, addKBEntry, updateKBEntry, deleteKBEntry, deleteKBEntriesBySource,
