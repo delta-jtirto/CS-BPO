@@ -1181,8 +1181,8 @@ function AIKeyFieldBackend({ hasApiKey, maskedApiKey, loading, onSave, onClear }
       ) : hasApiKey ? (
         <div className="flex items-center gap-3">
           <code className="bg-emerald-50 text-emerald-700 px-3 py-1.5 rounded-lg text-sm font-mono border border-emerald-200">{maskedApiKey}</code>
-          <button onClick={() => setEditing(true)} className="text-xs text-indigo-600 hover:underline font-medium">Change</button>
-          <button onClick={onClear} className="text-xs text-red-500 hover:underline font-medium">Remove</button>
+          <button onClick={() => setEditing(true)} className="text-[10px] text-indigo-600 hover:underline font-medium">Change</button>
+          <button onClick={onClear} className="text-[10px] text-red-500 hover:underline font-medium">Remove</button>
         </div>
       ) : (
         <button onClick={() => setEditing(true)} className="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 flex items-center gap-2">

@@ -644,7 +644,7 @@ Output ONLY a JSON object. For regular fields use flat keys. For FAQs use a "faq
         <div className="text-center">
           <AlertTriangle size={48} className="mx-auto text-amber-400 mb-4" />
           <h2 className="font-bold text-slate-800 mb-2">Property Not Found</h2>
-          <button onClick={() => navigate('/kb')} className="text-indigo-600 hover:underline text-sm">
+          <button onClick={() => navigate('/kb')} className="text-indigo-600 hover:underline text-xs">
             Back to Properties
           </button>
         </div>

@@ -1350,7 +1350,7 @@ export function InboxView() {
           {isActiveTicketStale && (
             <div className="flex items-center gap-2 mb-2 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-700">
               <AlertCircle size={14} className="shrink-0" />
-              <span>Connection lost — <button onClick={() => navigate('/settings/inboxes')} className="underline font-medium hover:no-underline">reconnect this inbox</button> to reply</span>
+              <span>Connection lost — <button onClick={() => navigate('/settings/inboxes')} className="underline font-medium hover:no-underline text-inherit">reconnect this inbox</button> to reply</span>
             </div>
           )}
           {guestMode && (

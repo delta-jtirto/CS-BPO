@@ -540,7 +540,7 @@ export function KnowledgeBaseView() {
         {/* Rec #4: "Where do I put this?" hint */}
         <div className="flex items-start gap-2 p-2 bg-white/60 border border-slate-200/50 rounded text-[10px] text-slate-500 leading-relaxed">
           <Info size={12} className="shrink-0 mt-0.5 text-slate-400" />
-          <span>If this info matches a form field (Wi-Fi, check-in, etc.), update it in the <button onClick={() => navigate(`/kb/onboard/${prop.id}`)} className="text-indigo-500 hover:underline font-medium">property form</button> instead — it auto-syncs to the AI.</span>
+          <span>If this info matches a form field (Wi-Fi, check-in, etc.), update it in the <button onClick={() => navigate(`/kb/onboard/${prop.id}`)} className="text-[10px] text-indigo-500 hover:underline font-medium">property form</button> instead — it auto-syncs to the AI.</span>
         </div>
         {/* Content first (Rec #7) */}
         <input
