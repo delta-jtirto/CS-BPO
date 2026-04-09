@@ -8,7 +8,7 @@ import {
   Plus, X, Trash2, Copy, FileEdit, Info, ShieldAlert, ArrowRightLeft,
   Loader2, Square, PauseCircle, SkipForward, Zap, AlertCircle,
   ArrowLeft, PanelRightOpen, PanelRightClose, PanelLeftOpen, PanelLeftClose, ChevronsLeft, ChevronsRight,
-  ArrowDown, MessageSquare as MessageSquareIcon, MoreVertical, Share2, FileText, Settings
+  ArrowDown, MessageSquare as MessageSquareIcon, MoreVertical, Share2, FileText, Settings, Lock
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { toast } from 'sonner';
@@ -32,17 +32,19 @@ export function InboxView() {
   const { ticketId } = useParams();
   const navigate = useNavigate();
   const {
-    tickets, resolveTicket, addMessageToTicket, injectGuestMessage,
+    tickets, setTickets, resolveTicket, addMessageToTicket, injectGuestMessage,
     activeHostFilter, agentName, devMode, resetToDemo, createTestTicket,
     deleteMessageFromTicket, kbEntries,
     draftReplies, clearDraftReply, addBotMessage, addSystemMessage,
     deleteThread, deescalateTicket,
-    autoReplyProcessing, cancelAutoReply, autoReplyPausedTickets, toggleAutoReplyPause,
+    autoReplyProcessing, cancelAutoReply, autoReplyPausedTickets, toggleAutoReplyPause, setTicketAiEnabled,
     autoReplyHandedOff, setAutoReplyHandedOff,
-    resumeAllAI, hostSettings, notificationPrefs, updateHostSettings,
+    resumeAllAI, threadAiLocks, toggleThreadAiLock,
+    hostSettings, notificationPrefs, updateHostSettings,
     ticketNotes, updateTicketNotes,
     activeMessages, setActiveMessages,
     firestoreConnections, firestoreInitializing,
+    firestoreSyncedTickets,
   } = useAppContext();
 
   const filteredTickets = activeHostFilter === 'all' ? tickets : tickets.filter(t => t.host.id === activeHostFilter);
@@ -84,6 +86,40 @@ export function InboxView() {
       setActiveMessages([]);
     }
   }, [firestoreMessages, activeTicket?.firestoreThreadId, setActiveMessages]);
+
+  // Sync Firestore messages into ticket.messages so AI consumers (useAutoReply,
+  // useSmartReply, AssistantPanel) can see the full conversation.
+  // Merge strategy: Firestore supplies guest/host/agent messages; local state
+  // supplies bot/system messages added by auto-reply. Sender types don't overlap.
+  useEffect(() => {
+    if (!activeTicket?.firestoreThreadId || firestoreMessages.length === 0) return;
+
+    // Mark this ticket as having received a Firestore sync so useAutoReply
+    // can re-initialize its count tracker without false-triggering.
+    firestoreSyncedTickets.current.add(activeTicket.id);
+
+    setTickets(prev => prev.map(t => {
+      if (t.id !== activeTicket.id) return t;
+
+      // Keep locally-created bot/system messages — they aren't in Firestore
+      const localMessages = (t.messages || []).filter(
+        m => m.sender === 'bot' || m.sender === 'system'
+      );
+
+      const merged = [...firestoreMessages, ...localMessages]
+        .sort((a, b) => a.createdAt - b.createdAt);
+
+      // Skip update if nothing actually changed (avoid unnecessary re-renders)
+      const existing = t.messages || [];
+      if (existing.length === merged.length) {
+        const last = existing[existing.length - 1];
+        const lastM = merged[merged.length - 1];
+        if (last?.text === lastM?.text && last?.createdAt === lastM?.createdAt) return t;
+      }
+
+      return { ...t, messages: merged };
+    }));
+  }, [firestoreMessages, activeTicket?.id, activeTicket?.firestoreThreadId, setTickets]);
 
   // Helper: get messages for a ticket — from Firestore (activeMessages) for active ticket,
   // or from embedded messages (mock/devMode), defaulting to empty array.
@@ -733,10 +769,11 @@ export function InboxView() {
 
                   {/* Row 2: badges inline */}
                   <div className="flex items-center gap-1 mb-1 flex-nowrap overflow-hidden">
-                    {/* AI Toggle */}
+                    {/* AI Toggle — per-ticket only, never changes host settings */}
                     {(() => {
                       const hostAutoReply = hostSettings.find(s => s.hostId === ticket.host.id)?.autoReply ?? false;
-                      const aiOff = !hostAutoReply || isPaused;
+                      const isExplicitlyEnabled = autoReplyPausedTickets[ticket.id] === false;
+                      const aiOff = autoReplyPausedTickets[ticket.id] === true || (!hostAutoReply && !isExplicitlyEnabled);
                       return (
                         <motion.button
                           key={aiOff ? 'off' : 'on'}
@@ -745,28 +782,49 @@ export function InboxView() {
                           transition={{ duration: 0.15 }}
                           onClick={(e: React.MouseEvent) => {
                             e.stopPropagation();
-                            if (!hostAutoReply) {
-                              updateHostSettings(ticket.host.id, { autoReply: true });
-                              if (isPaused) toggleAutoReplyPause(ticket.id);
-                              if (isHandedOff) setAutoReplyHandedOff(ticket.id, false);
-                              toast.success('Auto-reply enabled', { description: `AI is now active for ${ticket.host.name}.`, duration: 3000 });
-                            } else if (isPaused || isHandedOff) {
-                              if (isPaused) toggleAutoReplyPause(ticket.id);
+                            if (aiOff) {
+                              setTicketAiEnabled(ticket.id, true);
                               if (isHandedOff) setAutoReplyHandedOff(ticket.id, false);
                               toast.success('AI enabled', { description: `Auto-reply active for ${ticket.guestName}.`, duration: 3000 });
                             } else {
-                              toggleAutoReplyPause(ticket.id);
+                              setTicketAiEnabled(ticket.id, false);
                               toast('AI paused', { description: `You're handling ${ticket.guestName} manually.`, duration: 3000 });
                             }
                           }}
                           className={`inline-flex items-center gap-0.5 text-[9px] font-semibold px-1.5 py-0.5 rounded-full border transition-colors cursor-pointer shrink-0 ${
-                            !hostAutoReply || aiOff
+                            aiOff
                               ? 'bg-slate-100 text-slate-400 border-slate-200 hover:border-violet-300 hover:text-violet-500'
                               : 'bg-violet-50 text-violet-600 border-violet-200 hover:bg-slate-100 hover:text-slate-400'
                           }`}
                         >
                           {aiOff ? <><PauseCircle size={8} /> AI Off</> : <><Zap size={8} /> AI On</>}
                         </motion.button>
+                      );
+                    })()}
+                    {/* Lock toggle — pins AI state for this thread */}
+                    {(() => {
+                      const isLocked = !!threadAiLocks[ticket.id];
+                      return (
+                        <button
+                          onClick={(e: React.MouseEvent) => {
+                            e.stopPropagation();
+                            toggleThreadAiLock(ticket.id);
+                            toast(isLocked ? 'AI lock removed' : 'AI state locked', {
+                              description: isLocked
+                                ? `${ticket.guestName} will now follow global AI setting.`
+                                : `AI state for ${ticket.guestName} is pinned — won't change with global toggle.`,
+                              duration: 2500,
+                            });
+                          }}
+                          title={isLocked ? 'Unlock AI state (follows global toggle)' : 'Lock AI state (ignore global toggle)'}
+                          className={`inline-flex items-center justify-center w-4 h-4 rounded-full border transition-colors cursor-pointer shrink-0 ${
+                            isLocked
+                              ? 'bg-violet-100 text-violet-500 border-violet-300 hover:bg-slate-100 hover:text-slate-400 hover:border-slate-200'
+                              : 'bg-transparent text-slate-300 border-slate-200 hover:bg-violet-50 hover:text-violet-400 hover:border-violet-200'
+                          }`}
+                        >
+                          <Lock size={7} />
+                        </button>
                       );
                     })()}
 
@@ -901,32 +959,50 @@ export function InboxView() {
           {/* Actions — always visible */}
           {activeTicket && (() => {
             const hostAutoReply = hostSettings.find(s => s.hostId === activeTicket.host.id)?.autoReply ?? false;
-            const aiOff = !hostAutoReply || activeIsPaused;
+            const isExplicitlyEnabled = autoReplyPausedTickets[activeTicket.id] === false;
+            const aiOff = autoReplyPausedTickets[activeTicket.id] === true || (!hostAutoReply && !isExplicitlyEnabled);
+            const isLocked = !!threadAiLocks[activeTicket.id];
             return (
-              <button
-                onClick={() => {
-                  if (!hostAutoReply) {
-                    updateHostSettings(activeTicket.host.id, { autoReply: true });
-                    if (activeIsPaused) toggleAutoReplyPause(activeTicket.id);
-                    if (activeIsHandedOff) setAutoReplyHandedOff(activeTicket.id, false);
-                    toast.success('Auto-reply enabled', { description: `AI is now active for ${activeTicket.host.name}.`, duration: 3000 });
-                  } else if (activeIsPaused || activeIsHandedOff) {
-                    if (activeIsPaused) toggleAutoReplyPause(activeTicket.id);
-                    if (activeIsHandedOff) setAutoReplyHandedOff(activeTicket.id, false);
-                    toast.success('AI enabled', { description: `Auto-reply active for ${activeTicket.guestName}.`, duration: 3000 });
-                  } else {
-                    toggleAutoReplyPause(activeTicket.id);
-                    toast('AI paused', { description: `You're handling ${activeTicket.guestName} manually.`, duration: 3000 });
-                  }
-                }}
-                className={`flex items-center gap-1 text-[9px] font-bold px-2 py-1 rounded-full border transition-colors whitespace-nowrap cursor-pointer shrink-0 ${
-                  aiOff
-                    ? 'bg-slate-100 text-slate-400 border-slate-200 hover:bg-violet-50 hover:text-violet-600 hover:border-violet-300'
-                    : 'bg-violet-50 text-violet-600 border-violet-200 hover:bg-slate-100 hover:text-slate-400 hover:border-slate-200'
-                }`}
-              >
-                {aiOff ? <><PauseCircle size={9} /> AI Off</> : <><Zap size={9} /> AI On</>}
-              </button>
+              <div className="flex items-center gap-0.5 shrink-0">
+                <button
+                  onClick={() => {
+                    if (aiOff) {
+                      setTicketAiEnabled(activeTicket.id, true);
+                      if (activeIsHandedOff) setAutoReplyHandedOff(activeTicket.id, false);
+                      toast.success('AI enabled', { description: `Auto-reply active for ${activeTicket.guestName}.`, duration: 3000 });
+                    } else {
+                      setTicketAiEnabled(activeTicket.id, false);
+                      toast('AI paused', { description: `You're handling ${activeTicket.guestName} manually.`, duration: 3000 });
+                    }
+                  }}
+                  className={`flex items-center gap-1 text-[9px] font-bold px-2 py-1 rounded-full border transition-colors whitespace-nowrap cursor-pointer ${
+                    aiOff
+                      ? 'bg-slate-100 text-slate-400 border-slate-200 hover:bg-violet-50 hover:text-violet-600 hover:border-violet-300'
+                      : 'bg-violet-50 text-violet-600 border-violet-200 hover:bg-slate-100 hover:text-slate-400 hover:border-slate-200'
+                  }`}
+                >
+                  {aiOff ? <><PauseCircle size={9} /> AI Off</> : <><Zap size={9} /> AI On</>}
+                </button>
+                <button
+                  onClick={() => {
+                    toggleThreadAiLock(activeTicket.id);
+                    toast(isLocked ? 'AI lock removed' : 'AI state locked', {
+                      description: isLocked
+                        ? `${activeTicket.guestName} will now follow global AI setting.`
+                        : `AI state pinned — won't change with global toggle.`,
+                      duration: 2500,
+                    });
+                  }}
+                  title={isLocked ? 'Unlock AI state' : 'Lock AI state'}
+                  className={`flex items-center justify-center w-5 h-5 rounded-full border transition-colors cursor-pointer ${
+                    isLocked
+                      ? 'bg-violet-100 text-violet-500 border-violet-300 hover:bg-slate-100 hover:text-slate-400 hover:border-slate-200'
+                      : 'bg-transparent text-slate-300 border-slate-200 hover:bg-violet-50 hover:text-violet-400 hover:border-violet-200'
+                  }`}
+                >
+                  <Lock size={9} />
+                </button>
+              </div>
             );
           })()}
 
@@ -979,31 +1055,44 @@ export function InboxView() {
                   const hostConfig = activeTicket ? hostSettings.find(s => s.hostId === activeTicket.host.id) : null;
                   if (!hostConfig) return null;
                   const hostAutoReply = hostConfig.autoReply;
-                  const activeIsPaused = autoReplyPausedTickets[activeTicket.id];
+                  const isExplicitlyEnabled2 = autoReplyPausedTickets[activeTicket.id] === false;
                   const activeIsHandedOff2 = autoReplyHandedOff[activeTicket.id] === true;
-                  const aiOff2 = !hostAutoReply || activeIsPaused || activeIsHandedOff2;
+                  const aiOff2 = autoReplyPausedTickets[activeTicket.id] === true || (!hostAutoReply && !isExplicitlyEnabled2);
+                  const isLocked2 = !!threadAiLocks[activeTicket.id];
                   return (
-                    <button
-                      onClick={() => {
-                        setHeaderMenuOpen(false);
-                        if (!hostAutoReply) {
-                          updateHostSettings(activeTicket.host.id, { autoReply: true });
-                          if (activeIsPaused) toggleAutoReplyPause(activeTicket.id);
-                          if (activeIsHandedOff2) setAutoReplyHandedOff(activeTicket.id, false);
-                          toast.success('Auto-reply enabled', { description: `AI is now active for ${activeTicket.host.name}.`, duration: 3000 });
-                        } else if (activeIsPaused || activeIsHandedOff2) {
-                          if (activeIsPaused) toggleAutoReplyPause(activeTicket.id);
-                          if (activeIsHandedOff2) setAutoReplyHandedOff(activeTicket.id, false);
-                          toast.success('AI enabled', { description: `Auto-reply active for ${activeTicket.guestName}.`, duration: 3000 });
-                        } else {
-                          toggleAutoReplyPause(activeTicket.id);
-                          toast('AI paused', { description: `You're handling ${activeTicket.guestName} manually.`, duration: 3000 });
-                        }
-                      }}
-                      className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50 transition-colors"
-                    >
-                      {aiOff2 ? <><PauseCircle size={13} /> Enable AI</> : <><Zap size={13} /> Pause AI</>}
-                    </button>
+                    <>
+                      <button
+                        onClick={() => {
+                          setHeaderMenuOpen(false);
+                          if (aiOff2) {
+                            setTicketAiEnabled(activeTicket.id, true);
+                            if (activeIsHandedOff2) setAutoReplyHandedOff(activeTicket.id, false);
+                            toast.success('AI enabled', { description: `Auto-reply active for ${activeTicket.guestName}.`, duration: 3000 });
+                          } else {
+                            setTicketAiEnabled(activeTicket.id, false);
+                            toast('AI paused', { description: `You're handling ${activeTicket.guestName} manually.`, duration: 3000 });
+                          }
+                        }}
+                        className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50 transition-colors"
+                      >
+                        {aiOff2 ? <><PauseCircle size={13} /> Enable AI</> : <><Zap size={13} /> Pause AI</>}
+                      </button>
+                      <button
+                        onClick={() => {
+                          setHeaderMenuOpen(false);
+                          toggleThreadAiLock(activeTicket.id);
+                          toast(isLocked2 ? 'AI lock removed' : 'AI state locked', {
+                            description: isLocked2
+                              ? `${activeTicket.guestName} will now follow global AI setting.`
+                              : `AI state pinned — won't change with global toggle.`,
+                            duration: 2500,
+                          });
+                        }}
+                        className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50 transition-colors"
+                      >
+                        <Lock size={13} /> {isLocked2 ? 'Unlock AI state' : 'Lock AI state'}
+                      </button>
+                    </>
                   );
                 })()}
                 {/* AI settings */}

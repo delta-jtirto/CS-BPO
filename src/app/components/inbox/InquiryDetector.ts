@@ -429,13 +429,14 @@ export async function classifyWithLLM(
   kbContext?: string,
   overrides?: import('../../ai/prompts').PromptOverrides,
   mode?: 'ai-context' | 'kb-scoring',
+  skipCache?: boolean,
 ): Promise<DetectedInquiry[]> {
   // Cache key = prompt version + mode + guest messages + first 100 chars of KB
   // Bump PROMPT_V when prompt format changes to bust stale cache
   const PROMPT_V = 'v9';
   const cacheKey = (PROMPT_V + '|' + (mode ?? 'ai-context') + '|' + guestMessages.join('|') + '|' + (kbContext ?? '').slice(0, 100)).slice(0, 300);
   const cached = _classifyCache.get(cacheKey);
-  if (cached) return cached;
+  if (cached && !skipCache) return cached;
 
   // Lazy-import prompts so this module stays pure (no side effects at import time)
   const { CLASSIFY_INQUIRY_USER, interpolate, resolvePrompt } = await import('../../ai/prompts');

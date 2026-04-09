@@ -130,11 +130,19 @@ interface AppState {
   /** Registry of AbortControllers per ticket — used to cancel in-flight AI HTTP requests */
   autoReplyAbortControllers: React.MutableRefObject<Record<string, AbortController>>;
   cancelAutoReply: (ticketId: string) => void;
+  /** Set of ticket IDs that just received their first Firestore message sync.
+   *  Auto-reply reads and clears entries to re-initialize its count tracker,
+   *  preventing historical Firestore messages from triggering false auto-replies. */
+  firestoreSyncedTickets: React.MutableRefObject<Set<string>>;
   autoReplyPausedTickets: Record<string, boolean>;
   toggleAutoReplyPause: (ticketId: string) => void;
+  /** Explicitly enable or disable AI for a single ticket, overriding host-level setting. */
+  setTicketAiEnabled: (ticketId: string, enabled: boolean) => void;
   autoReplyHandedOff: Record<string, boolean>;
   setAutoReplyHandedOff: (ticketId: string, handedOff: boolean) => void;
   resumeAllAI: () => void;
+  threadAiLocks: Record<string, boolean>;
+  toggleThreadAiLock: (ticketId: string) => void;
 
   // Draft replies (for draft auto-reply mode)
   draftReplies: Record<string, string>;
@@ -284,6 +292,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [kbEntries, setKbEntries] = useState<KBEntry[]>(MOCK_KB);
   // Messages for the currently active thread — lazy-loaded from Firestore
   const [activeMessages, setActiveMessages] = useState<Message[]>([]);
+  // Tracks which tickets just received their first Firestore message sync
+  // so useAutoReply can re-initialize its count without false-triggering
+  const firestoreSyncedTickets = useRef<Set<string>>(new Set());
 
   // ─── Firestore connections ────────────────────────────────
   // Load saved connections from Supabase KV on mount
@@ -488,6 +499,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (typeof prefs.agentName === 'string' && prefs.agentName) setAgentNameRaw(prefs.agentName);
         if (typeof prefs.defaultLanguage === 'string' && prefs.defaultLanguage) setDefaultLanguageRaw(prefs.defaultLanguage);
         if (Array.isArray(prefs.hostSettings)) setHostSettings(prefs.hostSettings);
+        if (prefs.autoReplyPausedTickets && typeof prefs.autoReplyPausedTickets === 'object') {
+          setAutoReplyPausedTickets(prev => ({ ...prev, ...prefs.autoReplyPausedTickets }));
+        }
+        if (prefs.threadAiLocks && typeof prefs.threadAiLocks === 'object') {
+          setThreadAiLocks(prev => ({ ...prev, ...prefs.threadAiLocks }));
+        }
         if (prefs.notificationPrefs && typeof prefs.notificationPrefs === 'object') {
           setNotificationPrefs(prev => ({ ...prev, ...prefs.notificationPrefs }));
         }
@@ -701,6 +718,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [autoReplyHandedOff, setAutoReplyHandedOffState] = useState<Record<string, boolean>>(() => {
     try { const s = localStorage.getItem('autoReplyHandedOff'); return s ? JSON.parse(s) : {}; } catch { return {}; }
   });
+  const [threadAiLocks, setThreadAiLocks] = useState<Record<string, boolean>>(() => {
+    try { const s = localStorage.getItem('threadAiLocks'); return s ? JSON.parse(s) : {}; } catch { return {}; }
+  });
 
   const setAutoReplyProcessing = useCallback((ticketId: string, processing: boolean) => {
     setAutoReplyProcessingState(prev => ({ ...prev, [ticketId]: processing }));
@@ -717,14 +737,39 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const toggleAutoReplyPause = useCallback((ticketId: string) => {
-    setAutoReplyPausedTickets(prev => ({ ...prev, [ticketId]: !prev[ticketId] }));
-  }, []);
+    setAutoReplyPausedTickets(prev => {
+      const next = { ...prev, [ticketId]: !prev[ticketId] };
+      syncPrefToBackend('autoReplyPausedTickets', next);
+      return next;
+    });
+  }, [syncPrefToBackend]);
+
+  const setTicketAiEnabled = useCallback((ticketId: string, enabled: boolean) => {
+    setAutoReplyPausedTickets(prev => {
+      const next = { ...prev, [ticketId]: !enabled };
+      syncPrefToBackend('autoReplyPausedTickets', next);
+      return next;
+    });
+  }, [syncPrefToBackend]);
 
   const setAutoReplyHandedOff = useCallback((ticketId: string, handedOff: boolean) => {
     setAutoReplyHandedOffState(prev => ({ ...prev, [ticketId]: handedOff }));
   }, []);
 
-  // Persist paused/handed-off state to localStorage
+  const toggleThreadAiLock = useCallback((ticketId: string) => {
+    setThreadAiLocks(prev => {
+      const next = { ...prev };
+      if (next[ticketId]) {
+        delete next[ticketId];
+      } else {
+        next[ticketId] = true;
+      }
+      syncPrefToBackend('threadAiLocks', next);
+      return next;
+    });
+  }, [syncPrefToBackend]);
+
+  // Persist paused/handed-off/lock state to localStorage
   useEffect(() => {
     try { localStorage.setItem('autoReplyPausedTickets', JSON.stringify(autoReplyPausedTickets)); } catch {}
   }, [autoReplyPausedTickets]);
@@ -732,6 +777,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     try { localStorage.setItem('autoReplyHandedOff', JSON.stringify(autoReplyHandedOff)); } catch {}
   }, [autoReplyHandedOff]);
+
+  useEffect(() => {
+    try { localStorage.setItem('threadAiLocks', JSON.stringify(threadAiLocks)); } catch {}
+  }, [threadAiLocks]);
 
   // #14: Persist drafts to localStorage
   useEffect(() => {
@@ -854,6 +903,26 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const addBotMessage = useCallback((ticketId: string, text: string) => {
+    const ticket = tickets.find(t => t.id === ticketId);
+    // For Firestore-backed tickets: send via Unibox API so message is delivered
+    // to the actual channel and written to Firestore. It appears via onSnapshot.
+    if (ticket?.firestoreThreadId && ticket?.firestoreHostId) {
+      const conn = firestoreConnections.find(c => c.hostId === ticket.firestoreHostId && c.status === 'connected');
+      if (conn?.userId) {
+        const tokens = (() => { try { return JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}'); } catch { return {}; } })();
+        const token = tokens[ticket.firestoreHostId];
+        if (token) {
+          sendGuestMessage(ticket.firestoreThreadId, conn.userId, text, token).catch(err => {
+            console.error('[AutoReply] Failed to send bot reply via Unibox:', err);
+            toast.error('AI reply failed to send', { description: err.message });
+          });
+          return; // Message appears in UI via Firestore onSnapshot
+        }
+      }
+      console.warn('[AutoReply] Cannot send bot message — no token for host:', ticket.firestoreHostId);
+      return;
+    }
+    // Mock / devMode: in-memory only
     const now = Date.now();
     setTickets(prev => prev.map(t => {
       if (t.id !== ticketId) return t;
@@ -865,7 +934,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       };
       return { ...t, messages: [...(t.messages || []), newMsg] };
     }));
-  }, []);
+  }, [tickets, firestoreConnections]);
 
   const addSystemMessage = useCallback((ticketId: string, text: string) => {
     const now = Date.now();
@@ -882,6 +951,41 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const addMultipleMessages = useCallback((ticketId: string, messages: { sender: Message['sender']; text: string }[]) => {
+    const ticket = tickets.find(t => t.id === ticketId);
+    // For Firestore-backed tickets: bot messages go via Unibox API; system messages stay local
+    if (ticket?.firestoreThreadId && ticket?.firestoreHostId) {
+      const conn = firestoreConnections.find(c => c.hostId === ticket.firestoreHostId && c.status === 'connected');
+      if (conn?.userId) {
+        const tokens = (() => { try { return JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}'); } catch { return {}; } })();
+        const token = tokens[ticket.firestoreHostId];
+        if (token) {
+          for (const msg of messages) {
+            if (msg.sender === 'bot') {
+              sendGuestMessage(ticket.firestoreThreadId, conn.userId, msg.text, token).catch(err => {
+                console.error('[AutoReply] Failed to send bot reply via Unibox:', err);
+              });
+            }
+          }
+        }
+      }
+      // System messages are internal notes — store locally so agents see them
+      const systemMsgs = messages.filter(m => m.sender === 'system');
+      if (systemMsgs.length > 0) {
+        const now = Date.now();
+        setTickets(prev => prev.map(t => {
+          if (t.id !== ticketId) return t;
+          const maxId = (t.messages || []).length > 0 ? Math.max(...(t.messages || []).map(m => m.id)) : 0;
+          const newMsgs: Message[] = systemMsgs.map((m, i) => ({
+            id: maxId + 1 + i, sender: m.sender, text: m.text,
+            time: new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            createdAt: now,
+          }));
+          return { ...t, messages: [...(t.messages || []), ...newMsgs] };
+        }));
+      }
+      return;
+    }
+    // Mock / devMode: in-memory only
     const now = Date.now();
     setTickets(prev => prev.map(t => {
       if (t.id !== ticketId) return t;
@@ -893,7 +997,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }));
       return { ...t, messages: [...(t.messages || []), ...newMsgs] };
     }));
-  }, []);
+  }, [tickets, firestoreConnections]);
 
   const escalateTicketStatus = useCallback((ticketId: string) => {
     setTickets(prev => prev.map(t => {
@@ -1526,16 +1630,26 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const resumeAllAI = useCallback(() => {
-    setAutoReplyPausedTickets({});
-    // Must explicitly set each ticket to `false` (not just `{}`) so that
+    // Preserve locked threads; clear unlocked thread overrides
+    setAutoReplyPausedTickets(prev => {
+      const next: Record<string, boolean> = {};
+      for (const [id, val] of Object.entries(prev)) {
+        if (threadAiLocks[id]) next[id] = val;
+      }
+      syncPrefToBackend('autoReplyPausedTickets', next);
+      return next;
+    });
+    // Must explicitly set each unlocked ticket to `false` so that
     // the `=== false` override check in InboxView/useAutoReply prevents
     // system-message-derived "handed off" status from re-asserting.
-    const allFalse: Record<string, boolean> = {};
-    for (const t of tickets) {
-      allFalse[t.id] = false;
-    }
-    setAutoReplyHandedOffState(allFalse);
-  }, [tickets]);
+    setAutoReplyHandedOffState(prev => {
+      const next = { ...prev };
+      for (const t of tickets) {
+        if (!threadAiLocks[t.id]) next[t.id] = false;
+      }
+      return next;
+    });
+  }, [tickets, threadAiLocks, syncPrefToBackend]);
 
   return (
     <AppContext.Provider value={{
@@ -1582,9 +1696,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       autoReplyCancelledRef,
       autoReplyAbortControllers,
       cancelAutoReply,
-      autoReplyPausedTickets, toggleAutoReplyPause,
+      autoReplyPausedTickets, toggleAutoReplyPause, setTicketAiEnabled,
       autoReplyHandedOff, setAutoReplyHandedOff,
       resumeAllAI,
+      threadAiLocks, toggleThreadAiLock,
+      firestoreSyncedTickets,
     }}>
       {children}
     </AppContext.Provider>

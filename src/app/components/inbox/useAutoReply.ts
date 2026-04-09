@@ -33,6 +33,8 @@ import { interpolate, resolvePrompt, resolveModel, resolveTemperature, resolveMa
 import type { PromptOverrides } from '../../ai/prompts';
 import { buildPropertyContext } from '../../ai/kb-context';
 import type { Ticket } from '../../data/types';
+import { collection, getDocs, query, orderBy } from 'firebase/firestore';
+import { mapFirestoreMessage, type FirestoreMessage } from '../../../lib/firestore-mappers';
 
 // ─── Debounce presets (ms) — configurable per host ───────────────
 const DEBOUNCE_PRESETS: Record<string, number> = {
@@ -296,9 +298,14 @@ export function useGlobalAutoReply() {
   const autoReplyHandedOff = ctx?.autoReplyHandedOff ?? {};
   const setAutoReplyHandedOff = ctx?.setAutoReplyHandedOff ?? (() => {});
   const cancelAutoReply = ctx?.cancelAutoReply ?? (() => {});
-  
+  const firestoreSyncedTickets = ctx?.firestoreSyncedTickets ?? { current: new Set<string>() };
+  const firestoreConnections = ctx?.firestoreConnections ?? [];
+
   // Track message counts per ticket (for new-message detection)
   const prevCountsRef = useRef<Record<string, number>>({});
+  // Track unread counts — used to detect new messages on background Firestore threads
+  // (where ticket.messages is not loaded until the thread is opened)
+  const prevUnreadCountsRef = useRef<Record<string, number>>({});
   // Debounce timers per ticket
   const debounceTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   // Pending processing flag per ticket
@@ -357,20 +364,52 @@ export function useGlobalAutoReply() {
   // ─── Process a ticket (called after debounce) ──────────────────
   const processTicket = useCallback(async (ticketId: string) => {
     // Find the ticket in the latest state
-    const ticket = tickets.find(t => t.id === ticketId);
+    let ticket = tickets.find(t => t.id === ticketId);
     if (!ticket) {
       setAutoReplyProcessing(ticketId, false);
       return;
     }
 
+    // For Firestore background threads, messages aren't loaded — fetch them now so
+    // the AI has conversation history to work with.
+    if (ticket.firestoreThreadId && (!ticket.messages || ticket.messages.length === 0)) {
+      const conn = firestoreConnections.find(
+        c => c.hostId === ticket!.firestoreHostId && c.status === 'connected' && c.db,
+      );
+      if (conn?.db) {
+        try {
+          const msgsSnap = await getDocs(query(
+            collection(conn.db, 'threads', ticket.firestoreThreadId, 'messages'),
+            orderBy('timestamp', 'asc'),
+          ));
+          const fetchedMsgs = msgsSnap.docs.map(d =>
+            mapFirestoreMessage(
+              { message_id: d.id, ...d.data() } as FirestoreMessage,
+              ticket!.firestoreGuestUserId,
+            )
+          );
+          if (fetchedMsgs.length > 0) {
+            ticket = { ...ticket, messages: fetchedMsgs };
+            console.log('[AutoReply] Fetched %d Firestore messages for background ticket %s',
+              fetchedMsgs.length, ticketId);
+          }
+        } catch (err) {
+          console.error('[AutoReply] Failed to fetch Firestore messages for %s:', ticketId, err);
+        }
+      }
+    }
+
     const hostConfig = hostSettings.find(s => s.hostId === ticket.host.id);
-    if (!hostConfig?.autoReply) {
+    // Per-ticket explicit enable (autoReplyPausedTickets[id] === false) overrides host-level off.
+    // This allows one thread to run AI even when the host's global switch is off.
+    const isTicketExplicitlyEnabled = autoReplyPausedTickets[ticketId] === false;
+    if (!hostConfig?.autoReply && !isTicketExplicitlyEnabled) {
       setAutoReplyProcessing(ticketId, false);
       return;
     }
 
     // Assist mode = no auto-reply, only sidebar powers
-    if (hostConfig.autoReplyMode === 'assist') {
+    if (hostConfig?.autoReplyMode === 'assist') {
       console.log('[AutoReply] %s: assist mode — skipping auto-reply', ticketId);
       setAutoReplyProcessing(ticketId, false);
       return;
@@ -692,7 +731,8 @@ export function useGlobalAutoReply() {
     addBotMessage, addSystemMessage, addMultipleMessages, escalateTicketStatus,
     escalateTicketWithUrgency, setDraftReply, startReEscalationTimer, notificationPrefs,
     autoReplyPausedTickets, autoReplyHandedOff, setAutoReplyHandedOff,
-    setAutoReplyProcessing, autoReplyCancelledRef, autoReplyAbortControllers]);
+    setAutoReplyProcessing, autoReplyCancelledRef, autoReplyAbortControllers,
+    firestoreConnections]);
 
   // ─── Main effect: watch all tickets for new guest messages ─────
   useEffect(() => {
@@ -700,15 +740,19 @@ export function useGlobalAutoReply() {
 
     for (const ticket of tickets) {
       const hostConfig = hostSettings.find(s => s.hostId === ticket.host.id);
-      if (!hostConfig?.autoReply) continue;
-      if (hostConfig.autoReplyMode === 'assist') continue;
+      const isExplicitlyEnabled = autoReplyPausedTickets[ticket.id] === false;
+      if (!hostConfig?.autoReply && !isExplicitlyEnabled) continue;
+      if (hostConfig?.autoReplyMode === 'assist') continue;
 
       const currentCount = (ticket.messages || []).length;
       const prevCount = prevCountsRef.current[ticket.id];
+      const currentUnread = ticket.unreadCount ?? 0;
+      const prevUnread = prevUnreadCountsRef.current[ticket.id] ?? currentUnread;
 
       // Initialize on first encounter
       if (!initializedRef.current.has(ticket.id)) {
         prevCountsRef.current[ticket.id] = currentCount;
+        prevUnreadCountsRef.current[ticket.id] = currentUnread;
         initializedRef.current.add(ticket.id);
         
         // If this ticket appeared AFTER initial mount (e.g. createTestTicket),
@@ -735,6 +779,18 @@ export function useGlobalAutoReply() {
             processTicket(ticketId);
           }, debounceMs);
         }
+        continue;
+      }
+
+      // Re-initialize count if this ticket just received its first Firestore message
+      // sync (InboxView merges Firestore messages into ticket.messages and marks the
+      // ticket here). Without this, the count jump would look like many "new" guest
+      // messages and trigger auto-reply for the entire conversation history.
+      if (firestoreSyncedTickets.current.has(ticket.id)) {
+        firestoreSyncedTickets.current.delete(ticket.id);
+        prevCountsRef.current[ticket.id] = currentCount;
+        prevUnreadCountsRef.current[ticket.id] = currentUnread;
+        console.log('[AutoReply] Re-initialized count for %s after Firestore sync: %d msgs', ticket.id, currentCount);
         continue;
       }
 
@@ -799,7 +855,36 @@ export function useGlobalAutoReply() {
         }
       }
 
+      // Detect new messages on background Firestore threads via unreadCount.
+      // ticket.messages is only populated when the thread is open; for background
+      // threads the message count is always 0, so we use unreadCount as the trigger.
+      const isBackgroundFirestore = !!ticket.firestoreThreadId && currentCount === 0;
+      if (isBackgroundFirestore && currentUnread > prevUnread) {
+        const ticketId = ticket.id;
+        if (autoReplyPausedTickets[ticketId]) {
+          console.log('[AutoReply] New unread on %s but AI paused — ignoring', ticketId);
+        } else {
+          if (debounceTimersRef.current[ticketId]) {
+            clearTimeout(debounceTimersRef.current[ticketId]);
+          }
+          const debounceMs = DEBOUNCE_PRESETS[hostConfig?.debouncePreset || 'normal'] || DEBOUNCE_PRESETS.normal;
+          console.log('[AutoReply] New unread on background Firestore ticket %s (%d→%d) — starting %ds debounce',
+            ticket.id, prevUnread, currentUnread, debounceMs / 1000);
+          autoReplyCancelledRef.current[ticketId] = false;
+          setAutoReplyProcessing(ticketId, true);
+          debounceTimersRef.current[ticketId] = setTimeout(() => {
+            if (autoReplyCancelledRef.current[ticketId]) {
+              setAutoReplyProcessing(ticketId, false);
+              return;
+            }
+            console.log('[AutoReply] Debounce expired for background Firestore ticket %s — processing', ticketId);
+            processTicket(ticketId);
+          }, debounceMs);
+        }
+      }
+
       prevCountsRef.current[ticket.id] = currentCount;
+      prevUnreadCountsRef.current[ticket.id] = currentUnread;
     }
   }, [tickets, hasApiKey, hostSettings, processTicket, autoReplyPausedTickets, setAutoReplyProcessing, autoReplyCancelledRef]);
 

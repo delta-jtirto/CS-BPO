@@ -192,9 +192,10 @@ interface ChatMessage {
 const MAX_CONTEXT_TURNS = 3; // 3 user+assistant pairs = 6 messages
 
 export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInquiriesClassified }: AssistantPanelProps) {
-  const { kbEntries, hasApiKey: hasApiKeyFromCtx, aiModel, onboardingData, formTemplate, properties, hostSettings, promptOverrides } = useAppContext();
+  const { kbEntries, hasApiKey: hasApiKeyFromCtx, aiModel, onboardingData, formTemplate, properties, hostSettings, promptOverrides, activeMessages } = useAppContext();
   const guestNeedsMode = hostSettings?.[0]?.demoFeatures?.guestNeedsMode ?? 'ai-context';
   const [isAnalyzing, setIsAnalyzing] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [expandedInquiries, setExpandedInquiries] = useState<Set<string>>(new Set());
   const [expandedArticle, setExpandedArticle] = useState<string | null>(null);
 
@@ -233,7 +234,22 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
 
   // LLM-primary classification — always fires, regex only as no-API-key fallback
   const [aiInquiries, setAiInquiries] = useState<DetectedInquiry[] | null>(null);
-  const llmClassifyRef = useRef<string | null>(null); // track ticket.id to avoid duplicate calls
+  // Key = ticketId:guestMessageCount — allows re-classification when Firestore messages arrive
+  const llmClassifyRef = useRef<string | null>(null);
+
+  // For Firestore tickets, activeMessages (updated directly by the subscription) is more
+  // up-to-date than ticket.messages (which goes through a setTickets → re-render cycle).
+  // Fall back to ticket.messages for non-Firestore / mock tickets.
+  const resolvedMessages = ticket.firestoreThreadId && activeMessages.length > 0
+    ? activeMessages
+    : (ticket.messages || []);
+
+  const resolvedGuestMessages = resolvedMessages
+    .filter(m => m.sender === 'guest')
+    .map(m => m.text);
+
+  // Dedup key: re-classify when ticket OR guest message count changes
+  const classifyKey = `${ticket.id}:${resolvedGuestMessages.length}`;
 
   // Wrapper: set local state + notify parent (SmartReplyPanel consumes via InboxView)
   const updateAiInquiries = useCallback((result: DetectedInquiry[] | null) => {
@@ -244,51 +260,50 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
   }, [onInquiriesClassified]);
 
   const handleRefreshInquiries = () => {
-    const guestMessages = (ticket.messages || []).filter(m => m.sender === 'guest').map(m => m.text);
-    updateAiInquiries(null);
-    setIsAnalyzing(true);
+    setIsRefreshing(true);
+    // Reset ref so the effect re-classifies next time message count changes
+    llmClassifyRef.current = null;
     classifyWithLLM(
-      guestMessages,
+      resolvedGuestMessages,
       ticket.property,
       ticket.host.name,
       (opts) => classifyInquiriesProxy({ ...opts, model: resolveModel('classify_inquiry', promptOverrides), temperature: resolveTemperature('classify_inquiry', promptOverrides), maxTokens: resolveMaxTokens('classify_inquiry', promptOverrides) }),
       propContext,
       promptOverrides,
       guestNeedsMode,
+      true, // skipCache: force fresh LLM call regardless of cached result
     ).then(result => {
+      llmClassifyRef.current = classifyKey; // re-lock at current key
       updateAiInquiries(result.length > 0 ? result : [fallbackGeneralInquiry(ticket)]);
     }).catch(() => {
-      updateAiInquiries(filterGreetingNoise(detectInquiries(guestMessages, ticket.tags, ticket.summary)));
+      llmClassifyRef.current = classifyKey;
+      updateAiInquiries(filterGreetingNoise(detectInquiries(resolvedGuestMessages, ticket.tags, ticket.summary)));
     }).finally(() => {
-      setIsAnalyzing(false);
+      setIsRefreshing(false);
     });
   };
 
   useEffect(() => {
-    const guestMessages = (ticket.messages || [])
-      .filter(m => m.sender === 'guest')
-      .map(m => m.text);
-
     if (!hasApiKey) {
       // No API key — fall back to regex synchronously
-      const fallback = filterGreetingNoise(detectInquiries(guestMessages, ticket.tags, ticket.summary));
+      const fallback = filterGreetingNoise(detectInquiries(resolvedGuestMessages, ticket.tags, ticket.summary));
       updateAiInquiries(fallback);
       setIsAnalyzing(false);
       return;
     }
 
-    // Don't re-classify the same ticket
-    if (llmClassifyRef.current === ticket.id) return;
-    llmClassifyRef.current = ticket.id;
+    // Don't re-classify when ticket + message count haven't changed
+    if (llmClassifyRef.current === classifyKey) return;
+    llmClassifyRef.current = classifyKey;
 
-    if (guestMessages.length === 0) {
+    if (resolvedGuestMessages.length === 0) {
       updateAiInquiries([fallbackGeneralInquiry(ticket)]);
       setIsAnalyzing(false);
       return;
     }
 
     classifyWithLLM(
-      guestMessages,
+      resolvedGuestMessages,
       ticket.property,
       ticket.host.name,
       (opts) => classifyInquiriesProxy({ ...opts, model: resolveModel('classify_inquiry', promptOverrides), temperature: resolveTemperature('classify_inquiry', promptOverrides), maxTokens: resolveMaxTokens('classify_inquiry', promptOverrides) }),
@@ -296,16 +311,16 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
       promptOverrides,
       guestNeedsMode,
     ).then(result => {
-      console.log('[AssistantPanel] LLM classified %d inquiries', result.length);
+      console.log('[AssistantPanel] LLM classified %d inquiries for key %s', result.length, classifyKey);
       updateAiInquiries(result.length > 0 ? result : [fallbackGeneralInquiry(ticket)]);
     }).catch(err => {
       console.error('[AssistantPanel] LLM classification failed, falling back to regex:', err);
-      updateAiInquiries(filterGreetingNoise(detectInquiries(guestMessages, ticket.tags, ticket.summary)));
+      updateAiInquiries(filterGreetingNoise(detectInquiries(resolvedGuestMessages, ticket.tags, ticket.summary)));
     }).finally(() => {
       setIsAnalyzing(false);
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ticket.id, ticket, hasApiKey, aiModel, propContext]);
+  }, [classifyKey, hasApiKey, aiModel, propContext]);
 
   // All inquiries come from LLM (or regex fallback when no API key)
   // Deduplicate: merge same-type inquiries, combining their details
@@ -463,7 +478,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
               .join('\n')
           : '';
 
-        const recentGuestMessages = (ticket.messages || [])
+        const recentGuestMessages = resolvedMessages
           .slice(-6)
           .map(m => `[${m.sender}] ${m.text}`)
           .join('\n');
@@ -755,10 +770,11 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
             <span className="text-[10px] bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded-full font-bold tabular-nums">{inquiries.length}</span>
             <button
               onClick={handleRefreshInquiries}
-              className="text-slate-300 hover:text-slate-500 transition-colors"
+              disabled={isRefreshing}
+              className="text-slate-300 hover:text-slate-500 transition-colors disabled:cursor-not-allowed"
               title="Re-analyse guest needs"
             >
-              <RefreshCw size={11} className={isAnalyzing ? 'animate-spin' : ''} />
+              <RefreshCw size={11} className={isRefreshing ? 'animate-spin' : ''} />
             </button>
             <span className={`ml-auto text-[8px] font-semibold px-1.5 py-0.5 rounded-full border ${
               hasApiKey
@@ -769,9 +785,19 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
             </span>
           </div>
 
-          {/* One card per detected intent */}
+          {/* One card per detected intent — or inline skeleton while refreshing */}
           <div className="space-y-2">
-            {inquiries.map((inq, idx) => {
+            {isRefreshing ? (
+              <div className="space-y-2 animate-pulse">
+                {[1, 2].map(i => (
+                  <div key={i} className="rounded-xl border border-slate-100 p-3 space-y-1.5">
+                    <div className="h-2.5 bg-slate-200 rounded w-1/2" />
+                    <div className="h-2 bg-slate-100 rounded w-full" />
+                    <div className="h-2 bg-slate-100 rounded w-3/4" />
+                  </div>
+                ))}
+              </div>
+            ) : inquiries.map((inq, idx) => {
               const style = INQUIRY_STYLE;
               const isExpanded = expandedInquiries.has(inq.id);
               const matches = kbMatchesByInquiry[inq.id] || [];
