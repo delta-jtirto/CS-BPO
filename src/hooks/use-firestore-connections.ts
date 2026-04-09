@@ -117,12 +117,18 @@ export function useFirestoreConnections(
     [handleHealthChange],
   );
 
-  // Progressive initialization — authenticate each saved connection without blocking
+  // Track whether we've already run initial auth (prevents re-running when
+  // connections are later modified via addConnection/removeConnection)
+  const didInitRef = useRef(false);
+
+  // Progressive initialization — authenticate each saved connection without blocking.
+  // Watches `initialSaved` so it picks up async Supabase fetch results.
   useEffect(() => {
-    if (initialSaved.length === 0) {
-      setIsInitializing(false);
+    if (didInitRef.current || initialSaved.length === 0) {
+      if (initialSaved.length === 0) setIsInitializing(false);
       return;
     }
+    didInitRef.current = true;
 
     // Set all connections as "connecting" initially
     setConnections(
@@ -152,9 +158,7 @@ export function useFirestoreConnections(
     return () => {
       cancelled = true;
     };
-  // Only run on mount
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [initialSaved, authSingle]);
 
   // Persist saved connections when they change
   useEffect(() => {
