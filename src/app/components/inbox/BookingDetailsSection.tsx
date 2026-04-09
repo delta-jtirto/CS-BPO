@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import {
   User, Users, ChevronDown, ChevronUp, Building, Moon,
-  ArrowRight, ExternalLink, FileText, Copy, CreditCard,
+  ArrowRight, ExternalLink, FileText, Copy,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import type { BookingDetails } from '@/lib/pms-api';
@@ -33,17 +33,12 @@ function formatDate(dateStr: string): string {
   return dateStr.replace(/-/g, '/');
 }
 
-function formatCurrency(amount: number | undefined, currency?: string): string {
+function formatCurrency(amount: number | undefined): string {
   if (amount === undefined || amount === null) return '-';
-  try {
-    return new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency: currency || 'USD',
-      minimumFractionDigits: 2,
-    }).format(amount);
-  } catch {
-    return `${currency || '$'}${amount.toFixed(2)}`;
-  }
+  return new Intl.NumberFormat('ja-JP', {
+    style: 'currency',
+    currency: 'JPY',
+  }).format(amount);
 }
 
 function guestBreakdown(details: BookingDetails): string {
@@ -98,7 +93,6 @@ export function BookingDetailsSection({
     return (
       <div>
         <div className="p-5 border-b border-slate-100 space-y-4">
-          {/* Header skeleton */}
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <Skeleton className="h-4 w-16" />
@@ -106,7 +100,6 @@ export function BookingDetailsSection({
             </div>
             <Skeleton className="h-4 w-4" />
           </div>
-          {/* Profile skeleton */}
           <div className="flex items-center gap-3">
             <Skeleton className="w-14 h-14 rounded-full" />
             <div className="space-y-1.5">
@@ -114,7 +107,6 @@ export function BookingDetailsSection({
               <Skeleton className="h-3 w-36" />
             </div>
           </div>
-          {/* Info skeleton */}
           <div className="space-y-2.5">
             <Skeleton className="h-3 w-full" />
             <Skeleton className="h-3 w-3/4" />
@@ -127,12 +119,12 @@ export function BookingDetailsSection({
   }
 
   const status = bd?.bookingStatus || activeTicket.bookingStatus;
-  const hasPayment = bd?.paymentStatus || bd?.totalDue !== undefined;
-  const hasNotes = bd?.internalNote || bd?.externalNote;
   const hasExtendedDetails = bd && (bd.propertyName || bd.checkIn || bd.numberOfGuests > 0);
-  const amountDue = (bd?.totalDue !== undefined && bd?.amountPaid !== undefined)
-    ? bd.totalDue - bd.amountPaid
-    : undefined;
+  const displayIdentifier = bd?.identifier || String(activeTicket.bookingId || bd?.bookingId || '');
+  const isCondominium = bd?.propertyType?.toLowerCase() === 'condominium';
+
+  // Property image: prefer roomType thumbnail
+  const propertyImage = bd?.roomTypeThumbnail || bd?.propertyImageUrl;
 
   return (
     <div>
@@ -140,7 +132,7 @@ export function BookingDetailsSection({
       <div className="px-5 pt-4 pb-3 border-b border-slate-100">
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-2">
-            <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider">Booking</h3>
+            <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider">Booking Details</h3>
             <BookingStatusBadge status={status} />
           </div>
           {activeTicket.bookingId && (
@@ -178,12 +170,12 @@ export function BookingDetailsSection({
             <span className="text-[10px] text-slate-400 uppercase tracking-wider">Booking ID</span>
             <button
               onClick={() => {
-                navigator.clipboard.writeText(String(activeTicket.bookingId || bd?.bookingId || ''));
+                navigator.clipboard.writeText(displayIdentifier);
                 toast.success('Copied booking ID');
               }}
               className="text-sm font-medium text-indigo-600 hover:text-indigo-700 flex items-center gap-1 transition-colors"
             >
-              #{activeTicket.bookingId || bd?.bookingId}
+              {displayIdentifier}
               <Copy size={10} className="text-slate-300" />
             </button>
           </div>
@@ -195,9 +187,9 @@ export function BookingDetailsSection({
             </div>
           )}
 
-          {bd?.preCheckinStatus && (
-            <div className="flex items-center justify-between">
-              <span className="text-[10px] text-slate-400 uppercase tracking-wider">Pre-checkin</span>
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] text-slate-400 uppercase tracking-wider">Pre-checkin form</span>
+            {bd?.preCheckinStatus ? (
               <span className={`inline-flex items-center px-2 py-0.5 rounded-md text-[10px] font-semibold border ${
                 bd.preCheckinStatus.toLowerCase() === 'submitted'
                   ? 'bg-violet-50 text-violet-600 border-violet-200'
@@ -205,8 +197,12 @@ export function BookingDetailsSection({
               }`}>
                 {bd.preCheckinStatus.replace(/[-_]/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}
               </span>
-            </div>
-          )}
+            ) : (
+              <span className="inline-flex items-center px-2 py-0.5 rounded-md text-[10px] font-semibold border bg-slate-100 text-slate-500 border-slate-200">
+                No Submission
+              </span>
+            )}
+          </div>
         </div>
 
         {/* ── View More / Less Toggle ── */}
@@ -215,29 +211,23 @@ export function BookingDetailsSection({
             {expanded && (
               <div className="mt-4 pt-3 border-t border-slate-100 space-y-3">
                 {/* Property image + name */}
-                <div className="flex items-start gap-3">
-                  {bd?.propertyImageUrl ? (
-                    <img
-                      src={bd.propertyImageUrl}
-                      alt={bd.propertyName}
-                      className="w-16 h-12 rounded-lg object-cover shrink-0"
-                    />
-                  ) : bd?.propertyName ? (
-                    <div className="w-16 h-12 rounded-lg bg-slate-100 flex items-center justify-center shrink-0">
-                      <Building size={16} className="text-slate-400" />
-                    </div>
-                  ) : null}
-                  <div className="min-w-0">
-                    {bd?.propertyName && (
-                      <p className="text-sm font-semibold text-slate-700 line-clamp-2">{bd.propertyName}</p>
-                    )}
-                    {bd?.propertySubtitle && (
-                      <p className="text-xs text-slate-400 truncate">{bd.propertySubtitle}</p>
-                    )}
-                    {bd?.roomName && (
-                      <p className="text-[10px] text-slate-400">{bd.roomTypeName ? `${bd.roomTypeName} — ${bd.roomName}` : bd.roomName}</p>
-                    )}
-                  </div>
+                {propertyImage && (
+                  <img
+                    src={propertyImage}
+                    alt={bd?.propertyName}
+                    className="w-full h-28 rounded-lg object-cover"
+                  />
+                )}
+                <div className="min-w-0">
+                  {bd?.propertyName && (
+                    <p className="text-sm font-semibold text-slate-700">{bd.propertyName}</p>
+                  )}
+                  {bd?.roomTypeName && (
+                    <p className="text-xs text-slate-400">{bd.roomTypeName}</p>
+                  )}
+                  {isCondominium && bd?.roomName && (
+                    <p className="text-xs text-slate-400">{bd.roomName}</p>
+                  )}
                 </div>
 
                 {/* Check-in → Check-out */}
@@ -283,63 +273,49 @@ export function BookingDetailsSection({
         )}
       </div>
 
-      {/* ── Booking Notes ── */}
-      {hasNotes && (
-        <div className="px-5 py-4 border-b border-slate-100 space-y-3">
-          {bd?.internalNote && (
-            <div>
-              <span className="block text-[10px] text-slate-400 uppercase tracking-wider font-bold mb-1">
-                Internal Note (Staff Only)
-              </span>
-              <p className="text-xs text-slate-600 bg-amber-50 border border-amber-100 rounded-lg p-2.5 leading-relaxed">
-                {bd.internalNote}
-              </p>
-            </div>
-          )}
-          {bd?.externalNote && (
-            <div>
-              <span className="block text-[10px] text-slate-400 uppercase tracking-wider font-bold mb-1">
-                Guest Note
-              </span>
-              <p className="text-xs text-slate-600 bg-slate-50 border border-slate-100 rounded-lg p-2.5 leading-relaxed">
-                {bd.externalNote}
-              </p>
-            </div>
-          )}
+      {/* ── Booking Notes (always shown) ── */}
+      <div className="px-5 py-4 border-b border-slate-100 space-y-3">
+        <div>
+          <span className="block text-[10px] text-slate-400 uppercase tracking-wider font-bold mb-1">
+            Internal Note (not visible to guests)
+          </span>
+          <p className="text-xs text-slate-600 leading-relaxed">
+            {bd?.internalNote || '-'}
+          </p>
         </div>
-      )}
+        <div>
+          <span className="block text-[10px] text-slate-400 uppercase tracking-wider font-bold mb-1">
+            External Note (from OTA)
+          </span>
+          <p className="text-xs text-slate-600 leading-relaxed">
+            {bd?.externalNote || '-'}
+          </p>
+        </div>
+      </div>
 
       {/* ── Payment Info ── */}
-      {hasPayment && (
-        <div className="px-5 py-4 border-b border-slate-100">
-          <div className="flex items-center justify-between mb-3">
-            <span className="text-[10px] text-slate-400 uppercase tracking-wider font-bold flex items-center gap-1">
-              <CreditCard size={10} /> Payment
-            </span>
-            <PaymentStatusBadge status={bd?.paymentStatus} />
+      <div className="px-5 py-4 border-b border-slate-100">
+        <div className="flex items-center justify-between mb-3">
+          <span className="text-[10px] text-slate-400 uppercase tracking-wider font-bold">
+            Payment Status
+          </span>
+          <PaymentStatusBadge status={bd?.paymentStatus} />
+        </div>
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-slate-400">Total Due</span>
+            <span className="text-xs text-slate-600">{formatCurrency(bd?.totalDue)}</span>
           </div>
-          <div className="space-y-1.5">
-            {bd?.totalDue !== undefined && (
-              <div className="flex items-center justify-between">
-                <span className="text-xs text-slate-400">Total Due</span>
-                <span className="text-xs text-slate-600">{formatCurrency(bd.totalDue, bd.currency)}</span>
-              </div>
-            )}
-            {bd?.amountPaid !== undefined && (
-              <div className="flex items-center justify-between">
-                <span className="text-xs text-slate-400">Paid</span>
-                <span className="text-xs text-slate-600">{formatCurrency(bd.amountPaid, bd.currency)}</span>
-              </div>
-            )}
-            {amountDue !== undefined && (
-              <div className="flex items-center justify-between pt-1 border-t border-slate-100">
-                <span className="text-xs font-bold text-slate-500">Amount Due</span>
-                <span className="text-xs font-bold text-slate-800">{formatCurrency(amountDue, bd?.currency)}</span>
-              </div>
-            )}
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-slate-400">Paid</span>
+            <span className="text-xs text-slate-600">{formatCurrency(bd?.amountPaid)}</span>
+          </div>
+          <div className="flex items-center justify-between pt-1 border-t border-slate-100">
+            <span className="text-xs font-bold text-slate-500">Amount Due</span>
+            <span className="text-xs font-bold text-slate-800">{formatCurrency(bd?.amountDue)}</span>
           </div>
         </div>
-      )}
+      </div>
 
       {/* ── BPO Incident Log ── */}
       <IncidentLog notes={ticketNotes} onUpdate={onUpdateNotes} />

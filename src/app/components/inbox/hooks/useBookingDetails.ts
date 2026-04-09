@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { fetchBookingDetails, type BookingDetails } from '@/lib/pms-api';
+import { fetchBookingDetails, fetchPaymentData, type BookingDetails } from '@/lib/pms-api';
 
 export function useBookingDetails(bookingId: number | undefined, firestoreHostId: string | undefined) {
   const [bookingDetails, setBookingDetails] = useState<BookingDetails | null>(null);
@@ -15,8 +15,19 @@ export function useBookingDetails(bookingId: number | undefined, firestoreHostId
     if (!token) return;
 
     setBookingLoading(true);
-    fetchBookingDetails(bookingId, token)
-      .then(d => setBookingDetails(d))
+
+    Promise.all([
+      fetchBookingDetails(bookingId, token),
+      fetchPaymentData(bookingId, token),
+    ])
+      .then(([details, payment]) => {
+        if (details && payment) {
+          details.totalDue = payment.totalDue;
+          details.amountPaid = payment.paid;
+          details.amountDue = payment.amountDue;
+        }
+        setBookingDetails(details);
+      })
       .finally(() => setBookingLoading(false));
   }, [bookingId, firestoreHostId]);
 

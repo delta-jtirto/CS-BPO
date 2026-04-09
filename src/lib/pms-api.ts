@@ -2,16 +2,18 @@ const PMS_API_BASE = import.meta.env.VITE_PMS_API_BASE_URL || 'https://pms.beta.
 
 export interface BookingDetails {
   bookingId: number;
+  identifier: string;
   propertyName: string;
+  propertyType: string;
   roomName: string;
   roomTypeName: string;
+  roomTypeThumbnail: string;
   checkIn: string;
   checkOut: string;
   numberOfGuests: number;
   guestEmail: string;
   channelName: string;
   referenceId?: string;
-  // Extended fields from PMS response
   bookingStatus?: string;
   guestFirstName?: string;
   guestLastName?: string;
@@ -28,6 +30,7 @@ export interface BookingDetails {
   paymentStatus?: string;
   totalDue?: number;
   amountPaid?: number;
+  amountDue?: number;
   currency?: string;
 }
 
@@ -45,16 +48,11 @@ const cache = new Map<number, CacheEntry>();
 
 /**
  * Fetch booking details from PMS API. Cached with TTL.
- *
- * - Success: cached for 15 minutes
- * - Failure (404, 401, network): cached for 5 minutes (don't hammer)
- * - Returns null on failure — caller shows booking ID as fallback
  */
 export async function fetchBookingDetails(
   bookingId: number,
   accessToken: string,
 ): Promise<BookingDetails | null> {
-  // Check cache
   const cached = cache.get(bookingId);
   if (cached) {
     const ttl = cached.isError ? FAILURE_TTL : SUCCESS_TTL;
@@ -89,34 +87,41 @@ export async function fetchBookingDetails(
       if (diff > 0) numberOfNights = Math.round(diff / (1000 * 60 * 60 * 24));
     }
 
+    // numberOfGuests is an object { adults, children, infants }
+    const guestObj = d.stayDetails?.numberOfGuests;
+    const adultsCount = guestObj?.adults ?? 0;
+    const childrenCount = guestObj?.children ?? 0;
+    const infantsCount = guestObj?.infants ?? 0;
+    const totalGuests = adultsCount + childrenCount + infantsCount;
+
     const details: BookingDetails = {
       bookingId,
+      identifier: d.identifier || '',
       propertyName: d.stayDetails?.property?.name || '',
+      propertyType: d.stayDetails?.property?.type || '',
       roomName: d.stayDetails?.room?.name || '',
       roomTypeName: d.stayDetails?.roomType?.name || '',
+      roomTypeThumbnail: d.stayDetails?.roomType?.thumbnail || '',
       checkIn: d.stayDetails?.checkIn || '',
       checkOut: d.stayDetails?.checkOut || '',
-      numberOfGuests: d.stayDetails?.numberOfGuests || 0,
+      numberOfGuests: totalGuests,
       guestEmail: d.guestInformation?.guest?.email || '',
       channelName: d.stayDetails?.channel?.name || '',
       referenceId: d.stayDetails?.referenceId || '',
-      // Extended fields
       bookingStatus: d.status || d.bookingStatus,
       guestFirstName: d.guestInformation?.guest?.firstName,
       guestLastName: d.guestInformation?.guest?.lastName,
       guestPhone: d.guestInformation?.guest?.phone,
-      propertyImageUrl: d.stayDetails?.property?.imageUrl || d.stayDetails?.property?.image,
+      propertyImageUrl: d.stayDetails?.roomType?.thumbnail || d.stayDetails?.property?.imageUrl || d.stayDetails?.property?.image,
       propertySubtitle: d.stayDetails?.property?.address || d.stayDetails?.property?.subtitle,
-      adultsCount: d.stayDetails?.adults ?? d.stayDetails?.numberOfAdults,
-      childrenCount: d.stayDetails?.children ?? d.stayDetails?.numberOfChildren,
-      infantsCount: d.stayDetails?.infants ?? d.stayDetails?.numberOfInfants,
+      adultsCount,
+      childrenCount,
+      infantsCount,
       numberOfNights,
-      preCheckinStatus: d.preCheckin?.status,
-      internalNote: d.notes?.internal ?? d.internalNote,
-      externalNote: d.notes?.external ?? d.externalNote,
-      paymentStatus: d.payment?.status ?? d.paymentStatus,
-      totalDue: d.payment?.totalDue ?? d.payment?.total,
-      amountPaid: d.payment?.amountPaid ?? d.payment?.paid,
+      preCheckinStatus: d.preCheckInStatus,
+      internalNote: d.noteAndAttachment?.note,
+      externalNote: d.stayDetails?.comment,
+      paymentStatus: d.paymentStatus,
       currency: d.payment?.currency ?? d.currency,
     };
 
@@ -124,6 +129,49 @@ export async function fetchBookingDetails(
     return details;
   } catch {
     cache.set(bookingId, { data: null, fetchedAt: Date.now(), isError: true });
+    return null;
+  }
+}
+
+export interface PaymentData {
+  totalDue: number;
+  paid: number;
+  amountDue: number;
+}
+
+/**
+ * Fetch payment data from the separate PMS payment endpoint.
+ */
+export async function fetchPaymentData(
+  bookingId: number,
+  accessToken: string,
+): Promise<PaymentData | null> {
+  try {
+    const response = await fetch(`${PMS_API_BASE}v2/bookings/${bookingId}/payment-data`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!response.ok) return null;
+
+    const json = await response.json();
+    const d = json.data || json;
+    const payments = d.payments;
+
+    if (Array.isArray(payments) && payments.length > 0) {
+      const payment = payments[0];
+      return {
+        totalDue: payment.amount ?? 0,
+        paid: payment.collectedAmount ?? 0,
+        amountDue: payment.amountDue ?? 0,
+      };
+    }
+
+    return null;
+  } catch {
     return null;
   }
 }
