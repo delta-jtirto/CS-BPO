@@ -11,6 +11,24 @@ export interface BookingDetails {
   guestEmail: string;
   channelName: string;
   referenceId?: string;
+  // Extended fields from PMS response
+  bookingStatus?: string;
+  guestFirstName?: string;
+  guestLastName?: string;
+  guestPhone?: string;
+  propertyImageUrl?: string;
+  propertySubtitle?: string;
+  adultsCount?: number;
+  childrenCount?: number;
+  infantsCount?: number;
+  numberOfNights?: number;
+  preCheckinStatus?: string;
+  internalNote?: string;
+  externalNote?: string;
+  paymentStatus?: string;
+  totalDue?: number;
+  amountPaid?: number;
+  currency?: string;
 }
 
 interface CacheEntry {
@@ -62,6 +80,15 @@ export async function fetchBookingDetails(
     const json = await response.json();
     const d = json.data || json;
 
+    // Compute nights from dates
+    let numberOfNights: number | undefined;
+    const ciDate = d.stayDetails?.checkIn;
+    const coDate = d.stayDetails?.checkOut;
+    if (ciDate && coDate) {
+      const diff = new Date(coDate).getTime() - new Date(ciDate).getTime();
+      if (diff > 0) numberOfNights = Math.round(diff / (1000 * 60 * 60 * 24));
+    }
+
     const details: BookingDetails = {
       bookingId,
       propertyName: d.stayDetails?.property?.name || '',
@@ -73,6 +100,24 @@ export async function fetchBookingDetails(
       guestEmail: d.guestInformation?.guest?.email || '',
       channelName: d.stayDetails?.channel?.name || '',
       referenceId: d.stayDetails?.referenceId || '',
+      // Extended fields
+      bookingStatus: d.status || d.bookingStatus,
+      guestFirstName: d.guestInformation?.guest?.firstName,
+      guestLastName: d.guestInformation?.guest?.lastName,
+      guestPhone: d.guestInformation?.guest?.phone,
+      propertyImageUrl: d.stayDetails?.property?.imageUrl || d.stayDetails?.property?.image,
+      propertySubtitle: d.stayDetails?.property?.address || d.stayDetails?.property?.subtitle,
+      adultsCount: d.stayDetails?.adults ?? d.stayDetails?.numberOfAdults,
+      childrenCount: d.stayDetails?.children ?? d.stayDetails?.numberOfChildren,
+      infantsCount: d.stayDetails?.infants ?? d.stayDetails?.numberOfInfants,
+      numberOfNights,
+      preCheckinStatus: d.preCheckin?.status,
+      internalNote: d.notes?.internal ?? d.internalNote,
+      externalNote: d.notes?.external ?? d.externalNote,
+      paymentStatus: d.payment?.status ?? d.paymentStatus,
+      totalDue: d.payment?.totalDue ?? d.payment?.total,
+      amountPaid: d.payment?.amountPaid ?? d.payment?.paid,
+      currency: d.payment?.currency ?? d.currency,
     };
 
     cache.set(bookingId, { data: details, fetchedAt: Date.now(), isError: false });

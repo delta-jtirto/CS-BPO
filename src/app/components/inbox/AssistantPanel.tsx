@@ -8,7 +8,6 @@ import {
 import { toast } from 'sonner';
 import { useAppContext } from '../../context/AppContext';
 import { ScopeBadge } from '../shared/ScopeBadge';
-import { MOCK_PROPERTIES } from '../../data/mock-data';
 import type { Ticket } from '../../data/types';
 import type { OnboardingSection } from '../../data/onboarding-template';
 import {
@@ -31,6 +30,8 @@ import {
   interpolate,
   resolvePrompt,
   resolveModel,
+  resolveTemperature,
+  resolveMaxTokens,
 } from '../../ai/prompts';
 
 // Inquiry type → icon + color mapping
@@ -205,7 +206,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
   const inputRef = useRef<HTMLInputElement>(null);
 
   // Find property
-  const activeProp = MOCK_PROPERTIES.find(p => p.name === ticket.property);
+  const activeProp = properties.find(p => p.name === ticket.property);
   const ticketRoom = ticket.room.replace(/[^0-9]/g, '');
   const hasApiKey = hasApiKeyFromCtx;
 
@@ -250,7 +251,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
       guestMessages,
       ticket.property,
       ticket.host.name,
-      (opts) => classifyInquiriesProxy({ ...opts, model: resolveModel('classify_inquiry', promptOverrides), temperature: promptOverrides.classify_inquiry?.temperature, maxTokens: promptOverrides.classify_inquiry?.maxTokens }),
+      (opts) => classifyInquiriesProxy({ ...opts, model: resolveModel('classify_inquiry', promptOverrides), temperature: resolveTemperature('classify_inquiry', promptOverrides), maxTokens: resolveMaxTokens('classify_inquiry', promptOverrides) }),
       propContext,
       promptOverrides,
       guestNeedsMode,
@@ -290,7 +291,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
       guestMessages,
       ticket.property,
       ticket.host.name,
-      (opts) => classifyInquiriesProxy({ ...opts, model: resolveModel('classify_inquiry', promptOverrides), temperature: promptOverrides.classify_inquiry?.temperature, maxTokens: promptOverrides.classify_inquiry?.maxTokens }),
+      (opts) => classifyInquiriesProxy({ ...opts, model: resolveModel('classify_inquiry', promptOverrides), temperature: resolveTemperature('classify_inquiry', promptOverrides), maxTokens: resolveMaxTokens('classify_inquiry', promptOverrides) }),
       propContext,
       promptOverrides,
       guestNeedsMode,
@@ -484,8 +485,8 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
           systemPrompt: resolvePrompt('ask_ai', 'system', promptOverrides),
           userPrompt: enrichedPrompt,
           model: resolveModel('ask_ai', promptOverrides),
-          temperature: promptOverrides.ask_ai?.temperature,
-          maxTokens: promptOverrides.ask_ai?.maxTokens,
+          temperature: resolveTemperature('ask_ai', promptOverrides),
+          maxTokens: resolveMaxTokens('ask_ai', promptOverrides),
         });
 
         const assistantMsg: ChatMessage = {

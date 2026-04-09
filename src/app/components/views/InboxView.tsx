@@ -1,6 +1,5 @@
 import { detectInquiries, scoreKBForInquiry, type DetectedInquiry } from '../inbox/InquiryDetector';
-import { useState, useRef, useEffect, useCallback, useMemo, useDeferredValue } from 'react';
-import Fuse from 'fuse.js';
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router';
 import {
   Clock, Send, User, Search,
@@ -16,15 +15,18 @@ import { toast } from 'sonner';
 import { useAppContext } from '../../context/AppContext';
 import { MOCK_HOSTS, MOCK_PROPERTIES } from '../../data/mock-data';
 import { parseThreadStatus } from '../../data/types';
-import { ConfirmDialog } from '../shared/ConfirmDialog';
-import { AssistantPanel } from '../inbox/AssistantPanel';
 import { SmartReplyPanel, type SmartReplyCache } from '../inbox/SmartReplyPanel';
 import { useIsMobile } from '../ui/use-mobile';
 import { useFirestoreMessages } from '@/hooks/use-firestore-messages';
 import { ConnectionStatusBar } from '../ConnectionStatusBar';
 import { SLABadge, getSLAStatus } from '../inbox/SLABadge';
 import { computeTags, getLastGuestMessageAt } from '@/lib/compute-ticket-state';
-import { fetchBookingDetails, type BookingDetails } from '@/lib/pms-api';
+import { useInboxPanels } from '../inbox/hooks/useInboxPanels';
+import { useInboxSearch } from '../inbox/hooks/useInboxSearch';
+import { useMessageContextMenu } from '../inbox/hooks/useMessageContextMenu';
+import { useBookingDetails } from '../inbox/hooks/useBookingDetails';
+import { ContextSidebarPane } from '../inbox/ContextSidebarPane';
+import { InboxDialogs } from '../inbox/InboxDialogs';
 
 export function InboxView() {
   const { ticketId } = useParams();
@@ -46,52 +48,16 @@ export function InboxView() {
   const filteredTickets = activeHostFilter === 'all' ? tickets : tickets.filter(t => t.host.id === activeHostFilter);
 
   // ─── Search + Filters ─────────────────────────────────────
-  const [searchQuery, setSearchQuery] = useState('');
-  const deferredQuery = useDeferredValue(searchQuery);
-  const searchInputRef = useRef<HTMLInputElement>(null);
-  const [filterCompany, setFilterCompany] = useState('');
-  const [filterChannel, setFilterChannel] = useState('');
-  const [showFilters, setShowFilters] = useState(false);
-
-  // Categorical filters (AND logic, applied before fuzzy search)
-  const categoryFiltered = useMemo(() => filteredTickets.filter(t => {
-    if (filterCompany && (t.companyName || t.host.name) !== filterCompany) return false;
-    if (filterChannel && t.channel !== filterChannel) return false;
-    return true;
-  }), [filteredTickets, filterCompany, filterChannel]);
-
-  // Fuse.js fuzzy search on the filtered set
-  const fuse = useMemo(() => new Fuse(categoryFiltered, {
-    keys: [
-      { name: 'guestName', weight: 0.6 },
-      { name: 'bookingId', weight: 0.3 },
-      { name: 'summary', weight: 0.1 },
-    ],
-    threshold: 0.3,
-    ignoreLocation: true,
-  }), [categoryFiltered]);
-
-  const searchedTickets = deferredQuery.trim()
-    ? fuse.search(deferredQuery).map(r => r.item)
-    : categoryFiltered;
-
-  const isSearchActive = Boolean(deferredQuery.trim() || filterCompany || filterChannel);
-
-  // Unique values for filter dropdowns (only show if >1 option)
-  const uniqueCompanies = useMemo(() => [...new Set(filteredTickets.map(t => t.companyName || t.host.name).filter(Boolean))], [filteredTickets]);
-  const uniqueChannels = useMemo(() => [...new Set(filteredTickets.map(t => t.channel).filter(Boolean))], [filteredTickets]);
-
-  // "/" keyboard shortcut to focus search
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === '/' && !['INPUT', 'TEXTAREA', 'SELECT'].includes((e.target as HTMLElement).tagName)) {
-        e.preventDefault();
-        searchInputRef.current?.focus();
-      }
-    };
-    document.addEventListener('keydown', handler);
-    return () => document.removeEventListener('keydown', handler);
-  }, []);
+  const {
+    searchQuery, setSearchQuery, deferredQuery,
+    searchInputRef,
+    filterCompany, setFilterCompany,
+    filterChannel, setFilterChannel,
+    showFilters, setShowFilters,
+    searchedTickets,
+    isSearchActive,
+    uniqueCompanies, uniqueChannels,
+  } = useInboxSearch(filteredTickets);
 
   const activeTicket = (ticketId ? searchedTickets.find(t => t.id === ticketId) : searchedTickets[0]) || searchedTickets[0];
 
@@ -145,22 +111,7 @@ export function InboxView() {
   }, []);
 
   // ─── PMS booking details (lazy fetch on active ticket) ────
-  const [bookingDetails, setBookingDetails] = useState<BookingDetails | null>(null);
-  const [bookingLoading, setBookingLoading] = useState(false);
-  useEffect(() => {
-    if (!activeTicket?.bookingId || !activeTicket?.firestoreHostId) {
-      setBookingDetails(null);
-      return;
-    }
-    const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
-    const token = tokens[activeTicket.firestoreHostId];
-    if (!token) return;
-
-    setBookingLoading(true);
-    fetchBookingDetails(activeTicket.bookingId, token)
-      .then(d => setBookingDetails(d))
-      .finally(() => setBookingLoading(false));
-  }, [activeTicket?.bookingId, activeTicket?.firestoreHostId]);
+  const { bookingDetails, bookingLoading } = useBookingDetails(activeTicket?.bookingId, activeTicket?.firestoreHostId);
 
   // ─── Computed tags for active ticket (detail view only) ───
   const activeTags = useMemo(() => {
@@ -239,247 +190,27 @@ export function InboxView() {
   const smartReplyCacheRef = useRef<Record<string, SmartReplyCache>>({});
 
   // ─── Resizable panel state (desktop only) ──────────────────────
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [leftWidth, setLeftWidth] = useState(() => {
-    const saved = localStorage.getItem('inbox-left-width');
-    return saved ? Math.max(240, Math.min(480, parseInt(saved))) : 320;
-  });
-  const [rightWidth, setRightWidth] = useState(() => {
-    const saved = localStorage.getItem('inbox-right-width');
-    return saved ? Math.max(260, Math.min(480, parseInt(saved))) : 320;
-  });
-  const [resizing, setResizing] = useState<'left' | 'right' | null>(null);
+  const {
+    containerRef,
+    leftWidth, setLeftWidth,
+    rightWidth, setRightWidth,
+    resizing, setResizing,
+    leftCollapsed, setLeftCollapsed,
+    rightCollapsed, setRightCollapsed,
+    rightOverlayOpen, setRightOverlayOpen,
+    leftOverlayOpen, setLeftOverlayOpen,
+    displayLeftWidth, displayRightWidth,
+    shouldAutoCollapseLeft, shouldAutoCollapseRight,
+    MIN_CENTER, LEFT_MIN, RIGHT_MIN,
+  } = useInboxPanels(isMobile);
 
-  // ─── Collapsible panel state (responsive for "nanggung" screens) ──
-  const [containerWidth, setContainerWidth] = useState(1400);
-  const [leftCollapsed, setLeftCollapsed] = useState(() => {
-    const saved = localStorage.getItem('inbox-left-collapsed');
-    return saved === 'true';
-  });
-  const [rightCollapsed, setRightCollapsed] = useState(() => {
-    const saved = localStorage.getItem('inbox-right-collapsed');
-    return saved === 'true';
-  });
-  const [rightOverlayOpen, setRightOverlayOpen] = useState(false);
-  const [leftOverlayOpen, setLeftOverlayOpen] = useState(false);
-
-  // Panel dimension constants
-  const MIN_CENTER = 350;
-  const LEFT_MIN = 240;
-  const RIGHT_MIN = 260;
-
-  // Dynamic collapse thresholds based on actual preferred widths:
-  // Right collapses when both panels at minimum still can't fit alongside center
-  const autoCollapseRightThreshold = LEFT_MIN + RIGHT_MIN + MIN_CENTER; // 850
-  // Left collapses when (right already collapsed) left at minimum can't fit
-  const autoCollapseLeftThreshold = LEFT_MIN + MIN_CENTER; // 590
-
-  // Progressive shrink: compute display widths (shrink before collapse)
-  let displayLeftWidth = leftWidth;
-  let displayRightWidth = rightWidth;
-
-  if (!isMobile && !leftCollapsed && !rightCollapsed) {
-    const totalNeeded = leftWidth + rightWidth + MIN_CENTER;
-    if (containerWidth < totalNeeded) {
-      // Proportional shrink: both side panels shrink together toward their minimums
-      const deficit = totalNeeded - containerWidth;
-      const leftShrinkable = leftWidth - LEFT_MIN;
-      const rightShrinkable = rightWidth - RIGHT_MIN;
-      const totalShrinkable = leftShrinkable + rightShrinkable;
-      if (totalShrinkable > 0) {
-        const leftShare = leftShrinkable / totalShrinkable;
-        const rightShare = 1 - leftShare;
-        displayLeftWidth = Math.max(LEFT_MIN, Math.round(leftWidth - deficit * leftShare));
-        displayRightWidth = Math.max(RIGHT_MIN, Math.round(rightWidth - deficit * rightShare));
-      }
-      // Guard: ensure center never goes below minimum after rounding
-      const centerRemaining = containerWidth - displayLeftWidth - displayRightWidth;
-      if (centerRemaining < MIN_CENTER) {
-        const overshoot = MIN_CENTER - centerRemaining;
-        displayRightWidth = Math.max(RIGHT_MIN, displayRightWidth - overshoot);
-      }
-    }
-  } else if (!isMobile && rightCollapsed && !leftCollapsed) {
-    // Right is collapsed — left can shrink toward its minimum
-    displayLeftWidth = Math.max(LEFT_MIN, Math.min(leftWidth, containerWidth - MIN_CENTER));
-  }
-
-  // Transition flags for auto-collapse effects
-  const shouldAutoCollapseRight = !isMobile && containerWidth > 0 && containerWidth < autoCollapseRightThreshold;
-  const shouldAutoCollapseLeft = !isMobile && containerWidth > 0 && containerWidth < autoCollapseLeftThreshold;
-
-  // Track container width with ResizeObserver
-  useEffect(() => {
-    if (!containerRef.current || isMobile) return;
-    const observer = new ResizeObserver((entries) => {
-      const w = entries[0]?.contentRect.width ?? 1400;
-      setContainerWidth(w);
-    });
-    observer.observe(containerRef.current);
-    return () => observer.disconnect();
-  }, [isMobile]);
-
-  // Auto-collapse/expand panels when panels have been shrunk to minimum and still can't fit
-  const prevCollapseRightRef = useRef(shouldAutoCollapseRight);
-  const prevCollapseLeftRef = useRef(shouldAutoCollapseLeft);
-
-  useEffect(() => {
-    if (isMobile) return;
-    // Collapse right panel when both panels at min still can't fit
-    if (shouldAutoCollapseRight && !prevCollapseRightRef.current) {
-      setRightCollapsed(true);
-      setRightOverlayOpen(false);
-    }
-    // Auto-expand right panel when viewport grows past threshold
-    if (!shouldAutoCollapseRight && prevCollapseRightRef.current) {
-      setRightCollapsed(false);
-    }
-    prevCollapseRightRef.current = shouldAutoCollapseRight;
-  }, [shouldAutoCollapseRight, isMobile]);
-
-  useEffect(() => {
-    if (isMobile) return;
-    // Collapse left panel when (right already collapsed) left at min can't fit
-    if (shouldAutoCollapseLeft && !prevCollapseLeftRef.current) {
-      setLeftCollapsed(true);
-      setLeftOverlayOpen(false);
-    }
-    // Auto-expand left panel when viewport grows past threshold
-    if (!shouldAutoCollapseLeft && prevCollapseLeftRef.current) {
-      setLeftCollapsed(false);
-    }
-    prevCollapseLeftRef.current = shouldAutoCollapseLeft;
-  }, [shouldAutoCollapseLeft, isMobile]);
-
-  // Persist collapse prefs
-  useEffect(() => {
-    if (!isMobile) localStorage.setItem('inbox-left-collapsed', String(leftCollapsed));
-  }, [leftCollapsed, isMobile]);
-  useEffect(() => {
-    if (!isMobile) localStorage.setItem('inbox-right-collapsed', String(rightCollapsed));
-  }, [rightCollapsed, isMobile]);
-
-  // Close overlays when expanding
-  useEffect(() => {
-    if (!rightCollapsed) setRightOverlayOpen(false);
-    if (!leftCollapsed) setLeftOverlayOpen(false);
-  }, [rightCollapsed, leftCollapsed]);
-
-  // Persist panel widths
-  useEffect(() => {
-    if (!isMobile) localStorage.setItem('inbox-left-width', String(leftWidth));
-  }, [leftWidth, isMobile]);
-  useEffect(() => {
-    if (!isMobile) localStorage.setItem('inbox-right-width', String(rightWidth));
-  }, [rightWidth, isMobile]);
-
-  // Mouse drag resize handler
-  useEffect(() => {
-    if (!resizing || isMobile) return;
-
-    const handleMouseMove = (e: MouseEvent) => {
-      if (!containerRef.current) return;
-      const rect = containerRef.current.getBoundingClientRect();
-      const effectiveRightWidth = rightCollapsed ? 0 : rightWidth;
-      const effectiveLeftWidth = leftCollapsed ? 0 : leftWidth;
-
-      if (resizing === 'left' && !leftCollapsed) {
-        let newWidth = e.clientX - rect.left;
-        newWidth = Math.max(LEFT_MIN, Math.min(480, newWidth));
-        if (rect.width - newWidth - effectiveRightWidth < MIN_CENTER) {
-          newWidth = rect.width - effectiveRightWidth - MIN_CENTER;
-        }
-        if (newWidth >= LEFT_MIN) setLeftWidth(newWidth);
-      } else if (resizing === 'right' && !rightCollapsed) {
-        let newWidth = rect.right - e.clientX;
-        newWidth = Math.max(RIGHT_MIN, Math.min(480, newWidth));
-        if (rect.width - effectiveLeftWidth - newWidth < MIN_CENTER) {
-          newWidth = rect.width - effectiveLeftWidth - MIN_CENTER;
-        }
-        if (newWidth >= RIGHT_MIN) setRightWidth(newWidth);
-      }
-    };
-
-    const handleMouseUp = () => setResizing(null);
-
-    document.addEventListener('mousemove', handleMouseMove);
-    document.addEventListener('mouseup', handleMouseUp);
-    document.body.style.cursor = 'col-resize';
-    document.body.style.userSelect = 'none';
-
-    return () => {
-      document.removeEventListener('mousemove', handleMouseMove);
-      document.removeEventListener('mouseup', handleMouseUp);
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-    };
-  }, [resizing, isMobile, leftWidth, rightWidth, leftCollapsed, rightCollapsed]);
-
-  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; msgId: number; msgText: string; senderType: string } | null>(null);
-  const ctxMenuRef = useRef<HTMLDivElement>(null);
-
-  const [pendingDeletes, setPendingDeletes] = useState<Set<number>>(new Set());
-  const deleteTimersRef = useRef<Record<number, ReturnType<typeof setTimeout>>>({});
-
-  const scheduleDelete = useCallback((ticketId: string, msgId: number, senderLabel: string) => {
-    setPendingDeletes(prev => new Set(prev).add(msgId));
-    toast(`Deleted ${senderLabel}`, {
-      description: 'Message will be removed permanently',
-      duration: 5000,
-      action: {
-        label: 'Undo',
-        onClick: () => {
-          clearTimeout(deleteTimersRef.current[msgId]);
-          delete deleteTimersRef.current[msgId];
-          setPendingDeletes(prev => {
-            const next = new Set(prev);
-            next.delete(msgId);
-            return next;
-          });
-          toast.success('Message restored');
-        },
-      },
-    });
-    deleteTimersRef.current[msgId] = setTimeout(() => {
-      deleteMessageFromTicket(ticketId, msgId);
-      setPendingDeletes(prev => {
-        const next = new Set(prev);
-        next.delete(msgId);
-        return next;
-      });
-      delete deleteTimersRef.current[msgId];
-    }, 5000);
-  }, [deleteMessageFromTicket]);
-
-  useEffect(() => {
-    return () => {
-      Object.values(deleteTimersRef.current).forEach(clearTimeout);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!ctxMenu) return;
-    const close = () => setCtxMenu(null);
-    const handleClickOutside = (e: MouseEvent) => {
-      if (ctxMenuRef.current && !ctxMenuRef.current.contains(e.target as Node)) close();
-    };
-    document.addEventListener('mousedown', handleClickOutside);
-    document.addEventListener('scroll', close, true);
-    const handleKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
-    window.addEventListener('keydown', handleKey);
-    return () => {
-      document.removeEventListener('mousedown', handleClickOutside);
-      document.removeEventListener('scroll', close, true);
-      window.removeEventListener('keydown', handleKey);
-    };
-  }, [ctxMenu]);
-
-  useEffect(() => { setCtxMenu(null); }, [activeTicket?.id]);
-
-  const handleMsgContextMenu = useCallback((e: React.MouseEvent, msgId: number, msgText: string, senderType: string) => {
-    e.preventDefault();
-    setCtxMenu({ x: e.clientX, y: e.clientY, msgId, msgText, senderType });
-  }, []);
+  // ─── Context menu + message delete ─────────────────────────────
+  const {
+    ctxMenu, setCtxMenu, ctxMenuRef,
+    pendingDeletes,
+    scheduleDelete,
+    handleMsgContextMenu,
+  } = useMessageContextMenu(activeTicket?.id, deleteMessageFromTicket);
 
   const [showNewThread, setShowNewThread] = useState(false);
   const [ntHostId, setNtHostId] = useState(MOCK_HOSTS[0].id);
@@ -1743,201 +1474,44 @@ export function InboxView() {
       )}
 
       {/* Right Context Pane */}
-      <div
-        className={`${
-          isMobile
-            ? (showMobileDetails ? 'fixed inset-0 z-50 w-full animate-in slide-in-from-right duration-200' : 'hidden')
-            : rightCollapsed
-              ? (rightOverlayOpen ? 'flex absolute right-0 top-0 bottom-0 z-50 shadow-2xl rounded-l-xl animate-in slide-in-from-right duration-200' : 'hidden')
-              : 'flex shrink-0 overflow-hidden'
-        } bg-white border-l border-slate-200 flex flex-col`}
-        style={!isMobile ? { width: rightCollapsed && rightOverlayOpen ? Math.min(rightWidth, 380) : rightCollapsed ? 0 : displayRightWidth, minWidth: rightCollapsed ? 0 : RIGHT_MIN, transition: resizing ? 'none' : 'width 0.2s ease' } : undefined}
-      >
-        <div className={`p-3 border-b flex items-center justify-between shrink-0 ${activeTicket.status === 'urgent' ? 'bg-red-50 border-red-200' : activeTicket.status === 'warning' ? 'bg-amber-50 border-amber-200' : 'bg-slate-50 border-slate-200'}`}>
-          <div className="flex items-center gap-2">
-            {isMobile && (
-              <button onClick={() => setShowMobileDetails(false)} className="w-7 h-7 rounded-md flex items-center justify-center text-slate-400 hover:bg-slate-200 transition-colors">
-                <ArrowLeft size={16} />
-              </button>
-            )}
-            {!isMobile && rightCollapsed && rightOverlayOpen && (
-              <button onClick={() => setRightOverlayOpen(false)} className="w-7 h-7 rounded-md flex items-center justify-center text-slate-400 hover:bg-slate-200 transition-colors">
-                <X size={14} />
-              </button>
-            )}
-            <Clock size={14} className={activeTicket.status === 'urgent' ? 'text-red-500' : activeTicket.status === 'warning' ? 'text-amber-500' : 'text-slate-400'} />
-            <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">SLA</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className={`text-lg font-bold tabular-nums ${activeTicket.status === 'urgent' ? 'text-red-600' : activeTicket.status === 'warning' ? 'text-amber-600' : 'text-slate-700'}`}>
-              {activeTicket.sla}
-            </span>
-            {/* #12: De-escalation button — lets agent downgrade urgency */}
-            {activeTicket.status !== 'normal' && (
-              <button
-                onClick={() => {
-                  deescalateTicket(activeTicket.id);
-                  toast.success('De-escalated to normal', { description: `${activeTicket.guestName}'s ticket priority lowered.` });
-                }}
-                className="text-[9px] font-bold px-1.5 py-0.5 rounded border border-slate-200 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 hover:border-emerald-200 transition-colors uppercase tracking-wider"
-                title="De-escalate to normal priority"
-              >
-                <ArrowDown size={9} className="inline mr-0.5" /> De-escalate
-              </button>
-            )}
-          </div>
-        </div>
-
-        <div className="flex border-b border-slate-200 shrink-0">
-          <button
-            onClick={() => setRightTab('assistant')}
-            className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 text-[11px] font-bold transition-colors relative ${
-              rightTab === 'assistant'
-                ? 'text-indigo-600'
-                : 'text-slate-400 hover:text-slate-600'
-            }`}
-          >
-            <Sparkles size={12} /> Research
-            {rightTab === 'assistant' && (
-              <div className="absolute bottom-0 left-2 right-2 h-0.5 bg-indigo-600 rounded-full" />
-            )}
-          </button>
-          <button
-            onClick={() => setRightTab('details')}
-            className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 text-[11px] font-bold transition-colors relative ${
-              rightTab === 'details'
-                ? 'text-indigo-600'
-                : 'text-slate-400 hover:text-slate-600'
-            }`}
-          >
-            <User size={12} /> Details
-            {rightTab === 'details' && (
-              <div className="absolute bottom-0 left-2 right-2 h-0.5 bg-indigo-600 rounded-full" />
-            )}
-          </button>
-        </div>
-
-        <div className="flex-1 overflow-y-auto">
-          {rightTab === 'assistant' ? (
-            <AssistantPanel
-              ticket={activeTicket}
-              onComposeReply={handleComposeReply}
-              onNavigateToKB={(propId) => navigate(`/kb/${propId}`)}
-              onInquiriesClassified={setClassifiedInquiries}
-            />
-          ) : (
-            <div>
-              <div className="p-5 border-b border-slate-100">
-                <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-4 flex items-center gap-2"><User size={14} /> Guest & Booking</h3>
-                <div className="grid grid-cols-2 gap-4">
-                  {activeTicket.booking ? (
-                    <>
-                      <div><span className="block text-[10px] text-slate-400 mb-0.5">Check-in</span><span className="text-sm font-medium">{activeTicket.booking.checkIn}</span></div>
-                      <div><span className="block text-[10px] text-slate-400 mb-0.5">Check-out</span><span className="text-sm font-medium">{activeTicket.booking.checkOut}</span></div>
-                      <div><span className="block text-[10px] text-slate-400 mb-0.5">Guests</span><span className="text-sm font-medium flex items-center gap-1"><Users size={12} /> {activeTicket.booking.guests}</span></div>
-                      <div><span className="block text-[10px] text-slate-400 mb-0.5">Status</span><span className="text-sm font-medium">{activeTicket.booking.status}</span></div>
-                    </>
-                  ) : activeTicket.bookingId ? (
-                    <>
-                      <div><span className="block text-[10px] text-slate-400 mb-0.5">Booking ID</span><span className="text-sm font-medium">#{activeTicket.bookingId}</span></div>
-                      <div><span className="block text-[10px] text-slate-400 mb-0.5">Status</span><span className="text-sm font-medium">{activeTicket.bookingStatus || 'Unknown'}</span></div>
-                    </>
-                  ) : (
-                    <div className="col-span-2 text-xs text-slate-400">No booking data available</div>
-                  )}
-                </div>
-
-                {/* BPO Step 5 — Incident Log / Remarks field */}
-                <div className="mt-4">
-                  <span className="block text-[10px] text-slate-400 mb-1.5 uppercase tracking-wider font-bold flex items-center gap-1">
-                    <FileText size={10} /> Incident Log
-                  </span>
-                  <textarea
-                    value={ticketNotes[activeTicket.id] || ''}
-                    onChange={e => updateTicketNotes(activeTicket.id, e.target.value)}
-                    placeholder="Record issue details, response history, resolution…"
-                    rows={4}
-                    className="w-full text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-lg p-2.5 resize-none focus:outline-none focus:ring-1 focus:ring-indigo-400 focus:border-indigo-400 placeholder:text-slate-300 leading-relaxed"
-                  />
-                </div>
-              </div>
-
-              <div className="p-5 border-b border-slate-100">
-                <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-4 flex items-center gap-2"><Tag size={14} /> Ticket Details</h3>
-                <div className="space-y-3">
-                  <div>
-                    <span className="block text-[10px] text-slate-400 mb-1">Channel</span>
-                    <span className="text-sm font-medium flex items-center gap-1.5">
-                      <activeTicket.channelIcon size={14} className="text-slate-500" /> {activeTicket.channel}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="block text-[10px] text-slate-400 mb-1">Language</span>
-                    <span className="text-sm font-medium flex items-center gap-1.5">
-                      <Globe2 size={14} className="text-slate-500" /> {activeTicket.language}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="block text-[10px] text-slate-400 mb-1">AI Handover Reason</span>
-                    <p className="text-sm text-slate-700 leading-relaxed bg-slate-50 p-2 rounded-md border border-slate-100">{activeTicket.aiHandoverReason}</p>
-                  </div>
-                  <div>
-                    <span className="block text-[10px] text-slate-400 mb-1">Tags</span>
-                    <div className="flex flex-wrap gap-1">
-                      {activeTicket.tags.map(tag => (
-                        <span key={tag} className="text-[10px] bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded-full border border-indigo-100 flex items-center gap-1">
-                          <Tag size={8} /> {tag}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              <div className="p-5">
-                <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-4 flex items-center gap-2"><Briefcase size={14} /> Host</h3>
-                <div className="space-y-2">
-                  <div className="flex items-center gap-2">
-                    <div className={`w-8 h-8 rounded-lg ${activeTicket.host.brandColor} flex items-center justify-center text-white font-bold text-sm`}>
-                      {activeTicket.host.name.charAt(0)}
-                    </div>
-                    <div>
-                      <p className="text-sm font-bold text-slate-700">{activeTicket.host.name}</p>
-                      <p className="text-[10px] text-slate-400">Tone: {activeTicket.host.tone}</p>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-
-      <ConfirmDialog
-        open={showResolveConfirm}
-        title="Resolve this ticket?"
-        description={`This will close ${activeTicket.guestName}'s ticket (${activeTicket.id}) and remove it from the active queue. This action cannot be undone.`}
-        confirmLabel="Resolve Ticket"
-        cancelLabel="Keep Open"
-        variant="warning"
-        onConfirm={() => { setShowResolveConfirm(false); handleResolve(); }}
-        onCancel={() => setShowResolveConfirm(false)}
+      <ContextSidebarPane
+        activeTicket={activeTicket}
+        activeTags={activeTags}
+        isMobile={isMobile}
+        showMobileDetails={showMobileDetails}
+        setShowMobileDetails={setShowMobileDetails}
+        rightCollapsed={rightCollapsed}
+        rightOverlayOpen={rightOverlayOpen}
+        setRightOverlayOpen={setRightOverlayOpen}
+        displayRightWidth={displayRightWidth}
+        RIGHT_MIN={RIGHT_MIN}
+        rightWidth={rightWidth}
+        resizing={resizing}
+        rightTab={rightTab}
+        setRightTab={setRightTab}
+        bookingDetails={bookingDetails}
+        bookingLoading={bookingLoading}
+        ticketNotes={ticketNotes[activeTicket.id] || ''}
+        onUpdateNotes={(v) => updateTicketNotes(activeTicket.id, v)}
+        deescalateTicket={deescalateTicket}
+        onComposeReply={handleComposeReply}
+        onNavigateToKB={(propId) => navigate(`/kb/${propId}`)}
+        onInquiriesClassified={setClassifiedInquiries}
       />
 
-
-      {/* Delete thread confirmation */}
-      <ConfirmDialog
-        open={showDeleteConfirm}
-        title="Delete this thread?"
-        description={`This will permanently remove ${activeTicket.guestName}'s entire conversation (${getMessages(activeTicket).length} messages). This action cannot be undone.`}
-        confirmLabel="Delete Thread"
-        cancelLabel="Cancel"
-        variant="danger"
-        onConfirm={() => {
-          setShowDeleteConfirm(false);
-          const deletedId = activeTicket.id;
+      <InboxDialogs
+        activeTicket={activeTicket}
+        messageCount={getMessages(activeTicket).length}
+        filteredTickets={filteredTickets}
+        isMobile={isMobile}
+        agentName={agentName}
+        showResolveConfirm={showResolveConfirm}
+        setShowResolveConfirm={setShowResolveConfirm}
+        onResolve={handleResolve}
+        showDeleteConfirm={showDeleteConfirm}
+        setShowDeleteConfirm={setShowDeleteConfirm}
+        onDeleteThread={(deletedId) => {
           const nextTicket = filteredTickets.find(t => t.id !== deletedId);
-          // Cancel any in-progress AI processing for this thread
           cancelAutoReply(deletedId);
           setShowCancelMenu(false);
           deleteThread(deletedId);
@@ -1949,131 +1523,14 @@ export function InboxView() {
             if (isMobile) setMobilePanel('list');
           }
         }}
-        onCancel={() => setShowDeleteConfirm(false)}
+        showCancelMenu={showCancelMenu}
+        setShowCancelMenu={setShowCancelMenu}
+        toggleAutoReplyPause={toggleAutoReplyPause}
+        ctxMenu={ctxMenu}
+        setCtxMenu={setCtxMenu}
+        ctxMenuRef={ctxMenuRef}
+        scheduleDelete={scheduleDelete}
       />
-
-
-
-      {/* Cancel AI menu — pause or skip */}
-      <AnimatePresence>
-        {showCancelMenu && (
-          <div className="fixed inset-0 z-[9998] flex items-center justify-center bg-black/20" onClick={() => setShowCancelMenu(false)}>
-            <motion.div
-              initial={{ opacity: 0, scale: 0.95 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.95 }}
-              transition={{ duration: 0.15 }}
-              className="bg-white rounded-xl shadow-2xl border border-slate-200 p-5 w-[340px]"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div className="flex items-center gap-2 mb-3">
-                <div className="bg-violet-100 p-2 rounded-lg">
-                  <Bot size={16} className="text-violet-600" />
-                </div>
-                <div>
-                  <h3 className="text-sm font-bold text-slate-800">AI reply stopped</h3>
-                  <p className="text-[11px] text-slate-500">What would you like to do?</p>
-                </div>
-              </div>
-              
-              <div className="space-y-2">
-                <button
-                  onClick={() => {
-                    setShowCancelMenu(false);
-                    toast.info('Skipped this time', { description: 'AI will still review the next guest message in this thread.' });
-                  }}
-                  className="w-full text-left px-3 py-2.5 rounded-lg border border-slate-200 hover:bg-slate-50 transition-colors group"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <SkipForward size={14} className="text-slate-400 group-hover:text-indigo-500 transition-colors" />
-                    <div>
-                      <span className="text-sm font-medium text-slate-700">Skip this time only</span>
-                      <p className="text-[10px] text-slate-400">AI will review the next guest message normally</p>
-                    </div>
-                  </div>
-                </button>
-                
-                <button
-                  onClick={() => {
-                    toggleAutoReplyPause(activeTicket.id);
-                    setShowCancelMenu(false);
-                    toast.warning('AI paused for this thread', {
-                      description: `Auto-reply paused for ${activeTicket.guestName}. Click the status chip to re-enable.`,
-                      duration: 6000,
-                      action: {
-                        label: 'Resume',
-                        onClick: () => toggleAutoReplyPause(activeTicket.id),
-                      },
-                    });
-                  }}
-                  className="w-full text-left px-3 py-2.5 rounded-lg border border-amber-200 bg-amber-50/50 hover:bg-amber-50 transition-colors group"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <PauseCircle size={14} className="text-amber-500" />
-                    <div>
-                      <span className="text-sm font-medium text-amber-800">Pause AI for this thread</span>
-                      <p className="text-[10px] text-amber-600">No AI replies until you re-enable from the status chip</p>
-                    </div>
-                  </div>
-                </button>
-              </div>
-              
-              <button
-                onClick={() => setShowCancelMenu(false)}
-                className="mt-3 w-full text-center text-[11px] text-slate-400 hover:text-slate-600 transition-colors py-1"
-              >
-                Dismiss
-              </button>
-            </motion.div>
-          </div>
-        )}
-      </AnimatePresence>
-
-      {ctxMenu && (
-        <div
-          ref={ctxMenuRef}
-          className="fixed z-[9999] animate-in fade-in zoom-in-95 duration-100"
-          style={{ left: ctxMenu.x, top: ctxMenu.y }}
-        >
-          <div className="bg-white rounded-lg shadow-xl border border-slate-200 py-1 min-w-[180px] overflow-hidden">
-            <div className="px-3 py-1.5 border-b border-slate-100">
-              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
-                {ctxMenu.senderType === 'guest' ? activeTicket.guestName
-                  : ctxMenu.senderType === 'bot' ? 'AI Auto-Reply'
-                  : ctxMenu.senderType === 'host' ? activeTicket.host.name
-                  : agentName}
-              </span>
-            </div>
-
-            <button
-              onClick={() => {
-                navigator.clipboard.writeText(ctxMenu.msgText);
-                toast.success('Copied to clipboard');
-                setCtxMenu(null);
-              }}
-              className="w-full px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-50 flex items-center gap-2.5 transition-colors"
-            >
-              <Copy size={14} className="text-slate-400" />
-              Copy text
-            </button>
-
-            <button
-              onClick={() => {
-                const senderLabel = ctxMenu.senderType === 'bot' ? 'AI auto-reply'
-                  : ctxMenu.senderType === 'guest' ? 'guest message'
-                  : ctxMenu.senderType === 'host' ? 'host message'
-                  : 'agent message';
-                scheduleDelete(activeTicket.id, ctxMenu.msgId, senderLabel);
-                setCtxMenu(null);
-              }}
-              className="w-full px-3 py-2 text-left text-sm text-red-600 hover:bg-red-50 flex items-center gap-2.5 transition-colors"
-            >
-              <Trash2 size={14} />
-              Delete message
-            </button>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

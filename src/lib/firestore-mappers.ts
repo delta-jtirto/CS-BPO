@@ -131,6 +131,7 @@ export function mapThreadToTicket(
   resolvedAt?: number | null,
   escalationOverride?: EscalationOverride | null,
   handoverReason?: string,
+  propertyName?: string,
 ): Ticket {
   // Firestore timestamps are in seconds — normalize to milliseconds
   const lastMessageAtMs = item.last_message_at > 1e12
@@ -153,7 +154,7 @@ export function mapThreadToTicket(
     channel: channelDisplayName(item.channel),
     channelIcon: channelToIcon(item.channel),
     host,
-    property: '', // Populated from PMS API when ticket is selected
+    property: propertyName || '', // Resolved from properties list by hostId
     room: '',
     status,
     sla,
@@ -189,6 +190,7 @@ export function mapV1ThreadToTicket(
   resolvedAt?: number | null,
   escalationOverride?: EscalationOverride | null,
   handoverReason?: string,
+  propertyName?: string,
 ): Ticket {
   const lastMsgTs = thread.last_message?.timestamp ?? 0;
   const lastMessageAtMs = lastMsgTs > 1e12 ? lastMsgTs : lastMsgTs * 1000;
@@ -208,7 +210,7 @@ export function mapV1ThreadToTicket(
     channel: channelDisplayName(thread.channel),
     channelIcon: channelToIcon(thread.channel),
     host,
-    property: '',
+    property: propertyName || '', // Resolved from properties list by hostId
     room: '',
     status,
     sla,

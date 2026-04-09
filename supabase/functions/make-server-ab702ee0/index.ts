@@ -27,6 +27,7 @@ const KV_AI_IMPORT_MODEL = "ai_config:import_model";
 const KV_AI_SETTINGS_PREFIX = "ai_config:";
 const KV_PREFS_PREFIX = "agent_prefs:";
 const KV_CHAT_PREFIX = "ask_ai_chat:";
+const DEFAULT_AI_MODEL = "google/gemini-2.5-flash-lite";
 
 // ─── Health Check ────────────────────────────────────────
 app.get("/make-server-ab702ee0/health", (c) => {
@@ -51,7 +52,7 @@ app.get("/make-server-ab702ee0/ai/settings", async (c) => {
     return c.json({
       hasApiKey: !!rawKey,
       maskedApiKey: maskedKey,
-      model: (typeof model === "string" ? model : "") || "openai/gpt-4o-mini",
+      model: (typeof model === "string" ? model : "") || DEFAULT_AI_MODEL,
       importModel: (typeof importModel === "string" ? importModel : "") || "google/gemini-3.1-flash-lite-preview",
     });
   } catch (err: any) {
@@ -93,7 +94,7 @@ app.put("/make-server-ab702ee0/ai/settings", async (c) => {
 
     // Return current state
     const savedKey = typeof apiKey === "string" ? apiKey : (await kv.get(KV_AI_API_KEY) || "");
-    const savedModel = typeof model === "string" ? model : (await kv.get(KV_AI_MODEL) || "openai/gpt-4o-mini");
+    const savedModel = typeof model === "string" ? model : (await kv.get(KV_AI_MODEL) || DEFAULT_AI_MODEL);
     const savedImportModel = typeof importModel === "string" ? importModel : (await kv.get(KV_AI_IMPORT_MODEL) || "google/gemini-3.1-flash-lite-preview");
     const maskedKey = savedKey
       ? `${savedKey.slice(0, 8)}...${savedKey.slice(-4)}`
@@ -115,7 +116,7 @@ app.put("/make-server-ab702ee0/ai/settings", async (c) => {
 app.delete("/make-server-ab702ee0/ai/settings/key", async (c) => {
   try {
     await kv.set(KV_AI_API_KEY, "");
-    return c.json({ hasApiKey: false, maskedApiKey: "", model: (await kv.get(KV_AI_MODEL)) || "openai/gpt-4o-mini" });
+    return c.json({ hasApiKey: false, maskedApiKey: "", model: (await kv.get(KV_AI_MODEL)) || DEFAULT_AI_MODEL });
   } catch (err: any) {
     console.log(`Error clearing API key: ${err.message}`);
     return c.json({ error: `Failed to clear API key: ${err.message}` }, 500);
@@ -126,7 +127,7 @@ app.delete("/make-server-ab702ee0/ai/settings/key", async (c) => {
 // Returns all saved agent preferences (devMode, agentName, etc.)
 app.get("/make-server-ab702ee0/preferences", async (c) => {
   try {
-    const prefKeys = ["devMode", "agentName", "darkMode", "defaultLanguage", "hostSettings", "ticketState", "properties", "promptOverrides"];
+    const prefKeys = ["devMode", "agentName", "darkMode", "defaultLanguage", "hostSettings", "ticketState", "properties", "promptOverrides", "notificationPrefs"];
     const results = await Promise.all(
       prefKeys.map(k => kv.get(`${KV_PREFS_PREFIX}${k}`))
     );
@@ -185,7 +186,7 @@ app.post("/make-server-ab702ee0/ai/compose-reply", async (c) => {
       return c.json({ error: "Missing required fields: systemPrompt, userPrompt" }, 400);
     }
 
-    const aiModel = model || (await kv.get(KV_AI_MODEL)) || "openai/gpt-4o-mini";
+    const aiModel = model || (await kv.get(KV_AI_MODEL)) || DEFAULT_AI_MODEL;
     const startMs = performance.now();
 
     const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -257,7 +258,7 @@ app.post("/make-server-ab702ee0/ai/ask", async (c) => {
       return c.json({ error: "Missing required fields: systemPrompt, userPrompt" }, 400);
     }
 
-    const aiModel = model || (await kv.get(KV_AI_MODEL)) || "openai/gpt-4o-mini";
+    const aiModel = model || (await kv.get(KV_AI_MODEL)) || DEFAULT_AI_MODEL;
     const startMs = performance.now();
 
     const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {

@@ -55,6 +55,7 @@ export function useFirestoreThreads(
   connections: FirestoreConnection[],
   activeTicketId: string | null,
   bpoState?: BPOOverlayState,
+  properties?: { hostId: string; name: string }[],
 ): UseFirestoreThreadsResult {
   // Per-host raw thread data
   const threadsByHost = useRef<Map<string, Ticket[]>>(new Map());
@@ -82,6 +83,10 @@ export function useFirestoreThreads(
   // Stable ref for bpoState so the snapshot handlers always see current values
   const bpoStateRef = useRef(bpoState);
   bpoStateRef.current = bpoState;
+
+  // Stable ref for properties so snapshot handlers can resolve property names
+  const propertiesRef = useRef(properties);
+  propertiesRef.current = properties;
 
   const activeTicketIdRef = useRef(activeTicketId);
   activeTicketIdRef.current = activeTicketId;
@@ -180,6 +185,8 @@ export function useFirestoreThreads(
                     const thread = { thread_id: tDoc.id, ...tDoc.data() } as FirestoreThread;
                     // Filter archived threads client-side
                     if (thread.is_archived) return null;
+                    // Resolve property name from the properties list using the connection's hostId
+                    const propName = propertiesRef.current?.find(p => p.hostId === conn.hostId)?.name || conn.companyName;
                     return mapV1ThreadToTicket(
                       thread,
                       conn.hostId,
@@ -188,6 +195,7 @@ export function useFirestoreThreads(
                       state?.resolvedIds[thread.thread_id] || null,
                       state?.escalationOverrides[thread.thread_id] || null,
                       state?.handoverReasons[thread.thread_id] || '',
+                      propName,
                     );
                   })
                   .filter((t): t is Ticket => t !== null);

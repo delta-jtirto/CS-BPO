@@ -2,7 +2,6 @@ import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { Sparkles, Loader2, Settings2, X, Check, Minus, Pencil, Wand2, AlertTriangle, MessageSquare } from 'lucide-react';
 import { toast } from 'sonner';
 import { useAppContext } from '../../context/AppContext';
-import { MOCK_PROPERTIES } from '../../data/mock-data';
 import type { Ticket } from '../../data/types';
 import {
   detectInquiries,
@@ -44,6 +43,8 @@ import {
   interpolate,
   resolvePrompt,
   resolveModel,
+  resolveTemperature,
+  resolveMaxTokens,
 } from '../../ai/prompts';
 
 /** Cache entry stored by InboxView, keyed by ticketId-messageCount */
@@ -115,7 +116,7 @@ function formatQuestion(inq: DetectedInquiry): string {
 }
 
 export function SmartReplyPanel({ ticket, existingDraft, onInsert, onHide, cacheRef, aiInquiries }: SmartReplyPanelProps) {
-  const { kbEntries, agentName, hasApiKey, aiModel, promptOverrides } = useAppContext();
+  const { kbEntries, agentName, hasApiKey, aiModel, promptOverrides, properties } = useAppContext();
 
   // Cache key for this ticket + message state
   const cacheKey = `${ticket.id}-${(ticket.messages || []).length}`;
@@ -140,7 +141,7 @@ export function SmartReplyPanel({ ticket, existingDraft, onInsert, onHide, cache
   });
   const composeTriggered = useRef(!!cacheRef.current[cacheKey]);
 
-  const activeProp = MOCK_PROPERTIES.find(p => p.name === ticket.property);
+  const activeProp = properties.find(p => p.name === ticket.property);
   const ticketRoom = ticket.room.replace(/[^0-9]/g, '');
 
   const scopeFilteredKb = useMemo(() => {
@@ -241,8 +242,8 @@ export function SmartReplyPanel({ ticket, existingDraft, onInsert, onHide, cache
         systemPrompt: resolvePrompt('polish_draft', 'system', promptOverrides),
         userPrompt,
         model: resolveModel('polish_draft', promptOverrides),
-        temperature: promptOverrides.polish_draft?.temperature,
-        maxTokens: promptOverrides.polish_draft?.maxTokens,
+        temperature: resolveTemperature('polish_draft', promptOverrides),
+        maxTokens: resolveMaxTokens('polish_draft', promptOverrides),
       });
 
       setComposedMessage(result.text);
@@ -302,8 +303,8 @@ export function SmartReplyPanel({ ticket, existingDraft, onInsert, onHide, cache
           systemPrompt: resolvePrompt('compose_reply', 'system', promptOverrides),
           userPrompt,
           model: resolveModel('compose_reply', promptOverrides),
-          temperature: promptOverrides.compose_reply?.temperature,
-          maxTokens: promptOverrides.compose_reply?.maxTokens,
+          temperature: resolveTemperature('compose_reply', promptOverrides),
+          maxTokens: resolveMaxTokens('compose_reply', promptOverrides),
         });
 
         setComposedMessage(result.text);

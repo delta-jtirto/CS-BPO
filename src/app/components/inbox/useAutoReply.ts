@@ -29,9 +29,8 @@ import { useEffect, useRef, useCallback } from 'react';
 import { toast } from 'sonner';
 import { useAppContext } from '../../context/AppContext';
 import { composeReplyAI } from '../../ai/api-client';
-import { AUTO_REPLY_USER, interpolate, resolvePrompt, resolveModel } from '../../ai/prompts';
+import { interpolate, resolvePrompt, resolveModel, resolveTemperature, resolveMaxTokens } from '../../ai/prompts';
 import type { PromptOverrides } from '../../ai/prompts';
-import { MOCK_PROPERTIES } from '../../data/mock-data';
 import { buildPropertyContext } from '../../ai/kb-context';
 import type { Ticket } from '../../data/types';
 
@@ -277,6 +276,7 @@ export function useGlobalAutoReply() {
   const tickets = ctx?.tickets ?? [];
   const hostSettings = ctx?.hostSettings ?? [];
   const kbEntries = ctx?.kbEntries ?? [];
+  const properties = ctx?.properties ?? [];
   const onboardingData = ctx?.onboardingData ?? {};
   const formTemplate = ctx?.formTemplate ?? [];
   const hasApiKey = ctx?.hasApiKey ?? false;
@@ -317,11 +317,11 @@ export function useGlobalAutoReply() {
 
   // Build AI context for a ticket directly from form data + manual KB entries
   const buildKBContext = useCallback((ticket: Ticket): string => {
-    const prop = MOCK_PROPERTIES.find(p => p.name === ticket.property);
+    const prop = properties.find(p => p.name === ticket.property);
     const roomNames = prop?.roomNames ?? (prop?.units === 1 ? ['Entire Property'] : Array.from({ length: prop?.units ?? 1 }, (_, i) => `Unit ${i + 1}`));
     const manualEntries = kbEntries.filter(kb => kb.hostId === ticket.host.id && (!kb.propId || kb.propId === prop?.id));
     return buildPropertyContext(prop?.id ?? '', ticket.property, onboardingData, formTemplate, roomNames, manualEntries);
-  }, [kbEntries, onboardingData, formTemplate]);
+  }, [kbEntries, properties, onboardingData, formTemplate]);
 
   // ─── Re-escalation timer (defined before processTicket so it can be referenced) ─
   const startReEscalationTimer = useCallback((ticketId: string) => {
@@ -502,8 +502,8 @@ export function useGlobalAutoReply() {
         systemPrompt: autoReplySystem,
         userPrompt: autoReplyUser,
         model: resolveModel('auto_reply', promptOverrides),
-        temperature: promptOverrides.auto_reply?.temperature,
-        maxTokens: promptOverrides.auto_reply?.maxTokens,
+        temperature: resolveTemperature('auto_reply', promptOverrides),
+        maxTokens: resolveMaxTokens('auto_reply', promptOverrides),
         signal,
       });
 

@@ -338,6 +338,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     [firestoreConnections.map(c => `${c.hostId}:${c.status}`).join(',')],
   );
 
+  // ─── Properties (must be before useFirestoreThreads which references it) ───
+  const [properties, setProperties] = useState<Property[]>(MOCK_PROPERTIES);
+
   // ─── BPO overlay state (persisted in Supabase KV) ──────────
   const [escalationOverrides, setEscalationOverrides] = useState<Record<string, EscalationOverride>>(() => {
     try { return JSON.parse(localStorage.getItem('bpo_escalations') || '{}'); } catch { return {}; }
@@ -373,6 +376,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     healthyConnections,
     null,
     bpoOverlayState,
+    properties,
   );
 
   // Merge Firestore threads into the tickets state
@@ -594,9 +598,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   });
 
   const updatePromptOverride = useCallback((op: OperationId, field: keyof PromptOverride, value: string | number | undefined) => {
+    // Normalize: empty/whitespace-only strings are treated as "no override"
+    const sanitized = (typeof value === 'string' && !value.trim()) ? undefined : value;
     setPromptOverridesRaw(prev => {
-      const next: PromptOverrides = { ...prev, [op]: { ...prev[op], [field]: value } };
-      if (value === undefined) {
+      const next: PromptOverrides = { ...prev, [op]: { ...prev[op], [field]: sanitized } };
+      if (sanitized === undefined) {
         const opOverride = { ...next[op] };
         delete opOverride[field];
         next[op] = Object.keys(opOverride).length ? opOverride : undefined;
@@ -624,7 +630,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     });
   }, [syncPrefToBackend]);
 
-  const [properties, setProperties] = useState<Property[]>(MOCK_PROPERTIES);
   const [onboardingData, setOnboardingData] = useState<Record<string, Record<string, string>>>(() => {
     try {
       const stored = localStorage.getItem('onboardingData');

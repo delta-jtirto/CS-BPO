@@ -458,7 +458,8 @@ export function resolvePrompt(
   field: 'system' | 'user',
   overrides: PromptOverrides
 ): string {
-  return overrides[op]?.[field] ?? PROMPT_DEFAULTS[op][field];
+  // Use || so empty strings fall back to defaults (empty prompt is never valid)
+  return overrides[op]?.[field] || PROMPT_DEFAULTS[op][field];
 }
 
 /**
@@ -466,7 +467,24 @@ export function resolvePrompt(
  * using the override if set, otherwise falling back to the op default.
  */
 export function resolveModel(op: OperationId, overrides: PromptOverrides): string {
-  return overrides[op]?.model ?? PROMPT_DEFAULTS[op].model;
+  // Use || so empty strings fall back to defaults (empty model is never valid)
+  return overrides[op]?.model || PROMPT_DEFAULTS[op].model;
+}
+
+/**
+ * Returns the effective temperature for a given operation.
+ * Uses ?? (not ||) because 0 is a valid temperature value.
+ */
+export function resolveTemperature(op: OperationId, overrides: PromptOverrides): number {
+  return overrides[op]?.temperature ?? PROMPT_DEFAULTS[op].temperature;
+}
+
+/**
+ * Returns the effective maxTokens for a given operation.
+ * Uses ?? (not ||) because the value is always a positive number.
+ */
+export function resolveMaxTokens(op: OperationId, overrides: PromptOverrides): number {
+  return overrides[op]?.maxTokens ?? PROMPT_DEFAULTS[op].maxTokens;
 }
 
 /**
