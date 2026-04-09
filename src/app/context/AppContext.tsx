@@ -286,21 +286,56 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [activeMessages, setActiveMessages] = useState<Message[]>([]);
 
   // ─── Firestore connections ────────────────────────────────
-  // Load saved connections once from localStorage (prototype; Supabase KV in prod)
-  const [initialSavedConnections] = useState<SavedConnection[]>(() => {
-    try {
-      const raw = localStorage.getItem('settings_connected_inboxes');
-      const inboxes = raw ? JSON.parse(raw) : [];
-      const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
-      return inboxes.map((inbox: any) => ({
-        hostId: inbox.hostId,
-        companyName: inbox.companyName,
-        host: MOCK_HOSTS.find(h => h.id === inbox.hostId) || MOCK_HOSTS[0],
-        accessToken: tokens[inbox.hostId] || '',
-        maskedToken: inbox.maskedToken || '',
-      })).filter((c: SavedConnection) => c.accessToken);
-    } catch { return []; }
-  });
+  // Load saved connections from Supabase KV on mount
+  const [initialSavedConnections, setInitialSavedConnections] = useState<SavedConnection[]>([]);
+  const inboxesLoadedRef = useRef(false);
+
+  useEffect(() => {
+    if (inboxesLoadedRef.current) return;
+    inboxesLoadedRef.current = true;
+    (async () => {
+      try {
+        const api = await getApiClient();
+        const inboxes = await api.getInboxes();
+        if (inboxes.length === 0) return;
+        const hostIds = inboxes.map(i => i.hostId);
+        const tokens = await api.getInboxTokens(hostIds);
+        const connections: SavedConnection[] = inboxes
+          .map(inbox => ({
+            hostId: inbox.hostId,
+            companyName: inbox.companyName,
+            host: MOCK_HOSTS.find(h => h.id === inbox.hostId) || MOCK_HOSTS[0],
+            accessToken: tokens[inbox.hostId] || '',
+            maskedToken: inbox.maskedToken || '',
+          }))
+          .filter(c => c.accessToken);
+        if (connections.length > 0) {
+          setInitialSavedConnections(connections);
+          // Keep localStorage in sync as a cache for faster subsequent loads
+          try {
+            localStorage.setItem('settings_connected_inboxes', JSON.stringify(inboxes));
+            localStorage.setItem('settings_inbox_tokens', JSON.stringify(tokens));
+          } catch { /* ignore */ }
+        }
+      } catch (err) {
+        // Fallback to localStorage if Supabase is unreachable
+        console.warn('Failed to load inboxes from Supabase, falling back to localStorage:', err);
+        try {
+          const raw = localStorage.getItem('settings_connected_inboxes');
+          const inboxes = raw ? JSON.parse(raw) : [];
+          const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
+          const fallback: SavedConnection[] = inboxes.map((inbox: any) => ({
+            hostId: inbox.hostId,
+            companyName: inbox.companyName,
+            host: MOCK_HOSTS.find(h => h.id === inbox.hostId) || MOCK_HOSTS[0],
+            accessToken: tokens[inbox.hostId] || '',
+            maskedToken: inbox.maskedToken || '',
+          })).filter((c: SavedConnection) => c.accessToken);
+          if (fallback.length > 0) setInitialSavedConnections(fallback);
+        } catch { /* ignore */ }
+      }
+    })();
+  }, []);
 
   const handleConnectionHealthChange = useCallback((hostId: string, companyName: string, health: string, message: string) => {
     if (health === 'expired') {

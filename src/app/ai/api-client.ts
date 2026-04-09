@@ -103,6 +103,86 @@ export async function savePreferences(prefs: Record<string, any>): Promise<{ sav
   return json;
 }
 
+// ─── Connected Inboxes ─────────────────────────────────
+
+export interface InboxEntry {
+  hostId: string;
+  companyName: string;
+  maskedToken: string;
+  connectedAt: string;
+}
+
+/** Fetch saved inbox connections (metadata only, no raw tokens). */
+export async function getInboxes(): Promise<InboxEntry[]> {
+  try {
+    const res = await fetch(`${BASE_URL}/inboxes`, { headers: headers() });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || 'Failed to load inboxes');
+    return json.inboxes ?? [];
+  } catch (err: any) {
+    console.error('Failed to fetch inboxes:', err);
+    return [];
+  }
+}
+
+/** Bulk-fetch tokens for a list of hostIds. Returns { [hostId]: token }. */
+export async function getInboxTokens(hostIds: string[]): Promise<Record<string, string>> {
+  if (hostIds.length === 0) return {};
+  try {
+    const res = await fetch(`${BASE_URL}/inboxes/tokens`, {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ hostIds }),
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || 'Failed to load tokens');
+    return json.tokens ?? {};
+  } catch (err: any) {
+    console.error('Failed to fetch inbox tokens:', err);
+    return {};
+  }
+}
+
+/** Fetch the token for a single host. Returns null if not found. */
+export async function getInboxToken(hostId: string): Promise<string | null> {
+  try {
+    const res = await fetch(`${BASE_URL}/inboxes/${encodeURIComponent(hostId)}/token`, { headers: headers() });
+    if (res.status === 404) return null;
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || 'Failed to load token');
+    return json.token ?? null;
+  } catch (err: any) {
+    console.error('Failed to fetch inbox token:', err);
+    return null;
+  }
+}
+
+/** Save a new inbox connection (metadata + token). */
+export async function saveInbox(hostId: string, data: {
+  companyName: string;
+  maskedToken: string;
+  connectedAt: string;
+  accessToken: string;
+}): Promise<void> {
+  const res = await fetch(`${BASE_URL}/inboxes/${encodeURIComponent(hostId)}`, {
+    method: 'PUT',
+    headers: headers(),
+    body: JSON.stringify(data),
+  });
+  const json = await res.json();
+  if (!res.ok) throw new Error(json.error || 'Failed to save inbox');
+}
+
+/** Remove an inbox connection (metadata + token). */
+export async function deleteInbox(hostId: string): Promise<void> {
+  const res = await fetch(`${BASE_URL}/inboxes/${encodeURIComponent(hostId)}`, {
+    method: 'DELETE',
+    headers: headers(),
+  });
+  const json = await res.json();
+  if (!res.ok) throw new Error(json.error || 'Failed to delete inbox');
+}
+
 // Supabase client for direct table access (properties)
 let supabaseClient: any = null;
 const getSupabaseClient = async () => {

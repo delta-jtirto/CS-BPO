@@ -27,6 +27,8 @@ const KV_AI_IMPORT_MODEL = "ai_config:import_model";
 const KV_AI_SETTINGS_PREFIX = "ai_config:";
 const KV_PREFS_PREFIX = "agent_prefs:";
 const KV_CHAT_PREFIX = "ask_ai_chat:";
+const KV_INBOX_LIST = "inbox_connections";
+const KV_INBOX_TOKEN_PREFIX = "inbox_token:";
 const DEFAULT_AI_MODEL = "google/gemini-2.5-flash-lite";
 
 // ─── Health Check ────────────────────────────────────────
@@ -403,6 +405,113 @@ app.get("/make-server-ab702ee0/onboarding/load", async (c) => {
     return c.json({ data: result });
   } catch (error: any) {
     return c.json({ error: error.message }, 500);
+  }
+});
+
+// ─── Connected Inboxes: GET ─────────────────────────────
+// Returns saved inbox connections (tokens masked — never sent to client)
+app.get("/make-server-ab702ee0/inboxes", async (c) => {
+  try {
+    const data = await kv.get(KV_INBOX_LIST);
+    const inboxes = Array.isArray(data) ? data : [];
+    return c.json({ inboxes });
+  } catch (err: any) {
+    console.log(`Error fetching inboxes: ${err.message}`);
+    return c.json({ error: `Failed to load inboxes: ${err.message}` }, 500);
+  }
+});
+
+// ─── Connected Inboxes: GET token for a specific host ───
+// Returns the full access token for a single host (used by AppContext on init)
+app.get("/make-server-ab702ee0/inboxes/:hostId/token", async (c) => {
+  try {
+    const hostId = c.req.param("hostId");
+    const token = await kv.get(`${KV_INBOX_TOKEN_PREFIX}${hostId}`);
+    if (!token) {
+      return c.json({ error: "Token not found" }, 404);
+    }
+    return c.json({ hostId, token });
+  } catch (err: any) {
+    console.log(`Error fetching inbox token: ${err.message}`);
+    return c.json({ error: `Failed to load token: ${err.message}` }, 500);
+  }
+});
+
+// ─── Connected Inboxes: GET all tokens ──────────────────
+// Bulk-fetch tokens for multiple hosts (used on app init)
+app.post("/make-server-ab702ee0/inboxes/tokens", async (c) => {
+  try {
+    const { hostIds } = await c.req.json();
+    if (!Array.isArray(hostIds) || hostIds.length === 0) {
+      return c.json({ tokens: {} });
+    }
+    const keys = hostIds.map((id: string) => `${KV_INBOX_TOKEN_PREFIX}${id}`);
+    const values = await kv.mget(keys);
+    const tokens: Record<string, string> = {};
+    for (let i = 0; i < hostIds.length; i++) {
+      if (values[i]) tokens[hostIds[i]] = values[i];
+    }
+    return c.json({ tokens });
+  } catch (err: any) {
+    console.log(`Error fetching inbox tokens: ${err.message}`);
+    return c.json({ error: `Failed to load tokens: ${err.message}` }, 500);
+  }
+});
+
+// ─── Connected Inboxes: PUT (add/update) ────────────────
+// Saves a new connection — stores metadata in list + token separately
+app.put("/make-server-ab702ee0/inboxes/:hostId", async (c) => {
+  try {
+    const hostId = c.req.param("hostId");
+    const { companyName, maskedToken, connectedAt, accessToken } = await c.req.json();
+
+    if (!companyName || !accessToken) {
+      return c.json({ error: "Missing required fields: companyName, accessToken" }, 400);
+    }
+
+    // 1. Update the connections list (add or replace entry for this hostId)
+    const existing = await kv.get(KV_INBOX_LIST);
+    const inboxes: any[] = Array.isArray(existing) ? existing : [];
+    const filtered = inboxes.filter((i: any) => i.hostId !== hostId);
+    filtered.push({
+      hostId,
+      companyName,
+      maskedToken: maskedToken || "",
+      connectedAt: connectedAt || new Date().toISOString(),
+    });
+
+    // 2. Save both the list and the token
+    await kv.mset(
+      [KV_INBOX_LIST, `${KV_INBOX_TOKEN_PREFIX}${hostId}`],
+      [filtered, accessToken],
+    );
+
+    return c.json({ saved: true, hostId });
+  } catch (err: any) {
+    console.log(`Error saving inbox: ${err.message}`);
+    return c.json({ error: `Failed to save inbox: ${err.message}` }, 500);
+  }
+});
+
+// ─── Connected Inboxes: DELETE ──────────────────────────
+// Removes a connection by hostId (both metadata + token)
+app.delete("/make-server-ab702ee0/inboxes/:hostId", async (c) => {
+  try {
+    const hostId = c.req.param("hostId");
+
+    // 1. Remove from the connections list
+    const existing = await kv.get(KV_INBOX_LIST);
+    const inboxes: any[] = Array.isArray(existing) ? existing : [];
+    const filtered = inboxes.filter((i: any) => i.hostId !== hostId);
+    await kv.set(KV_INBOX_LIST, filtered);
+
+    // 2. Delete the token
+    await kv.del(`${KV_INBOX_TOKEN_PREFIX}${hostId}`);
+
+    return c.json({ deleted: true, hostId });
+  } catch (err: any) {
+    console.log(`Error deleting inbox: ${err.message}`);
+    return c.json({ error: `Failed to delete inbox: ${err.message}` }, 500);
   }
 });
 

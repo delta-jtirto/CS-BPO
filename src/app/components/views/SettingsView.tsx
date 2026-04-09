@@ -1206,13 +1206,33 @@ function ConnectedInboxesPanel() {
   const [selectedHostId, setSelectedHostId] = useState('');
   const [validationError, setValidationError] = useState('');
 
-  // Saved connections — persisted in localStorage for prototype (Supabase KV later)
-  const [savedInboxes, setSavedInboxes] = usePersistedState<Array<{
+  // Saved connections — persisted in Supabase KV (localStorage as cache)
+  const [savedInboxes, setSavedInboxes] = useState<Array<{
     hostId: string;
     companyName: string;
     maskedToken: string;
     connectedAt: string;
-  }>>('connected_inboxes', []);
+  }>>([]);
+  const inboxesLoadedRef = useRef(false);
+
+  // Load saved inboxes from Supabase on mount
+  useEffect(() => {
+    if (inboxesLoadedRef.current) return;
+    inboxesLoadedRef.current = true;
+    (async () => {
+      try {
+        const { getInboxes } = await import('../../ai/api-client');
+        const inboxes = await getInboxes();
+        setSavedInboxes(inboxes);
+      } catch {
+        // Fallback to localStorage cache
+        try {
+          const raw = localStorage.getItem('settings_connected_inboxes');
+          if (raw) setSavedInboxes(JSON.parse(raw));
+        } catch { /* ignore */ }
+      }
+    })();
+  }, []);
 
   const [testingId, setTestingId] = useState<string | null>(null);
   const [disconnectingId, setDisconnectingId] = useState<string | null>(null);
@@ -1249,18 +1269,34 @@ function ConnectedInboxesPanel() {
       return;
     }
 
-    // Save to localStorage for persistence across refreshes
-    setSavedInboxes(prev => [...prev, {
-      hostId: selectedHostId,
-      companyName: validatedCompany.name,
-      maskedToken: maskToken(tokenInput.trim()),
-      connectedAt: new Date().toISOString(),
-    }]);
-    try {
-      const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
-      tokens[selectedHostId] = tokenInput.trim();
-      localStorage.setItem('settings_inbox_tokens', JSON.stringify(tokens));
-    } catch { /* ignore */ }
+    // Save to Supabase KV (+ localStorage cache)
+    const masked = maskToken(tokenInput.trim());
+    const connectedAt = new Date().toISOString();
+    const entry = { hostId: selectedHostId, companyName: validatedCompany.name, maskedToken: masked, connectedAt };
+    setSavedInboxes(prev => [...prev, entry]);
+    (async () => {
+      try {
+        const { saveInbox } = await import('../../ai/api-client');
+        await saveInbox(selectedHostId, {
+          companyName: validatedCompany!.name,
+          maskedToken: masked,
+          connectedAt,
+          accessToken: tokenInput.trim(),
+        });
+      } catch (err) {
+        console.error('Failed to persist inbox to Supabase:', err);
+      }
+      // Keep localStorage in sync as cache
+      try {
+        const raw = localStorage.getItem('settings_connected_inboxes');
+        const list = raw ? JSON.parse(raw) : [];
+        list.push(entry);
+        localStorage.setItem('settings_connected_inboxes', JSON.stringify(list));
+        const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
+        tokens[selectedHostId] = tokenInput.trim();
+        localStorage.setItem('settings_inbox_tokens', JSON.stringify(tokens));
+      } catch { /* ignore */ }
+    })();
 
     // Activate the connection in AppContext — triggers Firebase auth + Firestore subscription
     addFirestoreConnection(tokenInput.trim(), host).catch(err => {
@@ -1281,11 +1317,23 @@ function ConnectedInboxesPanel() {
 
   const confirmDisconnect = (hostId: string) => {
     setSavedInboxes(prev => prev.filter(i => i.hostId !== hostId));
-    try {
-      const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
-      delete tokens[hostId];
-      localStorage.setItem('settings_inbox_tokens', JSON.stringify(tokens));
-    } catch { /* ignore */ }
+    // Remove from Supabase KV + localStorage cache
+    (async () => {
+      try {
+        const { deleteInbox } = await import('../../ai/api-client');
+        await deleteInbox(hostId);
+      } catch (err) {
+        console.error('Failed to delete inbox from Supabase:', err);
+      }
+      try {
+        const raw = localStorage.getItem('settings_connected_inboxes');
+        const list = raw ? JSON.parse(raw) : [];
+        localStorage.setItem('settings_connected_inboxes', JSON.stringify(list.filter((i: any) => i.hostId !== hostId)));
+        const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
+        delete tokens[hostId];
+        localStorage.setItem('settings_inbox_tokens', JSON.stringify(tokens));
+      } catch { /* ignore */ }
+    })();
     // Tear down Firebase app + unsubscribe from Firestore
     removeFirestoreConnection(hostId).catch(() => {});
     setDisconnectingId(null);
@@ -1295,8 +1343,8 @@ function ConnectedInboxesPanel() {
   const handleTestConnection = async (hostId: string) => {
     setTestingId(hostId);
     try {
-      const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
-      const token = tokens[hostId];
+      const { getInboxToken } = await import('../../ai/api-client');
+      const token = await getInboxToken(hostId);
       if (!token) {
         toast.error('Token not found — please reconnect this inbox.');
         return;
