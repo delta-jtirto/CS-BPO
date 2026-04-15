@@ -15,6 +15,10 @@ import { useFirestoreConnections, type SavedConnection, type InboxConnection } f
 import { useFirestoreThreads, type FirestoreConnection, type BPOOverlayState } from '@/hooks/use-firestore-threads';
 import { type EscalationOverride } from '@/lib/compute-ticket-state';
 import { sendGuestMessage } from '@/lib/unibox-send';
+import { sendProxyMessage, isProxyChannel } from '@/lib/proxy-send';
+import { useProxyConversations } from '@/hooks/use-proxy-conversations';
+import { mapProxyConversationToTicket } from '@/lib/proxy-mappers';
+import { supabase as supabaseClient, getUserCompanyIds as fetchProxyCompanyIds, getAccessToken } from '@/lib/supabase-client';
 import { toast } from 'sonner';
 
 // Lazy-load the API client so a module-level error in api-client.ts
@@ -98,6 +102,12 @@ interface AppState {
   // Lazy-loaded messages for the active thread (from Firestore)
   activeMessages: Message[];
   setActiveMessages: React.Dispatch<React.SetStateAction<Message[]>>;
+
+  // Loading: true until both Firestore AND proxy have returned initial data
+  isInitialLoad: boolean;
+
+  // Channel proxy (Supabase-backed channels: WhatsApp, Instagram, LINE, Email)
+  proxyCompanyIds: string[];
 
   // Firestore connections
   firestoreConnections: import('@/hooks/use-firestore-connections').InboxConnection[];
@@ -197,6 +207,15 @@ interface AppState {
   promptOverrides: PromptOverrides;
   updatePromptOverride: (op: OperationId, field: keyof PromptOverride, value: string | number | undefined) => void;
   resetPromptOverride: (op: OperationId, field?: keyof PromptOverride) => void;
+
+  // Agent presence — drives when AI auto-actions fire
+  // 'online': AI assists in sidebar only (classify + suggest), no auto-send
+  // 'away': AI auto-replies / drafts per autoReplyMode setting
+  agentPresence: 'online' | 'away';
+  setAgentPresence: (presence: 'online' | 'away') => void;
+  /** Minutes of inactivity before auto-away triggers (0 = disabled) */
+  autoAwayMinutes: number;
+  setAutoAwayMinutes: (minutes: number) => void;
 
   // Agent preferences
   darkMode: boolean;
@@ -443,10 +462,125 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     });
   }, [firestoreThreads]);
 
+  // ─── Channel Proxy (Supabase): WhatsApp, Instagram, LINE, Email ───
+  const [proxyCompanyIds, setProxyCompanyIds] = useState<string[]>([]);
+
+  // Load proxy company IDs on mount
+  useEffect(() => {
+    fetchProxyCompanyIds().then(ids => setProxyCompanyIds(ids)).catch(() => {});
+  }, []);
+
+  // Subscribe to proxy conversations via Supabase Realtime
+  const { conversations: proxyConversations, isLoading: proxyConversationsLoading } = useProxyConversations({
+    supabase: supabaseClient,
+    companyIds: proxyCompanyIds,
+    pageSize: 50,
+  });
+
+  // Merge proxy conversations into the tickets state
+  // Fetch channel accounts from proxy API to get host_id mappings
+  const [proxyAccountHostMap, setProxyAccountHostMap] = useState<Record<string, string>>({});
+  const [proxyAccountRefreshTick, setProxyAccountRefreshTick] = useState(0);
+  const refreshProxyAccounts = useCallback(() => setProxyAccountRefreshTick(t => t + 1), []);
+
+  useEffect(() => {
+    if (proxyCompanyIds.length === 0) return;
+    (async () => {
+      try {
+        const token = await getAccessToken();
+        const PROXY_URL = import.meta.env.VITE_CHANNEL_PROXY_URL || '';
+        if (!token || !PROXY_URL) return;
+        const res = await fetch(`${PROXY_URL}/api/proxy/accounts?company_id=${proxyCompanyIds[0]}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const map: Record<string, string> = {};
+          for (const acct of data.accounts || []) {
+            if (acct.host_id) {
+              map[acct.id] = acct.host_id;
+              // Also key by company_id + channel for conversation lookup
+              map[`${acct.company_id}_${acct.channel}`] = acct.host_id;
+            }
+          }
+          setProxyAccountHostMap(map);
+        }
+      } catch {}
+    })();
+  }, [proxyCompanyIds, proxyAccountRefreshTick]);
+
+  // Listen for host mapping changes from Settings (via custom event)
+  useEffect(() => {
+    const handler = () => refreshProxyAccounts();
+    window.addEventListener('channel-host-updated', handler);
+    return () => window.removeEventListener('channel-host-updated', handler);
+  }, [refreshProxyAccounts]);
+
+  useEffect(() => {
+    if (proxyConversations.length === 0 && !proxyConversationsLoading) return;
+    const defaultHost = MOCK_HOSTS[0] || { id: 'default', name: 'Default', tone: '', brandColor: '#6366f1' };
+
+    const proxyTickets = proxyConversations.map(c => {
+      // Look up host by company_id + channel (1 account per channel per company)
+      const channelKey = `${c.company_id}_${c.channel}`;
+      const hostId = proxyAccountHostMap[channelKey];
+      const host = hostId ? (MOCK_HOSTS.find(h => h.id === hostId) || defaultHost) : defaultHost;
+      return mapProxyConversationToTicket(c, host, host.name);
+    });
+    setTickets(prev => {
+      const nonProxy = prev.filter(t => !t.proxyConversationId);
+      const merged = [...nonProxy, ...proxyTickets];
+      const deduped = Array.from(new Map(merged.map(t => [t.id, t])).values());
+      deduped.sort((a, b) => {
+        const aTime = a.slaSetAt || 0;
+        const bTime = b.slaSetAt || 0;
+        return bTime - aTime;
+      });
+      return deduped;
+    });
+  }, [proxyConversations, proxyConversationsLoading]);
+
+  // Unified initial load flag (both Firestore and proxy must resolve)
+  const isInitialLoad = firestoreThreadsLoading || proxyConversationsLoading;
+
   const [darkMode, setDarkModeRaw] = useState(false);
   const [devModeRaw, setDevModeRaw] = useState(false);
-  const [agentNameRaw, setAgentNameRaw] = useState('Agent Felix');
+  const [agentNameRaw, setAgentNameRaw] = useState('');
+
+  // Load display name from Supabase profile on mount
+  useEffect(() => {
+    supabaseClient.auth.getSession().then(({ data: { session } }) => {
+      if (!session) return;
+      supabaseClient
+        .from('profiles')
+        .select('full_name')
+        .eq('id', session.user.id)
+        .single()
+        .then(({ data }) => {
+          if (data?.full_name && !agentNameRaw) {
+            setAgentNameRaw(data.full_name);
+          }
+        });
+    });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const [defaultLanguageRaw, setDefaultLanguageRaw] = useState('en');
+
+  // ─── Agent presence ───────────────────────────────────────
+  // 'online' = AI assists only (no auto-send); 'away' = AI auto-acts per autoReplyMode
+  const [agentPresence, setAgentPresenceRaw] = useState<'online' | 'away'>(() => {
+    try { return (localStorage.getItem('agentPresence') as 'online' | 'away') || 'online'; } catch { return 'online'; }
+  });
+  const setAgentPresence = useCallback((presence: 'online' | 'away') => {
+    setAgentPresenceRaw(presence);
+    try { localStorage.setItem('agentPresence', presence); } catch {}
+  }, []);
+  const [autoAwayMinutes, setAutoAwayMinutesRaw] = useState<number>(() => {
+    try { return parseInt(localStorage.getItem('autoAwayMinutes') || '5', 10) || 5; } catch { return 5; }
+  });
+  const setAutoAwayMinutes = useCallback((minutes: number) => {
+    setAutoAwayMinutesRaw(minutes);
+    try { localStorage.setItem('autoAwayMinutes', String(minutes)); } catch {}
+  }, []);
 
   // ─── BE-persisted preferences ────────────────────────────
   // Per-key debounce timers (#20) — prevents race where rapid changes clobber each other
@@ -478,6 +612,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const setAgentName = useCallback((v: string) => {
     setAgentNameRaw(v);
     syncPrefToBackend('agentName', v);
+    // Also persist to Supabase profiles table
+    supabaseClient.auth.getSession().then(({ data: { session } }) => {
+      if (session) {
+        supabaseClient.from('profiles').update({ full_name: v }).eq('id', session.user.id).then(() => {});
+      }
+    });
   }, [syncPrefToBackend]);
 
   const setDefaultLanguage = useCallback((v: string) => {
@@ -848,6 +988,21 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const addMessageToTicket = useCallback((ticketId: string, text: string) => {
     const ticket = tickets.find(t => t.id === ticketId);
 
+    // For proxy channel tickets (WhatsApp, Instagram, LINE, Email): send via channel proxy
+    if (ticket?.proxyConversationId && ticket?.proxyChannel) {
+      getAccessToken().then(token => {
+        if (!token) {
+          toast.error('Not authenticated — please sign in again');
+          return;
+        }
+        sendProxyMessage(ticket.proxyConversationId!, text, token).catch(err => {
+          toast.error('Failed to send message', { description: err.message });
+        });
+      });
+      setAutoReplyHandedOff(ticketId, false);
+      return;
+    }
+
     // For Firestore threads: send via Unibox API — message appears via onSnapshot
     if (ticket?.firestoreThreadId && ticket?.firestoreHostId) {
       const conn = firestoreConnections.find(c => c.hostId === ticket.firestoreHostId && c.status === 'connected');
@@ -904,6 +1059,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const addBotMessage = useCallback((ticketId: string, text: string) => {
     const ticket = tickets.find(t => t.id === ticketId);
+
+    // For proxy channel tickets: send via channel proxy (AI auto-reply)
+    if (ticket?.proxyConversationId && ticket?.proxyChannel) {
+      getAccessToken().then(token => {
+        if (!token) return;
+        sendProxyMessage(ticket.proxyConversationId!, text, token).catch(err => {
+          console.error('[AutoReply] Failed to send bot reply via proxy:', err);
+          toast.error('AI reply failed to send', { description: err.message });
+        });
+      });
+      return; // Message appears via Supabase Realtime
+    }
+
     // For Firestore-backed tickets: send via Unibox API so message is delivered
     // to the actual channel and written to Firestore. It appears via onSnapshot.
     if (ticket?.firestoreThreadId && ticket?.firestoreHostId) {
@@ -1461,7 +1629,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setKbEntries(MOCK_KB);
     setDarkModeRaw(false);
     setDevModeRaw(false);
-    setAgentNameRaw('Agent Felix');
+    // Don't reset agent name — it comes from Supabase profile
     setDefaultLanguageRaw('en');
     setOpenRouterApiKeyRaw('');
     setAiModelRaw('openai/gpt-4o-mini');
@@ -1655,6 +1823,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     <AppContext.Provider value={{
       activeHostFilter, setActiveHostFilter,
       tickets, setTickets, activeMessages, setActiveMessages,
+      isInitialLoad, proxyCompanyIds,
       firestoreConnections, firestoreInitializing,
       addFirestoreConnection, removeFirestoreConnection, reconnectFirestore,
       escalationOverrides, handoverReasons, setHandoverReason,
@@ -1668,6 +1837,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       customFormSections, addCustomFormSection, removeCustomFormSection, renameCustomFormSection,
       notifications, markNotificationRead, markAllNotificationsRead, unreadCount,
       hostSettings, updateHostSettings,
+      agentPresence, setAgentPresence,
+      autoAwayMinutes, setAutoAwayMinutes,
       darkMode, setDarkMode,
       devMode: devModeRaw, setDevMode,
       agentName: agentNameRaw, setAgentName,

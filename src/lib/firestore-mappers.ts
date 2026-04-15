@@ -1,5 +1,3 @@
-import { MessageSquare, Globe, Phone } from 'lucide-react';
-import type { LucideIcon } from 'lucide-react';
 import type { Host, Message, Ticket } from '@/app/data/types';
 import { computeSLA, formatSLARelative, type EscalationOverride } from './compute-ticket-state';
 
@@ -63,26 +61,17 @@ export interface FirestoreMessage {
 // Channel → Icon mapping (brand-specific)
 // ---------------------------------------------------------------------------
 
-const CHANNEL_ICONS: Record<string, LucideIcon> = {
-  airbnb: MessageSquare,   // TODO: Replace with Airbnb brand SVG component
-  booking_com: Globe,      // TODO: Replace with Booking.com brand SVG component
-  'booking.com': Globe,
-};
+// Channel icons and display names unified in channel-config.ts
+// Re-exported here for backward compatibility with existing imports
+import {
+  CHANNEL_ICONS,
+  channelToIcon as _channelToIcon,
+  channelDisplayName as _channelDisplayName,
+} from './channel-config';
 
-export function channelToIcon(channel: string): LucideIcon {
-  const key = channel.toLowerCase().replace(/\s+/g, '_');
-  return CHANNEL_ICONS[key] || Phone;
-}
-
-/** Normalize channel display name */
-export function channelDisplayName(channel: string): string {
-  const map: Record<string, string> = {
-    airbnb: 'Airbnb',
-    booking_com: 'Booking.com',
-    'booking.com': 'Booking.com',
-  };
-  return map[channel.toLowerCase()] || channel;
-}
+export { CHANNEL_ICONS };
+export const channelToIcon = _channelToIcon;
+export const channelDisplayName = _channelDisplayName;
 
 // ---------------------------------------------------------------------------
 // Sender role mapping
@@ -262,6 +251,7 @@ export function mapFirestoreMessage(msg: FirestoreMessage, guestUserId?: string)
     time: timestampToTimeString(tsMs),
     createdAt: tsMs,
     senderName: msg.sender_name,
+    attachments: msg.attachments?.length ? msg.attachments : undefined,
   };
 }
 

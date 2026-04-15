@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router';
 import { MOCK_HOSTS } from '../../data/mock-data';
 import { useAppContext } from '../../context/AppContext';
 import { ZoomControl } from './ZoomControl';
+import { supabase } from '@/lib/supabase-client';
 
 // Default values if context is unavailable (e.g. during HMR or error boundary recovery)
 const CONTEXT_DEFAULTS = {
@@ -32,8 +33,20 @@ export function TopBar({ onShowShortcuts }: { onShowShortcuts?: () => void }) {
   const navigate = useNavigate();
   const [showNotifications, setShowNotifications] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
+  const [userEmail, setUserEmail] = useState('');
   const notifRef = useRef<HTMLDivElement>(null);
   const profileRef = useRef<HTMLDivElement>(null);
+
+  // Load Supabase Auth user email
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session?.user?.email) setUserEmail(session.user.email);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUserEmail(session?.user?.email ?? '');
+    });
+    return () => subscription.unsubscribe();
+  }, []);
 
   // Close dropdowns on outside click
   useEffect(() => {
@@ -141,38 +154,24 @@ export function TopBar({ onShowShortcuts }: { onShowShortcuts?: () => void }) {
             <div className="absolute right-0 top-10 w-56 bg-white rounded-xl shadow-2xl border border-slate-200 overflow-hidden z-50 text-slate-800">
               <div className="px-4 py-3 border-b border-slate-100">
                 <p className="text-sm font-bold text-slate-800">{agentName}</p>
-                <p className="text-[11px] text-slate-500">felix@deltaaiops.com</p>
+                <p className="text-[11px] text-slate-500">{userEmail}</p>
               </div>
               <div className="py-1">
                 <button
-                  onClick={() => { navigate('/settings'); setShowProfile(false); }}
+                  onClick={() => { navigate('/settings/agent'); setShowProfile(false); }}
                   className="w-full px-4 py-2 text-left text-sm hover:bg-slate-50 flex items-center gap-3 text-slate-700"
                 >
-                  <Settings size={14} className="text-slate-400" /> Preferences
+                  <Settings size={14} className="text-slate-400" /> Settings
                 </button>
-                <button
-                  onClick={() => { navigate('/settings/ai'); setShowProfile(false); }}
-                  className="w-full px-4 py-2 text-left text-sm hover:bg-slate-50 flex items-center gap-3 text-slate-700"
-                >
-                  <Sparkles size={14} className="text-slate-400" /> AI Auto-Reply
-                </button>
-                <button
-                  onClick={() => { navigate('/guide'); setShowProfile(false); }}
-                  className="w-full px-4 py-2 text-left text-sm hover:bg-slate-50 flex items-center gap-3 text-slate-700"
-                >
-                  <TestTube2 size={14} className="text-slate-400" /> Test Guide
-                </button>
-                {onShowShortcuts && (
-                  <button
-                    onClick={() => { onShowShortcuts(); setShowProfile(false); }}
-                    className="w-full px-4 py-2 text-left text-sm hover:bg-slate-50 flex items-center gap-3 text-slate-700"
-                  >
-                    <Keyboard size={14} className="text-slate-400" /> Shortcuts
-                  </button>
-                )}
               </div>
               <div className="border-t border-slate-100 py-1">
-                <button className="w-full px-4 py-2 text-left text-sm hover:bg-red-50 flex items-center gap-3 text-red-600">
+                <button
+                  onClick={async () => {
+                    await supabase.auth.signOut();
+                    window.location.reload();
+                  }}
+                  className="w-full px-4 py-2 text-left text-sm hover:bg-red-50 flex items-center gap-3 text-red-600"
+                >
                   <LogOut size={14} /> Sign Out
                 </button>
               </div>

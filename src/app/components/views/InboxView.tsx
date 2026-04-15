@@ -8,7 +8,7 @@ import {
   Plus, X, Trash2, Copy, FileEdit, Info, ShieldAlert, ArrowRightLeft,
   Loader2, Square, PauseCircle, SkipForward, Zap, AlertCircle,
   ArrowLeft, PanelRightOpen, PanelRightClose, PanelLeftOpen, PanelLeftClose, ChevronsLeft, ChevronsRight,
-  ArrowDown, MessageSquare as MessageSquareIcon, MoreVertical, Share2, FileText, Settings, Lock
+  ArrowDown, MessageSquare as MessageSquareIcon, MoreVertical, Share2, FileText, Settings, Lock, RefreshCw
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { toast } from 'sonner';
@@ -18,6 +18,9 @@ import { parseThreadStatus } from '../../data/types';
 import { SmartReplyPanel, type SmartReplyCache } from '../inbox/SmartReplyPanel';
 import { useIsMobile } from '../ui/use-mobile';
 import { useFirestoreMessages } from '@/hooks/use-firestore-messages';
+import { useProxyMessages } from '@/hooks/use-proxy-conversations';
+import { mapProxyMessageToMessage } from '@/lib/proxy-mappers';
+import { supabase as supabaseClient } from '@/lib/supabase-client';
 import { ConnectionStatusBar } from '../ConnectionStatusBar';
 import { SLABadge, getSLAStatus } from '../inbox/SLABadge';
 import { computeTags, getLastGuestMessageAt } from '@/lib/compute-ticket-state';
@@ -27,6 +30,26 @@ import { useMessageContextMenu } from '../inbox/hooks/useMessageContextMenu';
 import { useBookingDetails } from '../inbox/hooks/useBookingDetails';
 import { ContextSidebarPane } from '../inbox/ContextSidebarPane';
 import { InboxDialogs } from '../inbox/InboxDialogs';
+
+/** Linkify plain-text email bodies: converts <URL> and bare https:// to anchor tags,
+ *  preserving the rest as plain text. Returns React nodes (no dangerouslySetInnerHTML). */
+function linkifyEmailText(text: string): React.ReactNode[] {
+  const urlPattern = /(<https?:\/\/[^>]+>|https?:\/\/[^\s<>]+)/g;
+  const parts = text.split(urlPattern);
+  return parts.map((part, i) => {
+    const angleMatch = part.match(/^<(https?:\/\/[^>]+)>$/);
+    if (angleMatch) {
+      const url = angleMatch[1];
+      const display = url.length > 55 ? url.slice(0, 55) + '…' : url;
+      return <a key={i} href={url} target="_blank" rel="noopener noreferrer" className="underline opacity-50 hover:opacity-80 text-[11px] break-all transition-opacity">{display}</a>;
+    }
+    if (/^https?:\/\//.test(part)) {
+      const display = part.length > 55 ? part.slice(0, 55) + '…' : part;
+      return <a key={i} href={part} target="_blank" rel="noopener noreferrer" className="underline opacity-50 hover:opacity-80 text-[11px] break-all transition-opacity">{display}</a>;
+    }
+    return part;
+  });
+}
 
 export function InboxView() {
   const { ticketId } = useParams();
@@ -44,7 +67,6 @@ export function InboxView() {
     ticketNotes, updateTicketNotes,
     activeMessages, setActiveMessages,
     firestoreConnections, firestoreInitializing,
-    firestoreSyncedTickets,
   } = useAppContext();
 
   const filteredTickets = activeHostFilter === 'all' ? tickets : tickets.filter(t => t.host.id === activeHostFilter);
@@ -77,15 +99,34 @@ export function InboxView() {
     activeTicket?.firestoreGuestUserId,
   );
 
-  // Sync Firestore messages into context so other components can access them
+  // Proxy message subscription (WhatsApp, Instagram, LINE, Email)
+  const isProxyTicket = !!activeTicket?.proxyConversationId;
+  const { messages: rawProxyMessages, isLoading: proxyMessagesLoading } = useProxyMessages(
+    isProxyTicket ? supabaseClient : null!,
+    isProxyTicket ? activeTicket!.proxyConversationId! : null,
+  );
+  const proxyMessages = useMemo(
+    () => rawProxyMessages.map(m => mapProxyMessageToMessage(m)),
+    [rawProxyMessages],
+  );
+
+  // Sync messages into context — branch on source
   useEffect(() => {
-    if (firestoreMessages.length > 0) {
+    if (isProxyTicket) {
+      // Proxy ticket: use Supabase messages
+      if (proxyMessages.length > 0) {
+        setActiveMessages(proxyMessages);
+      } else {
+        setActiveMessages([]);
+      }
+    } else if (firestoreMessages.length > 0) {
+      // Firestore ticket
       setActiveMessages(firestoreMessages);
     } else if (!activeTicket?.firestoreThreadId) {
-      // Non-Firestore ticket — clear active messages
+      // Non-Firestore, non-proxy ticket — clear
       setActiveMessages([]);
     }
-  }, [firestoreMessages, activeTicket?.firestoreThreadId, setActiveMessages]);
+  }, [isProxyTicket, proxyMessages, firestoreMessages, activeTicket?.firestoreThreadId, setActiveMessages]);
 
   // Sync Firestore messages into ticket.messages so AI consumers (useAutoReply,
   // useSmartReply, AssistantPanel) can see the full conversation.
@@ -93,10 +134,6 @@ export function InboxView() {
   // supplies bot/system messages added by auto-reply. Sender types don't overlap.
   useEffect(() => {
     if (!activeTicket?.firestoreThreadId || firestoreMessages.length === 0) return;
-
-    // Mark this ticket as having received a Firestore sync so useAutoReply
-    // can re-initialize its count tracker without false-triggering.
-    firestoreSyncedTickets.current.add(activeTicket.id);
 
     setTickets(prev => prev.map(t => {
       if (t.id !== activeTicket.id) return t;
@@ -121,12 +158,12 @@ export function InboxView() {
     }));
   }, [firestoreMessages, activeTicket?.id, activeTicket?.firestoreThreadId, setTickets]);
 
-  // Helper: get messages for a ticket — from Firestore (activeMessages) for active ticket,
-  // or from embedded messages (mock/devMode), defaulting to empty array.
+  // Helper: get messages for a ticket — from Firestore or Supabase (activeMessages)
+  // for the active ticket, or from embedded messages (mock/devMode).
   const getMessages = useCallback((ticket: typeof activeTicket) => {
     if (!ticket) return [];
-    // For active ticket with Firestore thread: use Firestore messages
-    if (ticket.firestoreThreadId && ticket.id === activeTicket?.id && activeMessages.length > 0) {
+    // Active ticket sourced from Firestore OR proxy (Supabase): use activeMessages
+    if ((ticket.firestoreThreadId || ticket.proxyConversationId) && ticket.id === activeTicket?.id && activeMessages.length > 0) {
       return activeMessages;
     }
     return ticket.messages || [];
@@ -329,12 +366,54 @@ export function InboxView() {
     return () => window.removeEventListener('keydown', handleGlobalKeyDown);
   }, [handleGlobalKeyDown]);
 
+  // When no ticket is selected, show empty state
   if (!activeTicket) {
     return (
-      <div className="flex-1 flex items-center justify-center flex-col gap-3 text-slate-500 px-6 text-center">
-        <Bot size={48} className="text-slate-300" />
-        <p className="font-bold text-slate-700">No active tickets</p>
-        <p className="text-sm">All tickets have been resolved, or no tickets match this workspace filter.</p>
+      <div className="flex-1 flex overflow-hidden">
+        <div className="w-80 shrink-0 bg-white border-r border-slate-200 flex flex-col">
+          <div className="p-4 border-b border-slate-200 bg-slate-50">
+            <h2 className="text-lg font-bold text-slate-800 flex items-center justify-between">
+              Inbox
+              <button
+                onClick={async () => {
+                  try {
+                    const { getAccessToken, COMPANY_ID } = await import('@/lib/supabase-client');
+                    const token = await getAccessToken();
+                    const PROXY_URL = import.meta.env.VITE_CHANNEL_PROXY_URL || '';
+                    if (!token || !PROXY_URL) return;
+                    const res = await fetch(`${PROXY_URL}/api/proxy/email/fetch`, {
+                      method: 'POST',
+                      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ company_id: COMPANY_ID }),
+                    });
+                    if (res.ok) {
+                      const data = await res.json();
+                      if (data.stored > 0) toast.success(`${data.stored} new email(s) fetched`);
+                      else toast('No new emails');
+                    }
+                  } catch { toast.error('Failed to fetch emails'); }
+                }}
+                className="w-6 h-6 rounded-md flex items-center justify-center bg-slate-200 text-slate-500 hover:bg-indigo-100 hover:text-indigo-600 transition-colors"
+                title="Check for new emails"
+              >
+                <RefreshCw size={12} />
+              </button>
+            </h2>
+          </div>
+          <div className="flex-1 flex items-center justify-center p-6 text-center">
+            <div className="space-y-2">
+              <Bot size={32} className="mx-auto text-slate-300" />
+              <p className="text-sm font-medium text-slate-500">No tickets yet</p>
+              <p className="text-xs text-slate-400">Click <RefreshCw size={10} className="inline" /> to check for new emails, or connect channels in Settings.</p>
+            </div>
+          </div>
+        </div>
+        <div className="flex-1 flex items-center justify-center bg-slate-50">
+          <div className="text-center space-y-2 text-slate-400">
+            <MessageSquareIcon size={40} className="mx-auto text-slate-200" />
+            <p className="text-sm">Select a conversation to view messages</p>
+          </div>
+        </div>
       </div>
     );
   }
@@ -517,6 +596,35 @@ export function InboxView() {
           <h2 className="text-lg font-bold text-slate-800 flex items-center justify-between">
             Inbox
             <div className="flex items-center gap-2">
+              <button
+                onClick={async () => {
+                  try {
+                    const { getAccessToken, COMPANY_ID } = await import('@/lib/supabase-client');
+                    const token = await getAccessToken();
+                    const PROXY_URL = import.meta.env.VITE_CHANNEL_PROXY_URL || '';
+                    if (!token || !PROXY_URL) return;
+                    const btn = document.getElementById('email-refresh-btn');
+                    if (btn) btn.classList.add('animate-spin');
+                    const res = await fetch(`${PROXY_URL}/api/proxy/email/fetch`, {
+                      method: 'POST',
+                      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ company_id: COMPANY_ID }),
+                    });
+                    if (btn) btn.classList.remove('animate-spin');
+                    if (res.ok) {
+                      const data = await res.json();
+                      if (data.stored > 0) {
+                        const { toast } = await import('sonner');
+                        toast.success(`${data.stored} new email(s) fetched`);
+                      }
+                    }
+                  } catch {}
+                }}
+                className="w-6 h-6 rounded-md flex items-center justify-center bg-slate-200 text-slate-500 hover:bg-indigo-100 hover:text-indigo-600 transition-colors"
+                title="Check for new emails"
+              >
+                <RefreshCw id="email-refresh-btn" size={12} />
+              </button>
               {!isMobile && (
                 <button
                   onClick={() => { setLeftCollapsed(true); setLeftOverlayOpen(false); }}
@@ -1314,7 +1422,42 @@ export function InboxView() {
                     msg.sender === 'guest'
                       ? 'bg-white border border-slate-200 text-slate-800 rounded-tl-sm'
                       : 'bg-indigo-600 text-white rounded-tr-sm'
-                  }`}>{msg.text}</div>
+                  }`}>
+                    {msg.subject && (
+                      <div className={`text-[11px] font-semibold mb-1.5 pb-1.5 border-b ${
+                        msg.sender === 'guest' ? 'border-slate-200 text-slate-500' : 'border-indigo-500 text-indigo-200'
+                      }`}>{msg.subject}</div>
+                    )}
+                    {activeTicket.proxyChannel === 'email' ? (
+                      <span className="whitespace-pre-wrap break-words leading-relaxed">
+                        {linkifyEmailText(msg.text)}
+                      </span>
+                    ) : msg.text}
+                    {msg.attachments && msg.attachments.length > 0 && (
+                      <div className={`mt-2 pt-2 flex flex-col gap-1.5 border-t ${
+                        msg.sender === 'guest' ? 'border-slate-200' : 'border-indigo-500'
+                      }`}>
+                        {msg.attachments.map((att, i) => {
+                          const isImage = att.mime_type?.startsWith('image/') || att.type === 'image';
+                          return isImage ? (
+                            <a key={i} href={att.url} target="_blank" rel="noopener noreferrer" className="block">
+                              <img src={att.url} alt={att.filename || 'attachment'} className="rounded-lg max-h-40 object-cover border border-slate-200" />
+                            </a>
+                          ) : (
+                            <a key={i} href={att.url} target="_blank" rel="noopener noreferrer"
+                              className={`flex items-center gap-2 text-[11px] px-2 py-1.5 rounded-lg ${
+                                msg.sender === 'guest'
+                                  ? 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                                  : 'bg-indigo-500 text-indigo-100 hover:bg-indigo-400'
+                              } transition-colors`}>
+                              <FileText size={12} className="shrink-0" />
+                              <span className="truncate">{att.filename || 'Attachment'}</span>
+                            </a>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
                 </>
               )}
             </div>
@@ -1439,7 +1582,7 @@ export function InboxView() {
           {isActiveTicketStale && (
             <div className="flex items-center gap-2 mb-2 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-700">
               <AlertCircle size={14} className="shrink-0" />
-              <span>Connection lost — <button onClick={() => navigate('/settings/inboxes')} className="underline font-medium hover:no-underline text-inherit">reconnect this inbox</button> to reply</span>
+              <span>Connection lost — <button onClick={() => navigate('/settings/inboxes')} className="underline font-medium hover:no-underline text-inherit p-0 leading-[inherit]">reconnect this inbox</button> to reply</span>
             </div>
           )}
           {guestMode && (

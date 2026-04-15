@@ -20,6 +20,13 @@ export interface Property {
   internalPortalToken?: string;  // internal-only token (staff use)
 }
 
+export interface MessageAttachment {
+  url: string;
+  filename?: string;
+  mime_type?: string; // e.g. 'image/jpeg', 'application/pdf'
+  type?: string;      // legacy field from Firestore ('image', 'document', etc.)
+}
+
 export interface Message {
   id: number;
   sender: 'guest' | 'system' | 'agent' | 'bot' | 'host';
@@ -28,6 +35,12 @@ export interface Message {
   createdAt: number; // epoch ms — used for cooldown, SLA, time-since calculations
   isGuestMode?: boolean; // true when injected via guest-mode testing — AI should skip
   senderName?: string; // display name from Firestore
+  attachments?: MessageAttachment[];
+  // Email-specific fields
+  subject?: string;
+  // Delivery status (proxy channels)
+  deliveryStatus?: 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
+  deliveryError?: string; // e.g. "Outside 24-hour messaging window"
 }
 
 /** @deprecated Use bookingId + bookingStatus on Ticket instead */
@@ -66,6 +79,10 @@ export interface Ticket {
   // Firestore metadata
   unreadCount?: number;
   companyName?: string; // for display in thread list
+  // Channel proxy linkage (WhatsApp, Instagram, LINE, Email)
+  proxyConversationId?: string;  // Supabase conversation UUID
+  proxyCompanyId?: string;       // company_id from channel proxy
+  proxyChannel?: string;         // raw channel: 'whatsapp' | 'instagram' | 'line' | 'email'
 }
 
 export interface KBEntry {

@@ -15,7 +15,8 @@ import { MOCK_HOSTS } from '../../data/mock-data';
 import { useAppContext } from '../../context/AppContext';
 import { useIsMobile } from '../ui/use-mobile';
 import { validateToken, maskToken, AuthError } from '@/lib/unibox-auth';
-import { Wifi, WifiOff, Plug, CheckCircle2, Loader2 } from 'lucide-react';
+import { Wifi, WifiOff, Plug, CheckCircle2, Loader2, Radio } from 'lucide-react';
+import ConnectedChannelsPanel from './ConnectedChannelsPanel';
 
 // ─── Helper: localStorage-backed state ─────────────────────────
 function usePersistedState<T>(key: string, initial: T): [T, (v: T | ((prev: T) => T)) => void] {
@@ -202,6 +203,7 @@ export function SettingsView() {
     darkMode, setDarkMode, devMode, setDevMode,
     agentName, setAgentName, defaultLanguage, setDefaultLanguage,
     hostSettings, updateHostSettings,
+    agentPresence, setAgentPresence, autoAwayMinutes, setAutoAwayMinutes,
     hasApiKey, maskedApiKey, aiSettingsLoading,
     saveAIApiKey, saveAIModel, saveImportAiModel, clearAIApiKey,
     aiModel, importAiModel, resetToDemo,
@@ -209,7 +211,7 @@ export function SettingsView() {
     promptOverrides, updatePromptOverride, resetPromptOverride,
   } = useAppContext();
 
-  const validTabs: SettingsTab[] = ['agent', 'ai', 'templates', 'hours', 'demo', 'prompts', 'inboxes'];
+  const validTabs: SettingsTab[] = ['agent', 'ai', 'templates', 'hours', 'demo', 'prompts', 'inboxes', 'channels'];
   // Map old 'client' tab to new 'ai' tab for backward compatibility
   const resolvedTab = urlTab === 'client' ? 'ai' : urlTab;
   const [settingsTab, setSettingsTab] = useState<SettingsTab>(
@@ -258,6 +260,9 @@ export function SettingsView() {
       setNewKeyword('');
     }
   }, [selectedHostId, hostSettings]);
+
+  // Advanced AI settings collapsed by default
+  const [showAiAdvanced, setShowAiAdvanced] = useState(false);
 
   // Session-persisted state for operational tabs
   const [slaThresholds, setSlaThresholds] = usePersistedState('slaThresholds', INITIAL_SLA_THRESHOLDS);
@@ -421,6 +426,7 @@ export function SettingsView() {
               <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2 ml-2">Connections</h3>
               <nav className="space-y-1">
                 {navItem('inboxes', <Globe size={16} />, 'Connected Inboxes')}
+                {navItem('channels', <Radio size={16} />, 'Messaging Channels')}
               </nav>
             </div>
 
@@ -462,6 +468,11 @@ export function SettingsView() {
           {/* ===== CONNECTED INBOXES ===== */}
           {settingsTab === 'inboxes' && (
             <ConnectedInboxesPanel />
+          )}
+
+          {/* ===== MESSAGING CHANNELS ===== */}
+          {settingsTab === 'channels' && (
+            <ConnectedChannelsPanel />
           )}
 
           {/* ===== MY PREFERENCES ===== */}
@@ -713,80 +724,201 @@ export function SettingsView() {
 
           {/* ===== AI CONFIGURATION ===== */}
           {settingsTab === 'ai' && (
-            <div className="max-w-3xl mx-auto animate-in fade-in">
-              <h2 className="text-lg font-bold text-slate-800 mb-1">AI Configuration</h2>
-              <p className="text-xs text-slate-500 mb-6">Manage AI-powered features and capabilities for guest interactions.</p>
-
-              {/* AI Features Overview */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-                <div className="bg-gradient-to-br from-indigo-50 to-indigo-100 border border-indigo-200 rounded-xl p-5">
-                  <div className="flex items-start gap-3">
-                    <Sparkles size={20} className="text-indigo-600 shrink-0 mt-0.5" />
-                    <div>
-                      <h3 className="font-bold text-sm text-indigo-900">Smart Replies</h3>
-                      <p className="text-xs text-indigo-700 mt-1">AI generates personalized reply suggestions based on guest messages and your property info.</p>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="bg-gradient-to-br from-emerald-50 to-emerald-100 border border-emerald-200 rounded-xl p-5">
-                  <div className="flex items-start gap-3">
-                    <Zap size={20} className="text-emerald-600 shrink-0 mt-0.5" />
-                    <div>
-                      <h3 className="font-bold text-sm text-emerald-900">Auto-Reply</h3>
-                      <p className="text-xs text-emerald-700 mt-1">Automatically respond to guest messages outside working hours using AI that understands your policies.</p>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="bg-gradient-to-br from-purple-50 to-purple-100 border border-purple-200 rounded-xl p-5">
-                  <div className="flex items-start gap-3">
-                    <Brain size={20} className="text-purple-600 shrink-0 mt-0.5" />
-                    <div>
-                      <h3 className="font-bold text-sm text-purple-900">Inquiry Detection</h3>
-                      <p className="text-xs text-purple-700 mt-1">Automatically categorize guest inquiries (maintenance, booking, billing, etc.) for smart routing.</p>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="bg-gradient-to-br from-amber-50 to-amber-100 border border-amber-200 rounded-xl p-5">
-                  <div className="flex items-start gap-3">
-                    <FileText size={20} className="text-amber-600 shrink-0 mt-0.5" />
-                    <div>
-                      <h3 className="font-bold text-sm text-amber-900">Knowledge Base</h3>
-                      <p className="text-xs text-amber-700 mt-1">Import documents to teach AI about your policies, rates, and procedures for better guest answers.</p>
-                    </div>
-                  </div>
-                </div>
+            <div className="max-w-2xl mx-auto animate-in fade-in space-y-5">
+              <div>
+                <h2 className="text-lg font-bold text-slate-800 mb-1">AI Configuration</h2>
+                <p className="text-xs text-slate-500">Control when AI acts automatically and how it handles guest messages.</p>
               </div>
 
-              {/* Configuration Links */}
-              <div className="bg-white border border-slate-200 rounded-xl p-6 mb-6">
-                <h3 className="font-bold text-sm text-slate-700 mb-4">Customize AI Behavior</h3>
-                <p className="text-xs text-slate-500 mb-4">Each AI feature uses customizable prompts to match your brand voice and business rules.</p>
-                <button
-                  onClick={() => {
-                    setSettingsTab('prompts');
-                    setTimeout(() => {
-                      document.querySelector('[data-operation="compose_reply"]')?.scrollIntoView({ behavior: 'smooth' });
-                    }, 100);
-                  }}
-                  className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg transition-colors"
-                >
-                  <BrainCircuit size={16} />
-                  Customize AI Prompts
-                </button>
-              </div>
-
-              {/* Status */}
-              <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-5">
-                <div className="flex items-start gap-3">
-                  <div className="w-2 h-2 bg-emerald-500 rounded-full mt-1.5 shrink-0" />
+              {/* ── Auto-Actions (When Away) ── */}
+              <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+                <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
                   <div>
-                    <p className="text-sm font-bold text-emerald-900">All AI Features Active</p>
-                    <p className="text-xs text-emerald-700 mt-0.5">Your AI features are enabled and ready to use. Configure prompt templates and behavior in the AI Prompts section.</p>
+                    <h3 className="font-bold text-sm text-slate-800">Auto-Actions (When Away)</h3>
+                    <p className="text-xs text-slate-500 mt-0.5">These settings govern automated behavior — not what AI can do manually.</p>
+                  </div>
+                  <div className={`flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full ${agentPresence === 'away' ? 'bg-amber-50 text-amber-700 border border-amber-200' : 'bg-emerald-50 text-emerald-700 border border-emerald-200'}`}>
+                    <span className={`w-1.5 h-1.5 rounded-full ${agentPresence === 'away' ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'}`} />
+                    {agentPresence === 'away' ? 'Away — AI active' : 'Online — AI on standby'}
                   </div>
                 </div>
+
+                <div className="px-5 py-4 space-y-5">
+                  {/* Mode selector */}
+                  <div>
+                    <p className="text-xs font-semibold text-slate-600 mb-2.5">When you're away, AI should:</p>
+                    <div className="grid grid-cols-3 gap-2">
+                      {([
+                        { mode: 'auto',   label: 'Reply for me',  desc: 'Sends reply automatically' },
+                        { mode: 'draft',  label: 'Draft for me',  desc: 'Holds for your review' },
+                        { mode: 'assist', label: 'Suggest only',  desc: 'Sidebar suggestions' },
+                      ] as const).map(({ mode, label, desc }) => {
+                        const isSelected = autoReplyMode === mode;
+                        return (
+                          <button
+                            key={mode}
+                            onClick={() => { setAutoReplyMode(mode); autoSave({ autoReplyMode: mode }); }}
+                            className={`flex flex-col items-center gap-1 p-3 rounded-xl border text-center transition-all ${
+                              isSelected
+                                ? 'border-indigo-400 bg-indigo-50 shadow-sm'
+                                : 'border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50'
+                            }`}
+                          >
+                            <span className={`text-[11px] font-bold leading-tight ${isSelected ? 'text-indigo-700' : 'text-slate-700'}`}>{label}</span>
+                            <span className={`text-[9px] leading-snug ${isSelected ? 'text-indigo-500' : 'text-slate-400'}`}>{desc}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Auto-away timer */}
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-xs font-semibold text-slate-600">Auto-away after idle</p>
+                      <p className="text-[10px] text-slate-400 mt-0.5">Automatically switch to Away after inactivity. 0 = disabled.</p>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <input
+                        type="number"
+                        min={0}
+                        max={120}
+                        value={autoAwayMinutes}
+                        onChange={e => setAutoAwayMinutes(Math.max(0, parseInt(e.target.value) || 0))}
+                        className="w-14 text-center border border-slate-200 rounded-lg py-1.5 text-xs font-semibold text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                      />
+                      <span className="text-xs text-slate-400">min</span>
+                    </div>
+                  </div>
+
+                  {/* Info note */}
+                  <div className="flex items-start gap-2 bg-slate-50 rounded-lg px-3 py-2.5">
+                    <Info size={12} className="text-slate-400 shrink-0 mt-0.5" />
+                    <p className="text-[10px] text-slate-500 leading-snug">
+                      AI drafting and suggestions are always available in the sidebar, even when you're Online.
+                    </p>
+                  </div>
+
+                  {/* Advanced toggle */}
+                  <button
+                    onClick={() => setShowAiAdvanced(v => !v)}
+                    className="flex items-center gap-1.5 text-xs text-slate-500 hover:text-slate-700 transition-colors"
+                  >
+                    {showAiAdvanced ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                    Advanced settings
+                  </button>
+
+                  {showAiAdvanced && (
+                    <div className="border border-slate-100 rounded-xl p-4 space-y-4 bg-slate-50/60">
+                      {/* Reply delay */}
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <p className="text-xs font-semibold text-slate-600">Reply delay</p>
+                          <p className="text-[10px] text-slate-400">Wait for guest to finish typing before AI replies.</p>
+                        </div>
+                        <select
+                          value={debouncePreset}
+                          onChange={e => { setDebouncePreset(e.target.value as typeof debouncePreset); autoSave({ debouncePreset: e.target.value }); }}
+                          className="border border-slate-200 rounded-lg py-1.5 px-2 text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-300 bg-white"
+                        >
+                          <option value="instant">Instant (2s)</option>
+                          <option value="quick">Quick (10s)</option>
+                          <option value="normal">Normal (30s)</option>
+                          <option value="patient">Patient (60s)</option>
+                        </select>
+                      </div>
+
+                      {/* Cooldown */}
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <p className="text-xs font-semibold text-slate-600">Pause AI after I reply</p>
+                          <p className="text-[10px] text-slate-400">Prevents AI from cutting in after you've taken over.</p>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => { const next = !cooldownEnabled; setCooldownEnabled(next); autoSave({ cooldownEnabled: next }); }}
+                            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${cooldownEnabled ? 'bg-indigo-500' : 'bg-slate-200'}`}
+                          >
+                            <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${cooldownEnabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                          </button>
+                          {cooldownEnabled && (
+                            <div className="flex items-center gap-1">
+                              <input
+                                type="number"
+                                min={1}
+                                max={120}
+                                value={cooldownMinutes}
+                                onChange={e => { const v = parseInt(e.target.value) || 10; setCooldownMinutes(v); autoSave({ cooldownMinutes: v }); }}
+                                className="w-12 text-center border border-slate-200 rounded-lg py-1 text-xs font-semibold text-slate-700 focus:outline-none"
+                              />
+                              <span className="text-[10px] text-slate-400">min</span>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Safety keywords */}
+                      <div>
+                        <p className="text-xs font-semibold text-slate-600 mb-1.5">Always escalate if message contains</p>
+                        <div className="flex flex-wrap gap-1.5 mb-2">
+                          {safetyKeywords.map(kw => (
+                            <span key={kw} className="flex items-center gap-1 text-[10px] bg-red-50 border border-red-200 text-red-700 px-2 py-0.5 rounded-full">
+                              {kw}
+                              <button onClick={() => { const next = safetyKeywords.filter(k => k !== kw); setSafetyKeywords(next); autoSave({ safetyKeywords: next }); }}>
+                                <X size={9} />
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+                        <div className="flex gap-2">
+                          <input
+                            type="text"
+                            value={newKeyword}
+                            onChange={e => setNewKeyword(e.target.value)}
+                            onKeyDown={e => {
+                              if (e.key === 'Enter' && newKeyword.trim()) {
+                                const next = [...safetyKeywords, newKeyword.trim()];
+                                setSafetyKeywords(next);
+                                autoSave({ safetyKeywords: next });
+                                setNewKeyword('');
+                              }
+                            }}
+                            placeholder="Add keyword…"
+                            className="flex-1 border border-slate-200 rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                          />
+                          <button
+                            onClick={() => {
+                              if (newKeyword.trim()) {
+                                const next = [...safetyKeywords, newKeyword.trim()];
+                                setSafetyKeywords(next);
+                                autoSave({ safetyKeywords: next });
+                                setNewKeyword('');
+                              }
+                            }}
+                            className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 rounded-lg text-xs font-medium text-slate-600 transition-colors"
+                          >
+                            Add
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Customize prompts link */}
+              <div className="bg-white border border-slate-200 rounded-xl px-5 py-4 flex items-center justify-between">
+                <div>
+                  <p className="text-sm font-semibold text-slate-700">Customize AI tone &amp; prompts</p>
+                  <p className="text-xs text-slate-500 mt-0.5">Adjust how AI writes replies to match your brand voice.</p>
+                </div>
+                <button
+                  onClick={() => { setSettingsTab('prompts'); setTimeout(() => { document.querySelector('[data-operation="compose_reply"]')?.scrollIntoView({ behavior: 'smooth' }); }, 100); }}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold rounded-lg transition-colors shrink-0"
+                >
+                  <BrainCircuit size={13} />
+                  AI Prompts
+                </button>
               </div>
             </div>
           )}
@@ -1181,8 +1313,8 @@ function AIKeyFieldBackend({ hasApiKey, maskedApiKey, loading, onSave, onClear }
       ) : hasApiKey ? (
         <div className="flex items-center gap-3">
           <code className="bg-emerald-50 text-emerald-700 px-3 py-1.5 rounded-lg text-sm font-mono border border-emerald-200">{maskedApiKey}</code>
-          <button onClick={() => setEditing(true)} className="text-[10px] text-indigo-600 hover:underline font-medium">Change</button>
-          <button onClick={onClear} className="text-[10px] text-red-500 hover:underline font-medium">Remove</button>
+          <button onClick={() => setEditing(true)} className="text-[10px] text-indigo-600 hover:underline font-medium p-0 leading-[inherit]">Change</button>
+          <button onClick={onClear} className="text-[10px] text-red-500 hover:underline font-medium p-0 leading-[inherit]">Remove</button>
         </div>
       ) : (
         <button onClick={() => setEditing(true)} className="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 flex items-center gap-2">

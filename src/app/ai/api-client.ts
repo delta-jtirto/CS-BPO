@@ -11,6 +11,7 @@ import { startDebugEntry, updateDebugEntry, type AIDebugEntry } from './debug-st
 const BASE_URL = `https://${projectId}.supabase.co/functions/v1/make-server-ab702ee0`;
 const SUPABASE_REST_URL = `https://${projectId}.supabase.co/rest/v1`;
 
+// Edge Function uses anon key (not user JWT) — it has its own auth via service_role internally
 const headers = () => ({
   'Content-Type': 'application/json',
   'Authorization': `Bearer ${publicAnonKey}`,
