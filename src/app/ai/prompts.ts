@@ -175,23 +175,29 @@ Answer the agent's question concisely:`;
 
 // ─── Classify Inquiries (LLM fallback for unknown types) ─
 
-export const CLASSIFY_INQUIRY_SYSTEM = `You are a hospitality message classifier. Given guest messages from a short-term rental / hotel conversation, identify exactly what the guest is asking about.
+export const CLASSIFY_INQUIRY_SYSTEM = `You are a hospitality message classifier. Given a conversation from a short-term rental / hotel, identify exactly what the guest is asking about and whether each inquiry has been resolved.
 
-Return ONLY a valid JSON array of objects. No markdown, no code fences, no backticks, no explanation — just the raw JSON array starting with [ and ending with ].
+Return ONLY a valid JSON object with two fields. No markdown, no code fences, no backticks, no explanation — just the raw JSON starting with { and ending with }.
 
-Each object has:
+Fields:
+- "summary": a single sentence (max 15 words) summarizing the overall conversation state for the agent. Focus on what's still needed, not what's already done. Examples: "Guest needs hair salon recommendations — pets and parking already addressed", "All inquiries resolved — wifi, pets, and parking covered", "Guest asking about check-in and luggage storage".
+- "inquiries": a JSON array of inquiry objects.
+
+Each inquiry object has:
 - "type": a short lowercase slug describing the topic (e.g. "maintenance", "wifi", "checkout", "checkin", "noise", "pet", "food", "nearby", "visitors", "billing", "amenities", "directions"). Choose whatever slug best describes what the guest is actually asking — do NOT force a pet/animal slug for human visitor questions.
 - "label": a concise human-readable label (2-4 words) describing what the guest needs. Choose freely based on context — e.g. "AC Not Working", "Restaurant Recommendations", "Extra Guests", "Late Checkout". Do NOT be constrained by a fixed list.
 - "detail": a one-sentence summary of exactly what the guest wants
 - "keywords": array of 3-6 specific search terms to find relevant KB entries. Use concrete nouns only — never generic words like "policy", "rules", "check", "guest", "booking", "property"
 - "needsKbSearch": true if this requires looking up property info. false ONLY for pure greetings/compliments with no question.
+- "status": "handled" if the agent/AI has already provided a substantive answer to this inquiry in the conversation. "active" if the inquiry is unanswered, was deferred ("I'll check with the team"), or the answer was vague/incomplete. When in doubt, use "active".
 - "context": always set to empty array [] — a separate instruction appended below will populate this when needed
 
 Rules:
 - Return 1-3 inquiries max — guests rarely ask about more than 3 things at once
 - Merge similar topics (don't return separate entries for "dog" and "pet fee")
 - If the guest also sent a greeting (hello, hi, hey) alongside a real question, IGNORE the greeting entirely — only return the real inquiry. Greetings are not inquiries.
-- ONLY return a greeting entry (type "greeting", label "Greeting") if the message is EXCLUSIVELY a greeting with absolutely no question or request`;
+- ONLY return a greeting entry (type "greeting", label "Greeting") if the message is EXCLUSIVELY a greeting with absolutely no question or request
+- For "status": an inquiry is "handled" ONLY if a concrete, useful answer was given. Saying "I'll get back to you" or "let me check" is NOT handled — that is "active". Saying "pets are not permitted" IS handled — a clear factual answer was given.`;
 
 export const CLASSIFY_INQUIRY_USER = `Property: {{propertyName}}
 Host: {{hostName}}
@@ -199,10 +205,10 @@ Host: {{hostName}}
 Property Knowledge Base:
 {{kbContext}}
 
-Guest messages:
+Conversation:
 {{guestMessages}}
 
-Classify the guest's inquiries as JSON:`;
+Classify the guest's inquiries and their resolution status as JSON:`;
 
 // ─── Inquiry Summary (AI Briefing for Guest Needs Panel) ─
 

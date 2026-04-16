@@ -40,6 +40,7 @@ interface ContextSidebarPaneProps {
   inquiryResolutions?: InquiryResolutionMap;
   onResolutionChange?: (type: string, state: InquiryResolutionState) => void;
   onBulkResolution?: (handled: boolean) => void;
+  onSummaryUpdate?: (summary: string) => void;
 }
 
 export function ContextSidebarPane({
@@ -55,7 +56,7 @@ export function ContextSidebarPane({
   needsPropertyMapping,
   deescalateTicket,
   onComposeReply, onNavigateToKB, onInquiriesClassified,
-  inquiryResolutions, onResolutionChange, onBulkResolution,
+  inquiryResolutions, onResolutionChange, onBulkResolution, onSummaryUpdate,
 }: ContextSidebarPaneProps) {
   return (
     <div
@@ -147,6 +148,7 @@ export function ContextSidebarPane({
             inquiryResolutions={inquiryResolutions}
             onResolutionChange={onResolutionChange}
             onBulkResolution={onBulkResolution}
+            onSummaryUpdate={onSummaryUpdate}
           />
         ) : (
           <div>

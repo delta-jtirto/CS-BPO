@@ -35,8 +35,6 @@ import { buildPropertyContext } from '../../ai/kb-context';
 import type { Ticket } from '../../data/types';
 import { collection, getDocs, query, orderBy } from 'firebase/firestore';
 import { mapFirestoreMessage, type FirestoreMessage } from '../../../lib/firestore-mappers';
-import { detectInquiries } from './InquiryDetector';
-import { getHandledTypesFromPartial } from './inquiryResolutionUtils';
 
 // ─── Debounce presets (ms) — configurable per host ───────────────
 const DEBOUNCE_PRESETS: Record<string, number> = {
@@ -745,28 +743,6 @@ export function useGlobalAutoReply() {
         }
       }
 
-      // ─── [STEP 6b] Inquiry Resolution Event ────────────────────
-      // Dispatch a custom event so InboxView can update per-inquiry
-      // handled/active state without threading callbacks through AppContext.
-      if (outcomeForRouting === 'answered' || outcomeForRouting === 'partial') {
-        try {
-          const guestMessages = (ticket.messages || [])
-            .filter(m => m.sender === 'guest')
-            .map(m => m.text);
-          const allTypes = detectInquiries(guestMessages, ticket.tags ?? [], ticket.summary ?? '')
-            .map(inq => inq.type);
-          const handledTypes = outcomeForRouting === 'answered'
-            ? allTypes
-            : getHandledTypesFromPartial(allTypes, output.escalate_topics);
-          if (handledTypes.length > 0) {
-            window.dispatchEvent(new CustomEvent('inquiry-resolution', {
-              detail: { ticketId, handledTypes },
-            }));
-          }
-        } catch (e) {
-          console.warn('[AutoReply] Failed to emit inquiry-resolution event:', e);
-        }
-      }
 
       // ─── [STEP 7] Safety Flag Toast ────────────────────────────
       // Shown after routing so it doesn't interfere with routing toasts.

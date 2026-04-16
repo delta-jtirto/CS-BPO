@@ -1,10 +1,5 @@
 import { detectInquiries, scoreKBForInquiry, type DetectedInquiry } from '../inbox/InquiryDetector';
 import type { InquiryResolutionMap, InquiryResolutionState } from '../../data/types';
-import {
-  detectAgentCoverage,
-  detectReopenedInquiries,
-  reconstructResolutionState,
-} from '../inbox/inquiryResolutionUtils';
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router';
 import {
@@ -333,6 +328,7 @@ export function InboxView() {
   const [classifiedInquiries, setClassifiedInquiries] = useState<DetectedInquiry[]>([]);
   const [inquiryResolutions, setInquiryResolutions] = useState<InquiryResolutionMap>({});
   const [summaryCollapsed, setSummaryCollapsed] = useState(true);
+  const [aiSummary, setAiSummary] = useState<string | null>(null);
   const [viewedTickets, setViewedTickets] = useState<Record<string, number>>({});
   const [cardMenuOpen, setCardMenuOpen] = useState<string | null>(null);
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
@@ -416,77 +412,13 @@ export function InboxView() {
     setShowSmartReply(false);
     setGuestMode(false);
     setViewedTickets(prev => ({ ...prev, [activeTicket.id]: getMessages(activeTicket).length }));
-    // Reset inquiry resolution state on ticket switch
+    // Reset inquiry resolution state and AI summary on ticket switch
     setInquiryResolutions({});
+    setAiSummary(null);
   }, [activeTicket?.id]);
 
-  // Reconstruct resolution state from system messages once inquiries are classified
-  const prevReconstructKeyRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (!activeTicket || classifiedInquiries.length === 0) return;
-    const key = `${activeTicket.id}:${classifiedInquiries.length}`;
-    if (prevReconstructKeyRef.current === key) return;
-    prevReconstructKeyRef.current = key;
-    const msgs = getMessages(activeTicket);
-    const types = classifiedInquiries.map(inq => inq.type);
-    const reconstructed = reconstructResolutionState(msgs, types);
-    if (Object.keys(reconstructed).length > 0) {
-      setInquiryResolutions(reconstructed);
-    }
-  }, [activeTicket?.id, classifiedInquiries]);
-
-  // Layer 1: Listen for auto-reply resolution events
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const detail = (e as CustomEvent).detail as { ticketId: string; handledTypes: string[] };
-      if (detail.ticketId !== activeTicket?.id) return;
-      setInquiryResolutions(prev => {
-        const next = { ...prev };
-        for (const type of detail.handledTypes) {
-          next[type] = { handled: true, source: 'ai', updatedAt: Date.now() };
-        }
-        return next;
-      });
-    };
-    window.addEventListener('inquiry-resolution', handler);
-    return () => window.removeEventListener('inquiry-resolution', handler);
-  }, [activeTicket?.id]);
-
-  // Re-open detection: watch for new guest messages that match handled inquiries
-  const prevGuestMsgCountRef = useRef<number>(0);
-  useEffect(() => {
-    if (!activeTicket) return;
-    const msgs = getMessages(activeTicket);
-    const guestMsgs = msgs.filter(m => m.sender === 'guest');
-    if (guestMsgs.length <= prevGuestMsgCountRef.current) {
-      prevGuestMsgCountRef.current = guestMsgs.length;
-      return;
-    }
-    prevGuestMsgCountRef.current = guestMsgs.length;
-
-    // Check the newest guest message(s) against handled inquiries
-    const handledTypes = Object.entries(inquiryResolutions)
-      .filter(([, state]) => state.handled)
-      .map(([type]) => type);
-    if (handledTypes.length === 0) return;
-
-    const inquiriesByType: Record<string, DetectedInquiry> = {};
-    for (const inq of classifiedInquiries) inquiriesByType[inq.type] = inq;
-
-    const lastGuestMsg = guestMsgs[guestMsgs.length - 1];
-    const reopened = detectReopenedInquiries(lastGuestMsg.text, handledTypes, inquiriesByType);
-    if (reopened.length > 0) {
-      setInquiryResolutions(prev => {
-        const next = { ...prev };
-        for (const type of reopened) {
-          next[type] = { handled: false, source: prev[type]?.source ?? 'ai', updatedAt: Date.now(), reopened: true };
-        }
-        return next;
-      });
-    }
-  }, [activeTicket?.messages?.length, classifiedInquiries, inquiryResolutions]);
-
-  // Resolution change callbacks for AssistantPanel
+  // Resolution change callbacks for AssistantPanel (manual toggles only —
+  // AI classification handles resolution detection via inq.status directly)
   const handleResolutionChange = useCallback((type: string, state: InquiryResolutionState) => {
     setInquiryResolutions(prev => ({ ...prev, [type]: state }));
   }, []);
@@ -626,48 +558,8 @@ export function InboxView() {
         addSystemMessage(activeTicket.id, `AI handled — Agent followed up.`);
       }
       addMessageToTicket(activeTicket.id, replyText.trim());
-
-      // Layer 2: Detect which active inquiries the agent's reply covers
-      const activeInquiries = classifiedInquiries.filter(
-        inq => !inquiryResolutions[inq.type]?.handled
-      );
-      if (activeInquiries.length > 0) {
-        const coveredTypes = detectAgentCoverage(replyText.trim(), activeInquiries);
-        if (coveredTypes.length > 0) {
-          setInquiryResolutions(prev => {
-            const next = { ...prev };
-            for (const type of coveredTypes) {
-              // Don't downgrade AI-handled to heuristic
-              if (!next[type]?.handled || next[type]?.source !== 'ai') {
-                next[type] = { handled: true, source: 'heuristic', updatedAt: Date.now() };
-              }
-            }
-            return next;
-          });
-          // Undo toast for heuristic-detected resolutions
-          const coveredLabels = coveredTypes
-            .map(type => classifiedInquiries.find(inq => inq.type === type)?.label)
-            .filter(Boolean);
-          if (coveredLabels.length > 0) {
-            toast(`Marked ${coveredLabels.join(', ')} as handled`, {
-              description: 'Based on your reply.',
-              duration: 5000,
-              action: {
-                label: 'Undo',
-                onClick: () => {
-                  setInquiryResolutions(prev => {
-                    const next = { ...prev };
-                    for (const type of coveredTypes) {
-                      next[type] = { handled: false, source: 'manual', updatedAt: Date.now() };
-                    }
-                    return next;
-                  });
-                },
-              },
-            });
-          }
-        }
-      }
+      // AI re-classification (triggered by classifyKey change in AssistantPanel)
+      // handles resolution detection — no heuristic needed here.
 
       setReplyText('');
       setShowSmartReply(false);
@@ -1536,52 +1428,21 @@ export function InboxView() {
           </div>
         </div>
 
-        {/* AI Context Summary Banner */}
-        <button
-          onClick={() => setSummaryCollapsed(!summaryCollapsed)}
-          className="bg-indigo-50/50 border-b border-indigo-100 shrink-0 text-left w-full transition-all hover:bg-indigo-50/80"
-        >
-          {summaryCollapsed ? (
-            <div className="px-3 md:px-4 py-2 flex items-center gap-2">
-              <Sparkles size={12} className="text-indigo-500 shrink-0" />
-              <p className="text-xs text-indigo-800 truncate flex-1">
-                <span className="font-bold">AI:</span> {activeTicket.summary}
-              </p>
-              <div className="flex items-center gap-1.5 shrink-0">
-                {activeTicket.tags.slice(0, 2).map(tag => (
-                  <span key={tag} className="text-[9px] bg-indigo-100 text-indigo-700 px-1.5 py-0.5 rounded-full">{tag}</span>
-                ))}
-                {activeTicket.tags.length > 2 && (
-                  <span className="text-[9px] text-indigo-400">+{activeTicket.tags.length - 2}</span>
-                )}
-              </div>
-              <ChevronDown size={12} className="text-indigo-400 shrink-0" />
-            </div>
-          ) : (
-            <div className="p-4">
-              <div className="flex items-start gap-3">
-                <div className="bg-indigo-100 p-2 rounded-full text-indigo-600 mt-0.5"><Sparkles size={16} /></div>
-                <div className="flex-1">
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-xs font-bold text-indigo-800 uppercase tracking-wider mb-1">AI Context Summary</h3>
-                    <ChevronDown size={12} className="text-indigo-400 rotate-180" />
-                  </div>
-                  <p className="text-sm text-indigo-900 leading-relaxed">{activeTicket.summary}</p>
-                  <div className="flex gap-2 mt-2 flex-wrap">
-                    {activeTicket.tags.map(tag => (
-                      <span key={tag} className="text-[10px] bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full flex items-center gap-1">
-                        <Tag size={8} /> {tag}
-                      </span>
-                    ))}
-                    <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full flex items-center gap-1">
-                      <Globe2 size={8} /> {activeTicket.language}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-        </button>
+        {/* AI Context Summary — single-line bar, AI-generated when available */}
+        {(aiSummary || activeTicket.summary) && (
+          <div className="px-3 md:px-4 py-1.5 flex items-center gap-2 bg-slate-50 border-b border-slate-100 shrink-0">
+            <Sparkles size={10} className="text-indigo-400 shrink-0" />
+            <p className="text-[11px] text-slate-600 truncate flex-1">
+              {aiSummary || activeTicket.summary}
+            </p>
+            {activeTicket.tags.slice(0, 2).map(tag => (
+              <span key={tag} className="text-[9px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded-full shrink-0">{tag}</span>
+            ))}
+            {activeTicket.tags.length > 2 && (
+              <span className="text-[9px] text-slate-400 shrink-0">+{activeTicket.tags.length - 2}</span>
+            )}
+          </div>
+        )}
 
         {/* BPO escalation guidance — Step 3 of Trouble Response Flow */}
         {escalationGuidance && (
@@ -2058,6 +1919,7 @@ export function InboxView() {
         inquiryResolutions={inquiryResolutions}
         onResolutionChange={handleResolutionChange}
         onBulkResolution={handleBulkResolution}
+        onSummaryUpdate={setAiSummary}
       />
 
       <InboxDialogs

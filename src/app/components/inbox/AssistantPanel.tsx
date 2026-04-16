@@ -17,6 +17,7 @@ import {
   filterGreetingNoise,
   type DetectedInquiry,
   type InquiryKBMatch,
+  type ClassifyResult,
 } from './InquiryDetector';
 import { askAI as askAIProxy, classifyInquiries as classifyInquiriesProxy } from '../../ai/api-client';
 import { buildPropertyContext } from '../../ai/kb-context';
@@ -66,6 +67,8 @@ interface AssistantPanelProps {
   onResolutionChange?: (type: string, state: InquiryResolutionState) => void;
   /** Callback to mark all inquiries handled/active at once */
   onBulkResolution?: (handled: boolean) => void;
+  /** Callback when AI generates a conversation summary */
+  onSummaryUpdate?: (summary: string) => void;
 }
 
 // ─── Form field extraction ───────────────────────────────────────────────────
@@ -201,7 +204,7 @@ interface ChatMessage {
 // Max conversation turns to send in the prompt (sliding window)
 const MAX_CONTEXT_TURNS = 3; // 3 user+assistant pairs = 6 messages
 
-export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInquiriesClassified, inquiryResolutions, onResolutionChange, onBulkResolution }: AssistantPanelProps) {
+export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInquiriesClassified, inquiryResolutions, onResolutionChange, onBulkResolution, onSummaryUpdate }: AssistantPanelProps) {
   const { kbEntries, hasApiKey: hasApiKeyFromCtx, aiModel, onboardingData, formTemplate, properties, hostSettings, promptOverrides, activeMessages } = useAppContext();
   const guestNeedsMode = hostSettings?.[0]?.demoFeatures?.guestNeedsMode ?? 'ai-context';
   const [isAnalyzing, setIsAnalyzing] = useState(true);
@@ -258,8 +261,17 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
     .filter(m => m.sender === 'guest')
     .map(m => m.text);
 
-  // Dedup key: re-classify when ticket, message count, OR property changes
-  const classifyKey = `${ticket.id}:${resolvedGuestMessages.length}:${ticket.property}`;
+  // Full conversation for AI classification (includes agent/bot replies for resolution detection)
+  const resolvedConversation = resolvedMessages
+    .filter(m => m.sender !== 'system')
+    .map(m => {
+      const role = m.sender === 'guest' ? 'Guest' : m.sender === 'bot' ? 'AI' : 'Agent';
+      return `[${role}]: ${m.text}`;
+    });
+
+  // Dedup key: re-classify when ticket, total message count, OR property changes
+  // Uses total message count (not just guest) so agent replies trigger re-classification
+  const classifyKey = `${ticket.id}:${resolvedMessages.filter(m => m.sender !== 'system').length}:${ticket.property}`;
 
   // Wrapper: set local state + notify parent (SmartReplyPanel consumes via InboxView)
   const updateAiInquiries = useCallback((result: DetectedInquiry[] | null) => {
@@ -269,22 +281,27 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
     }
   }, [onInquiriesClassified]);
 
+  /** Handle a ClassifyResult: update inquiries + emit summary */
+  const handleClassifyResult = useCallback((cr: ClassifyResult) => {
+    updateAiInquiries(cr.inquiries.length > 0 ? cr.inquiries : [fallbackGeneralInquiry(ticket)]);
+    if (cr.summary) onSummaryUpdate?.(cr.summary);
+  }, [updateAiInquiries, onSummaryUpdate, ticket]);
+
   const handleRefreshInquiries = () => {
     setIsRefreshing(true);
-    // Reset ref so the effect re-classifies next time message count changes
     llmClassifyRef.current = null;
     classifyWithLLM(
-      resolvedGuestMessages,
+      resolvedConversation,
       ticket.property,
       ticket.host.name,
       (opts) => classifyInquiriesProxy({ ...opts, model: resolveModel('classify_inquiry', promptOverrides), temperature: resolveTemperature('classify_inquiry', promptOverrides), maxTokens: resolveMaxTokens('classify_inquiry', promptOverrides) }),
       propContext,
       promptOverrides,
       guestNeedsMode,
-      true, // skipCache: force fresh LLM call regardless of cached result
-    ).then(result => {
-      llmClassifyRef.current = classifyKey; // re-lock at current key
-      updateAiInquiries(result.length > 0 ? result : [fallbackGeneralInquiry(ticket)]);
+      true,
+    ).then(cr => {
+      llmClassifyRef.current = classifyKey;
+      handleClassifyResult(cr);
     }).catch(() => {
       llmClassifyRef.current = classifyKey;
       updateAiInquiries(filterGreetingNoise(detectInquiries(resolvedGuestMessages, ticket.tags, ticket.summary)));
@@ -295,14 +312,12 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
 
   useEffect(() => {
     if (!hasApiKey) {
-      // No API key — fall back to regex synchronously
       const fallback = filterGreetingNoise(detectInquiries(resolvedGuestMessages, ticket.tags, ticket.summary));
       updateAiInquiries(fallback);
       setIsAnalyzing(false);
       return;
     }
 
-    // Don't re-classify when ticket + message count haven't changed
     if (llmClassifyRef.current === classifyKey) return;
     llmClassifyRef.current = classifyKey;
 
@@ -312,22 +327,27 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
       return;
     }
 
+    // Show inline refresh spinner (not full skeleton) when re-classifying with existing results
+    const isReClassify = aiInquiries !== null && aiInquiries.length > 0;
+    if (isReClassify) setIsRefreshing(true);
+
     classifyWithLLM(
-      resolvedGuestMessages,
+      resolvedConversation,
       ticket.property,
       ticket.host.name,
       (opts) => classifyInquiriesProxy({ ...opts, model: resolveModel('classify_inquiry', promptOverrides), temperature: resolveTemperature('classify_inquiry', promptOverrides), maxTokens: resolveMaxTokens('classify_inquiry', promptOverrides) }),
       propContext,
       promptOverrides,
       guestNeedsMode,
-    ).then(result => {
-      console.log('[AssistantPanel] LLM classified %d inquiries for key %s', result.length, classifyKey);
-      updateAiInquiries(result.length > 0 ? result : [fallbackGeneralInquiry(ticket)]);
+    ).then(cr => {
+      console.log('[AssistantPanel] LLM classified %d inquiries for key %s', cr.inquiries.length, classifyKey);
+      handleClassifyResult(cr);
     }).catch(err => {
       console.error('[AssistantPanel] LLM classification failed, falling back to regex:', err);
       updateAiInquiries(filterGreetingNoise(detectInquiries(resolvedGuestMessages, ticket.tags, ticket.summary)));
     }).finally(() => {
       setIsAnalyzing(false);
+      setIsRefreshing(false);
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [classifyKey, hasApiKey, aiModel, propContext]);
@@ -400,8 +420,14 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
   }, [inquiries, activeProp, onboardingData, formTemplate, properties, ticket.property]);
 
   // ─── Inquiry Resolution: partition into Active / Handled ───
-  const activeInquiries = inquiries.filter(inq => !inquiryResolutions?.[inq.type]?.handled);
-  const handledInquiries = inquiries.filter(inq => inquiryResolutions?.[inq.type]?.handled);
+  // Priority: manual override > AI classification > default active
+  const isHandled = (inq: DetectedInquiry) => {
+    const manual = inquiryResolutions?.[inq.type];
+    if (manual) return manual.handled; // manual toggle overrides AI
+    return inq.status === 'handled';   // AI-classified status
+  };
+  const activeInquiries = inquiries.filter(inq => !isHandled(inq));
+  const handledInquiries = inquiries.filter(inq => isHandled(inq));
   const [handledSectionOpen, setHandledSectionOpen] = useState(false);
 
   // Quick question chips (deduplicated by inquiry type)
@@ -419,12 +445,17 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
   // Reset state + load chat on ticket switch
   // isAnalyzing is set to false by the classification effect when LLM returns
   useEffect(() => {
-    setIsAnalyzing(true);
+    // Only show full skeleton on first load — keep stale inquiries visible during
+    // re-classification to avoid flash. isRefreshing handles the inline indicator.
+    if (aiInquiries === null) {
+      setIsAnalyzing(true);
+    }
     setExpandedInquiries(new Set());
     setExpandedArticle(null);
     setInputText('');
     setIsThinking(false);
-    updateAiInquiries(null);
+    // Don't clear inquiries — let them go stale briefly while re-classifying
+    // to avoid the flash of empty → skeleton → new content
     setChatMessages([]); // Clear old thread's chat immediately
     llmClassifyRef.current = null;
 
@@ -637,9 +668,6 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
             <div className="flex items-center gap-2">
               <Bot size={12} className="text-indigo-600" />
               <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Ask AI</span>
-              {hasApiKey && (
-                <span className="text-[8px] bg-emerald-50 text-emerald-600 border border-emerald-200 px-1 py-0.5 rounded font-bold">Live</span>
-              )}
             </div>
             {chatMessages.length > 0 && (
               <div className="flex items-center gap-1">
@@ -663,19 +691,24 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
             )}
           </div>
 
-          {/* Quick question chips — always visible, compact when chat has messages */}
+          {/* Quick question chips — short labels, click to ask AI about the topic */}
           {quickQuestions.length > 0 && (
-            <div className={`px-4 flex flex-wrap gap-1.5 ${chatMessages.length > 0 ? 'pb-1.5' : 'pb-2.5'}`}>
-              {quickQuestions.map(qq => (
-                <button
-                  key={qq.id}
-                  onClick={() => handleSend(qq.question)}
-                  disabled={isThinking}
-                  className="text-[10px] font-medium text-indigo-600 bg-indigo-50 border border-indigo-100 px-2 py-1 rounded-full hover:bg-indigo-100 transition-colors disabled:opacity-50 truncate max-w-full"
-                >
-                  {qq.question}
-                </button>
-              ))}
+            <div className={`px-4 flex flex-wrap gap-1 ${chatMessages.length > 0 ? 'pb-1.5' : 'pb-2.5'}`}>
+              {quickQuestions.map(qq => {
+                const inq = inquiries.find(i => i.id === qq.id);
+                const label = inq?.label || qq.type;
+                return (
+                  <button
+                    key={qq.id}
+                    onClick={() => handleSend(qq.question)}
+                    disabled={isThinking}
+                    className="text-[10px] text-slate-500 bg-slate-50 border border-slate-200 px-2 py-0.5 rounded-md hover:bg-indigo-50 hover:text-indigo-600 hover:border-indigo-100 transition-colors disabled:opacity-50"
+                    title={qq.question}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
             </div>
           )}
 
@@ -782,12 +815,14 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
           </div>
         </div>
 
-        {/* ─── Background: What the guest needs ────────────────── */}
-        <div className="p-3 pb-4">
+        {/* ─── What the guest needs ────────────────────────────── */}
+        <div className="px-3 pt-4 pb-4">
           {/* Section header */}
-          <div className="flex items-center gap-2 mb-3">
+          <div className="flex items-center gap-2 mb-2.5">
             <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">What the guest needs</span>
-            <span className="text-[10px] bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded-full font-bold tabular-nums">{activeInquiries.length}</span>
+            {activeInquiries.length > 0 && (
+              <span className="text-[10px] bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded-full font-bold tabular-nums">{activeInquiries.length}</span>
+            )}
             <button
               onClick={handleRefreshInquiries}
               disabled={isRefreshing}
@@ -799,23 +834,16 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
             {activeInquiries.length > 0 && onBulkResolution && (
               <button
                 onClick={() => onBulkResolution(true)}
-                className="text-[9px] text-slate-400 hover:text-slate-600 hover:underline transition-colors"
+                className="ml-auto text-[9px] text-slate-400 hover:text-slate-600 hover:underline transition-colors"
               >
                 Mark all handled
               </button>
             )}
-            <span className={`ml-auto text-[8px] font-semibold px-1.5 py-0.5 rounded-full border ${
-              hasApiKey
-                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                : 'bg-slate-50 text-slate-500 border-slate-200'
-            }`}>
-              {hasApiKey ? 'Live AI' : 'Template'}
-            </span>
           </div>
 
-          {/* One card per detected intent — or inline skeleton while refreshing */}
-          <div className="space-y-2">
-            {isRefreshing ? (
+          {/* Inquiry cards — keep existing cards visible during re-classification */}
+          <div className={`space-y-1.5 transition-opacity duration-200 ${isRefreshing ? 'opacity-60' : ''}`}>
+            {inquiries.length === 0 && isRefreshing ? (
               <div className="space-y-2 animate-pulse">
                 {[1, 2].map(i => (
                   <div key={i} className="rounded-xl border border-slate-100 p-3 space-y-1.5">
@@ -876,12 +904,6 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
                         <span className={`text-[11px] font-semibold leading-tight ${isHandledCard ? 'text-slate-400' : style.color}`}>{inq.label}</span>
                         {inq.aiClassified && (
                           <span className="text-[7px] font-bold text-violet-600 bg-violet-50 border border-violet-200 px-1 py-0.5 rounded">AI</span>
-                        )}
-                        {isHandledCard && resState?.source === 'ai' && (
-                          <span className="text-[7px] font-bold text-emerald-600 bg-emerald-50 border border-emerald-200 px-1 py-0.5 rounded">AI</span>
-                        )}
-                        {isHandledCard && resState?.source !== 'ai' && (
-                          <CheckSquare size={9} className="text-slate-400 shrink-0" />
                         )}
                       </div>
                       <p className="text-[10px] text-slate-400 truncate leading-tight mt-0.5">{inq.detail}</p>
@@ -1231,22 +1253,22 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
 
               {/* ── Handled section ── */}
               {handledInquiries.length > 0 && (
-                <div className="mt-3">
+                <div className="mt-2">
                   <button
                     onClick={() => setHandledSectionOpen(prev => !prev)}
-                    className="w-full flex items-center gap-2 py-1.5 group"
+                    className="w-full flex items-center gap-2 py-1 group"
                   >
-                    <div className="flex-1 h-px bg-slate-200" />
-                    <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1">
+                    <div className="flex-1 h-px bg-slate-100" />
+                    <span className="text-[9px] font-medium text-slate-300 uppercase tracking-wider flex items-center gap-1 group-hover:text-slate-400 transition-colors">
                       Handled
-                      <span className="text-[9px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded-full font-bold tabular-nums">{handledInquiries.length}</span>
-                      <ChevronDown size={10} className={`text-slate-300 transition-transform duration-200 ${handledSectionOpen ? '' : '-rotate-90'}`} />
+                      <span className="text-[9px] bg-slate-50 text-slate-400 px-1.5 py-0.5 rounded-full tabular-nums">{handledInquiries.length}</span>
+                      <ChevronDown size={9} className={`transition-transform duration-200 ${handledSectionOpen ? '' : '-rotate-90'}`} />
                     </span>
-                    <div className="flex-1 h-px bg-slate-200" />
+                    <div className="flex-1 h-px bg-slate-100" />
                   </button>
 
                   {handledSectionOpen && (
-                    <div className="space-y-1.5 mt-1.5">
+                    <div className="space-y-1 mt-1">
                       {handledInquiries.map((inq, idx) => {
                         const isHandledCard = true;
                         const resState = inquiryResolutions?.[inq.type];
@@ -1260,7 +1282,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
                         return (
                           <div
                             key={inq.id}
-                            className="rounded-xl border overflow-hidden transition-all duration-200 border-slate-100 bg-slate-50"
+                            className="rounded-lg border overflow-hidden transition-all duration-200 border-slate-100 bg-slate-50/70"
                           >
                             {/* ── Card header (handled — muted styling) ── */}
                             <div
@@ -1277,22 +1299,21 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
                                   setExpandedArticle(null);
                                 }
                               }}
-                              className={`w-full flex items-center gap-2.5 px-3 py-2 text-left transition-colors cursor-pointer ${isExpanded ? 'bg-slate-50' : 'bg-slate-50 hover:bg-slate-100/50'}`}
+                              className={`w-full flex items-center gap-2 px-2.5 py-1.5 text-left transition-colors cursor-pointer hover:bg-slate-100/50`}
                             >
                               {/* Desaturated icon */}
-                              <div className="shrink-0 w-6 h-6 rounded-full flex items-center justify-center bg-slate-100">
-                                <span className="text-slate-400">{style.icon}</span>
+                              <div className="shrink-0 w-5 h-5 rounded-full flex items-center justify-center bg-slate-100">
+                                <span className="text-slate-300" style={{ fontSize: 10 }}>{style.icon}</span>
                               </div>
 
                               {/* Label + detail (muted) */}
                               <div className="flex-1 min-w-0">
                                 <div className="flex items-center gap-1.5">
                                   <span className="text-[11px] font-semibold leading-tight text-slate-400">{inq.label}</span>
-                                  {resState?.source === 'ai' && (
-                                    <span className="text-[7px] font-bold text-emerald-600 bg-emerald-50 border border-emerald-200 px-1 py-0.5 rounded">AI</span>
-                                  )}
-                                  {resState?.source !== 'ai' && (
+                                  {resState?.source === 'manual' ? (
                                     <CheckSquare size={9} className="text-slate-400 shrink-0" />
+                                  ) : (
+                                    <span className="text-[7px] font-bold text-emerald-600 bg-emerald-50 border border-emerald-200 px-1 py-0.5 rounded">AI</span>
                                   )}
                                 </div>
                                 <p className="text-[10px] text-slate-300 truncate leading-tight mt-0.5">{inq.detail}</p>

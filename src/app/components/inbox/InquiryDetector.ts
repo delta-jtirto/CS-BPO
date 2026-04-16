@@ -37,6 +37,8 @@ export interface DetectedInquiry {
   needsKbSearch?: boolean;
   /** Structured source-tagged briefing items for the agent (used in ai-context mode) */
   context?: ContextItem[];
+  /** Resolution status — set by LLM classification when full conversation is provided */
+  status?: 'active' | 'handled';
 }
 
 export type InquiryType =
@@ -416,10 +418,16 @@ export function filterGreetingNoise(inquiries: DetectedInquiry[]): DetectedInqui
 
 /**
  * LLM-powered inquiry classification — async, called only when regex falls through.
- * Returns structured DetectedInquiry[] parsed from the LLM's JSON response.
+ * Returns structured result with inquiries and an AI-generated conversation summary.
  * Cached per message fingerprint to avoid redundant API calls.
  */
-const _classifyCache = new Map<string, DetectedInquiry[]>();
+export interface ClassifyResult {
+  inquiries: DetectedInquiry[];
+  /** AI-generated one-line summary of the conversation state */
+  summary?: string;
+}
+
+const _classifyCache = new Map<string, ClassifyResult>();
 
 export async function classifyWithLLM(
   guestMessages: string[],
@@ -430,13 +438,14 @@ export async function classifyWithLLM(
   overrides?: import('../../ai/prompts').PromptOverrides,
   mode?: 'ai-context' | 'kb-scoring',
   skipCache?: boolean,
-): Promise<DetectedInquiry[]> {
+): Promise<ClassifyResult> {
   // Cache key = prompt version + mode + guest messages + first 100 chars of KB
   // Bump PROMPT_V when prompt format changes to bust stale cache
   const PROMPT_V = 'v10';
   const cacheKey = (PROMPT_V + '|' + (mode ?? 'ai-context') + '|' + guestMessages.join('|') + '|' + (kbContext ?? '').slice(0, 100)).slice(0, 300);
   const cached = _classifyCache.get(cacheKey);
   if (cached && !skipCache) return cached;
+  const EMPTY_RESULT: ClassifyResult = { inquiries: [], summary: undefined };
 
   // Lazy-import prompts so this module stays pure (no side effects at import time)
   const { CLASSIFY_INQUIRY_USER, interpolate, resolvePrompt } = await import('../../ai/prompts');
@@ -461,24 +470,18 @@ export async function classifyWithLLM(
       userPrompt,
     });
 
-    // Parse JSON from the LLM response — robustly extract the JSON array
+    // Parse JSON from the LLM response — handles both { summary, inquiries } and legacy [...] formats
     let jsonText = result.text.trim();
     // Strip markdown code fences (```json ... ```)
     if (jsonText.startsWith('```')) {
       jsonText = jsonText.replace(/^```[a-z]*\s*/i, '').replace(/\s*```[\s\S]*$/, '').trim();
-    }
-    // Belt-and-suspenders: find the outermost [ ... ] array even if there's preamble/postamble
-    const arrayStart = jsonText.indexOf('[');
-    const arrayEnd = jsonText.lastIndexOf(']');
-    if (arrayStart !== -1 && arrayEnd > arrayStart) {
-      jsonText = jsonText.slice(arrayStart, arrayEnd + 1);
     }
     // Fix unescaped newlines inside JSON string values (model sometimes outputs real newlines)
     jsonText = jsonText.replace(/"(?:[^"\\]|\\.)*"/gs, (m) =>
       m.replace(/\n/g, '\\n').replace(/\r/g, '')
     );
 
-    const parsed = JSON.parse(jsonText) as Array<{
+    type RawInquiry = {
       type: string;
       label: string;
       detail: string;
@@ -486,15 +489,53 @@ export async function classifyWithLLM(
       relevantTags?: string[];
       keywords?: string[];
       needsKbSearch?: boolean;
+      status?: 'active' | 'handled';
       context?: ContextItem[] | string;
-    }>;
+    };
 
-    if (!Array.isArray(parsed) || parsed.length === 0) {
-      console.log('[InquiryDetector] LLM returned empty or non-array, keeping general fallback');
-      return [];
+    let rawItems: RawInquiry[];
+    let aiSummary: string | undefined;
+
+    // Try parsing as { summary, inquiries } object first
+    const objStart = jsonText.indexOf('{');
+    const objEnd = jsonText.lastIndexOf('}');
+    if (objStart !== -1 && objEnd > objStart) {
+      try {
+        const obj = JSON.parse(jsonText.slice(objStart, objEnd + 1)) as { summary?: string; inquiries?: RawInquiry[] };
+        if (obj.inquiries && Array.isArray(obj.inquiries)) {
+          rawItems = obj.inquiries;
+          aiSummary = obj.summary;
+        } else {
+          // Might be a single inquiry object — wrap it
+          rawItems = [obj as unknown as RawInquiry];
+        }
+      } catch {
+        // Fall back to array extraction
+        const arrayStart = jsonText.indexOf('[');
+        const arrayEnd = jsonText.lastIndexOf(']');
+        if (arrayStart !== -1 && arrayEnd > arrayStart) {
+          rawItems = JSON.parse(jsonText.slice(arrayStart, arrayEnd + 1)) as RawInquiry[];
+        } else {
+          rawItems = [];
+        }
+      }
+    } else {
+      // Legacy: bare array
+      const arrayStart = jsonText.indexOf('[');
+      const arrayEnd = jsonText.lastIndexOf(']');
+      if (arrayStart !== -1 && arrayEnd > arrayStart) {
+        rawItems = JSON.parse(jsonText.slice(arrayStart, arrayEnd + 1)) as RawInquiry[];
+      } else {
+        rawItems = [];
+      }
     }
 
-    const inquiries: DetectedInquiry[] = parsed.slice(0, 3).map((item, idx) => {
+    if (rawItems.length === 0) {
+      console.log('[InquiryDetector] LLM returned empty result, keeping general fallback');
+      return EMPTY_RESULT;
+    }
+
+    const inquiries: DetectedInquiry[] = rawItems.slice(0, 3).map((item, idx) => {
       // Clean LLM-returned keywords through the same stop-word filter
       // to prevent generic words like "policy" from causing false KB matches
       const rawKeywords = item.keywords || [];
@@ -517,22 +558,24 @@ export async function classifyWithLLM(
         aiClassified: true,
         needsKbSearch: item.needsKbSearch !== false,
         context: Array.isArray(item.context) ? item.context : [],
+        status: item.status === 'handled' ? 'handled' : 'active',
       };
     });
 
-    _classifyCache.set(cacheKey, inquiries);
+    const classifyResult: ClassifyResult = { inquiries, summary: aiSummary };
+    _classifyCache.set(cacheKey, classifyResult);
     // Cap cache at 50 entries
     if (_classifyCache.size > 50) {
       const firstKey = _classifyCache.keys().next().value;
       if (firstKey) _classifyCache.delete(firstKey);
     }
 
-    console.log('[InquiryDetector] LLM classified %d inquiries: %s',
-      inquiries.length, inquiries.map(i => i.type).join(', '));
-    return inquiries;
+    console.log('[InquiryDetector] LLM classified %d inquiries: %s | summary: %s',
+      inquiries.length, inquiries.map(i => i.type).join(', '), aiSummary ?? '(none)');
+    return classifyResult;
   } catch (err) {
     console.error('[InquiryDetector] LLM classification failed:', err);
-    return []; // Fall back to regex result (the general inquiry)
+    return EMPTY_RESULT;
   }
 }
 
