@@ -14,7 +14,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { toast } from 'sonner';
 import { useAppContext } from '../../context/AppContext';
 import { MOCK_HOSTS, MOCK_PROPERTIES } from '../../data/mock-data';
-import { parseThreadStatus } from '../../data/types';
+import { parseThreadStatus, type Message } from '../../data/types';
 import { SmartReplyPanel, type SmartReplyCache } from '../inbox/SmartReplyPanel';
 import { useIsMobile } from '../ui/use-mobile';
 import { useFirestoreMessages } from '@/hooks/use-firestore-messages';
@@ -51,11 +51,42 @@ function linkifyEmailText(text: string): React.ReactNode[] {
   });
 }
 
+/** Renders an HTML email body in a sandboxed iframe that auto-sizes to its content. */
+function EmailHtmlFrame({ html, dark }: { html: string; dark?: boolean }) {
+  const ref = useRef<HTMLIFrameElement>(null);
+  const srcDoc = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 8px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px; line-height: 1.5; color: ${dark ? '#e2e8f0' : '#1e293b'}; background: transparent; word-break: break-word; }
+    img { max-width: 100%; height: auto; display: block; }
+    a { color: #6366f1; }
+    table { max-width: 100%; border-collapse: collapse; }
+    td, th { padding: 4px 8px; }
+  </style></head><body>${html}</body></html>`;
+
+  return (
+    <iframe
+      ref={ref}
+      srcDoc={srcDoc}
+      sandbox="allow-same-origin allow-popups"
+      onLoad={() => {
+        const iframe = ref.current;
+        if (iframe?.contentDocument?.body) {
+          iframe.style.height = `${iframe.contentDocument.body.scrollHeight + 16}px`;
+        }
+      }}
+      className="w-full border-0"
+      style={{ minHeight: 60, display: 'block' }}
+      title="Email"
+    />
+  );
+}
+
 export function InboxView() {
   const { ticketId } = useParams();
   const navigate = useNavigate();
   const {
-    tickets, setTickets, resolveTicket, addMessageToTicket, injectGuestMessage,
+    tickets, setTickets, setProxyTicketProperty, resolveTicket, addMessageToTicket, injectGuestMessage,
+    pendingProxyMessages, retryPendingProxyMessage, deletePendingProxyMessage,
     activeHostFilter, agentName, devMode, resetToDemo, createTestTicket,
     deleteMessageFromTicket, kbEntries,
     draftReplies, clearDraftReply, addBotMessage, addSystemMessage,
@@ -84,6 +115,16 @@ export function InboxView() {
   } = useInboxSearch(filteredTickets);
 
   const activeTicket = (ticketId ? searchedTickets.find(t => t.id === ticketId) : searchedTickets[0]) || searchedTickets[0];
+
+  // Resolved guest name: ticket-level name → contactEmail → first guest message senderName → 'Unknown'
+  const resolvedGuestName = useMemo(() => {
+    if (!activeTicket) return 'Unknown';
+    if (activeTicket.guestName && activeTicket.guestName !== 'Unknown') return activeTicket.guestName;
+    if (activeTicket.contactEmail) return activeTicket.contactEmail;
+    const firstGuestMsg = activeMessages.find(m => m.sender === 'guest' && m.senderName);
+    if (firstGuestMsg?.senderName) return firstGuestMsg.senderName;
+    return 'Unknown';
+  }, [activeTicket, activeMessages]);
 
   // ─── Firestore messages: subscribe to active ticket's thread ───
   // Find the Firestore db instance for the active ticket's company
@@ -160,14 +201,55 @@ export function InboxView() {
 
   // Helper: get messages for a ticket — from Firestore or Supabase (activeMessages)
   // for the active ticket, or from embedded messages (mock/devMode).
+  // For proxy tickets, optimistic pending messages (sending/failed/just-sent) are
+  // merged in so the user sees their reply immediately with a delivery indicator.
+  const mergePending = useCallback((ticketId: string, base: Message[]): Message[] => {
+    const pending = pendingProxyMessages[ticketId];
+    if (!pending || pending.length === 0) return base;
+    // Hide pending 'sent' entries whose real counterpart has already arrived
+    // via Supabase Realtime (matched by text + approximate createdAt window).
+    const sixtySecs = 60_000;
+    const visiblePending = pending.filter(p => {
+      if (p.deliveryStatus !== 'sent') return true;
+      return !base.some(b =>
+        b.sender === 'agent' &&
+        b.text === p.text &&
+        Math.abs((b.createdAt ?? 0) - p.createdAt) < sixtySecs,
+      );
+    });
+    if (visiblePending.length === 0) return base;
+    return [...base, ...visiblePending].sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
+  }, [pendingProxyMessages]);
+
   const getMessages = useCallback((ticket: typeof activeTicket) => {
     if (!ticket) return [];
     // Active ticket sourced from Firestore OR proxy (Supabase): use activeMessages
     if ((ticket.firestoreThreadId || ticket.proxyConversationId) && ticket.id === activeTicket?.id && activeMessages.length > 0) {
-      return activeMessages;
+      return ticket.proxyConversationId ? mergePending(ticket.id, activeMessages) : activeMessages;
     }
-    return ticket.messages || [];
-  }, [activeTicket?.id, activeMessages]);
+    const base = ticket.messages || [];
+    return ticket.proxyConversationId ? mergePending(ticket.id, base) : base;
+  }, [activeTicket?.id, activeMessages, mergePending]);
+
+  // Dedup: once a real outbound message matching a 'sent' pending entry arrives
+  // via Realtime, drop the pending copy so the rendered list shows only one bubble.
+  useEffect(() => {
+    if (!activeTicket?.proxyConversationId) return;
+    const pending = pendingProxyMessages[activeTicket.id];
+    if (!pending || pending.length === 0) return;
+    const sixtySecs = 60_000;
+    const toRemove = pending.filter(p => {
+      if (p.deliveryStatus !== 'sent') return false;
+      return activeMessages.some(m =>
+        m.sender === 'agent' &&
+        m.text === p.text &&
+        Math.abs((m.createdAt ?? 0) - p.createdAt) < sixtySecs,
+      );
+    });
+    if (toRemove.length > 0) {
+      for (const m of toRemove) deletePendingProxyMessage(activeTicket.id, m.id);
+    }
+  }, [activeMessages, activeTicket?.id, activeTicket?.proxyConversationId, pendingProxyMessages, deletePendingProxyMessage]);
 
   // Check if the active ticket's connection is stale (expired/disconnected)
   const isActiveTicketStale = useMemo(() => {
@@ -301,7 +383,14 @@ export function InboxView() {
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [activeTicket?.messages?.length]);
+    // Also watch the lazy-loaded stores used by Firestore / proxy tickets so
+    // the thread auto-scrolls on new inbound messages, not only when the
+    // ticket's in-memory `messages` array grows.
+  }, [
+    activeTicket?.messages?.length,
+    activeMessages.length,
+    activeTicket?.id ? pendingProxyMessages[activeTicket.id]?.length : 0,
+  ]);
 
   // When ticket changes, switch mobile to thread view if a ticketId is in the URL
   useEffect(() => {
@@ -446,7 +535,9 @@ export function InboxView() {
       setReplyText('');
       setShowSmartReply(false);
       if (activeDraft) clearDraftReply(activeTicket.id);
-      toast.success('Message sent', { description: `Reply sent to ${activeTicket.guestName} via ${activeTicket.channel}` });
+      // No eager toast here — for proxy channels the message bubble itself shows
+      // sending/sent/failed state. For Firestore channels a success is implied by
+      // the message appearing in the thread via onSnapshot.
     }
   };
 
@@ -592,64 +683,64 @@ export function InboxView() {
         } bg-white border-r border-slate-200 flex-col`}
         style={!isMobile ? { width: leftCollapsed && leftOverlayOpen ? Math.min(leftWidth, 360) : leftCollapsed ? 0 : displayLeftWidth, minWidth: leftCollapsed ? 0 : LEFT_MIN, transition: resizing ? 'none' : 'width 0.2s ease' } : undefined}
       >
-        <div className="p-4 border-b border-slate-200 bg-slate-50">
-          <h2 className="text-lg font-bold text-slate-800 flex items-center justify-between">
-            Inbox
-            <div className="flex items-center gap-2">
-              <button
-                onClick={async () => {
-                  try {
-                    const { getAccessToken, COMPANY_ID } = await import('@/lib/supabase-client');
-                    const token = await getAccessToken();
-                    const PROXY_URL = import.meta.env.VITE_CHANNEL_PROXY_URL || '';
-                    if (!token || !PROXY_URL) return;
-                    const btn = document.getElementById('email-refresh-btn');
-                    if (btn) btn.classList.add('animate-spin');
-                    const res = await fetch(`${PROXY_URL}/api/proxy/email/fetch`, {
-                      method: 'POST',
-                      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ company_id: COMPANY_ID }),
-                    });
-                    if (btn) btn.classList.remove('animate-spin');
-                    if (res.ok) {
-                      const data = await res.json();
-                      if (data.stored > 0) {
-                        const { toast } = await import('sonner');
-                        toast.success(`${data.stored} new email(s) fetched`);
-                      }
+        <div className="px-4 py-3 border-b border-slate-200 bg-slate-50 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <h2 className="text-sm font-bold text-slate-800">Inbox</h2>
+            <span className="bg-slate-200 text-slate-600 text-[11px] font-semibold px-2 py-0.5 rounded-full tabular-nums">
+              {isSearchActive ? `${searchedTickets.length}/${filteredTickets.length}` : filteredTickets.length}
+            </span>
+          </div>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={async () => {
+                try {
+                  const { getAccessToken, COMPANY_ID } = await import('@/lib/supabase-client');
+                  const token = await getAccessToken();
+                  const PROXY_URL = import.meta.env.VITE_CHANNEL_PROXY_URL || '';
+                  if (!token || !PROXY_URL) return;
+                  const btn = document.getElementById('email-refresh-btn');
+                  if (btn) btn.classList.add('animate-spin');
+                  const res = await fetch(`${PROXY_URL}/api/proxy/email/fetch`, {
+                    method: 'POST',
+                    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ company_id: COMPANY_ID }),
+                  });
+                  if (btn) btn.classList.remove('animate-spin');
+                  if (res.ok) {
+                    const data = await res.json();
+                    if (data.stored > 0) {
+                      const { toast } = await import('sonner');
+                      toast.success(`${data.stored} new email(s) fetched`);
                     }
-                  } catch {}
-                }}
-                className="w-6 h-6 rounded-md flex items-center justify-center bg-slate-200 text-slate-500 hover:bg-indigo-100 hover:text-indigo-600 transition-colors"
-                title="Check for new emails"
-              >
-                <RefreshCw id="email-refresh-btn" size={12} />
-              </button>
-              {!isMobile && (
-                <button
-                  onClick={() => { setLeftCollapsed(true); setLeftOverlayOpen(false); }}
-                  className="w-5 h-5 rounded flex items-center justify-center text-slate-300 hover:text-indigo-500 hover:bg-indigo-50 transition-colors"
-                  title="Collapse sidebar"
-                >
-                  <ChevronsLeft size={12} />
-                </button>
-              )}
+                  }
+                } catch {}
+              }}
+              className="w-6 h-6 rounded-md flex items-center justify-center text-slate-400 hover:bg-indigo-50 hover:text-indigo-600 transition-colors"
+              title="Check for new emails"
+            >
+              <RefreshCw id="email-refresh-btn" size={13} />
+            </button>
+            <button
+              onClick={() => setShowNewThread(prev => !prev)}
+              className={`w-6 h-6 rounded-md flex items-center justify-center transition-colors ${
+                showNewThread
+                  ? 'bg-indigo-600 text-white'
+                  : 'text-slate-400 hover:bg-indigo-50 hover:text-indigo-600'
+              }`}
+              title="Start a new test conversation"
+            >
+              <Plus size={14} />
+            </button>
+            {!isMobile && (
               <button
-                onClick={() => setShowNewThread(prev => !prev)}
-                className={`w-6 h-6 rounded-md flex items-center justify-center transition-colors ${
-                  showNewThread
-                    ? 'bg-indigo-600 text-white'
-                    : 'bg-slate-200 text-slate-500 hover:bg-indigo-100 hover:text-indigo-600'
-                }`}
-                title="Start a new test conversation"
+                onClick={() => { setLeftCollapsed(true); setLeftOverlayOpen(false); }}
+                className="w-6 h-6 rounded-md flex items-center justify-center text-slate-400 hover:bg-indigo-50 hover:text-indigo-600 transition-colors"
+                title="Collapse sidebar"
               >
-                <Plus size={14} />
+                <ChevronsLeft size={13} />
               </button>
-              <span className="bg-slate-200 text-slate-600 text-xs px-2 py-1 rounded-full">
-                {isSearchActive ? `${searchedTickets.length}/${filteredTickets.length}` : filteredTickets.length}
-              </span>
-            </div>
-          </h2>
+            )}
+          </div>
         </div>
 
         {/* Compact search bar */}
@@ -1061,7 +1152,17 @@ export function InboxView() {
             <div className="text-[9px] font-semibold text-slate-400 uppercase tracking-wider truncate">
               {activeTicket.property}
             </div>
-            <h1 className="text-sm font-bold truncate text-slate-800 leading-tight">{activeTicket.guestName}</h1>
+            <h1 className="text-sm font-bold truncate text-slate-800 leading-tight">{resolvedGuestName}</h1>
+            {/* Show human-readable contact info (email, phone) as subtitle.
+                For channels like LINE where channel_contact_id is a raw userId,
+                show the channel name instead. */}
+            {activeTicket.contactEmail && resolvedGuestName !== activeTicket.contactEmail && (
+              <div className="text-[10px] text-slate-400 truncate">
+                {activeTicket.contactEmail.includes('@') || activeTicket.contactEmail.startsWith('+')
+                  ? activeTicket.contactEmail
+                  : activeTicket.channel}
+              </div>
+            )}
           </div>
 
           {/* Actions — always visible */}
@@ -1413,25 +1514,31 @@ export function InboxView() {
               ) : (
                 <>
                   <span className={`text-[10px] text-slate-400 mb-1 px-1 ${msg.sender === 'guest' ? 'text-left' : 'text-right'}`}>
-                    {msg.sender === 'guest' ? activeTicket.guestName : agentName}
+                    {msg.sender === 'guest' ? (activeTicket.guestName || msg.senderName) : agentName}
                     {/* #19: Visual flag for guest-mode test messages */}
                     {msg.isGuestMode && <span className="ml-1 text-[9px] font-bold text-amber-500">(TEST)</span>}
                     {' '}&bull; {msg.time}
                   </span>
-                  <div className={`p-3 rounded-2xl shadow-sm text-sm ${
+                  <div className={`p-3 rounded-2xl shadow-sm text-sm transition-all ${
                     msg.sender === 'guest'
                       ? 'bg-white border border-slate-200 text-slate-800 rounded-tl-sm'
-                      : 'bg-indigo-600 text-white rounded-tr-sm'
-                  }`}>
+                      : msg.deliveryStatus === 'failed'
+                        ? 'bg-red-50 border border-red-300 text-red-900 rounded-tr-sm'
+                        : 'bg-indigo-600 text-white rounded-tr-sm'
+                  } ${msg.deliveryStatus === 'sending' ? 'opacity-70' : ''}`}>
                     {msg.subject && (
                       <div className={`text-[11px] font-semibold mb-1.5 pb-1.5 border-b ${
-                        msg.sender === 'guest' ? 'border-slate-200 text-slate-500' : 'border-indigo-500 text-indigo-200'
+                        msg.sender === 'guest'
+                          ? 'border-slate-200 text-slate-500'
+                          : msg.deliveryStatus === 'failed'
+                            ? 'border-red-200 text-red-500'
+                            : 'border-indigo-500 text-indigo-200'
                       }`}>{msg.subject}</div>
                     )}
                     {activeTicket.proxyChannel === 'email' ? (
-                      <span className="whitespace-pre-wrap break-words leading-relaxed">
-                        {linkifyEmailText(msg.text)}
-                      </span>
+                      msg.htmlBody
+                        ? <EmailHtmlFrame html={msg.htmlBody} dark={msg.sender !== 'guest' && msg.deliveryStatus !== 'failed'} />
+                        : <span className="whitespace-pre-wrap break-words leading-relaxed">{linkifyEmailText(msg.text)}</span>
                     ) : msg.text}
                     {msg.attachments && msg.attachments.length > 0 && (
                       <div className={`mt-2 pt-2 flex flex-col gap-1.5 border-t ${
@@ -1458,6 +1565,45 @@ export function InboxView() {
                       </div>
                     )}
                   </div>
+                  {/* Delivery status footer — sending / sent / failed with retry/delete */}
+                  {msg.sender !== 'guest' && msg.deliveryStatus && (
+                    <div className="flex items-center gap-2 mt-1 px-1 text-[10px] justify-end min-w-0">
+                      {msg.deliveryStatus === 'sending' && (
+                        <span className="flex items-center gap-1 text-slate-400">
+                          <Loader2 size={10} className="animate-spin" /> Sending…
+                        </span>
+                      )}
+                      {msg.deliveryStatus === 'sent' && (
+                        <span className="flex items-center gap-1 text-emerald-500">
+                          <CheckCircle size={10} /> Sent
+                        </span>
+                      )}
+                      {msg.deliveryStatus === 'failed' && (
+                        <>
+                          <span className="flex items-center gap-1 text-red-600 min-w-0">
+                            <AlertCircle size={10} className="shrink-0" />
+                            <span className="truncate" title={msg.deliveryError || 'Failed to send'}>
+                              Failed{msg.deliveryError ? ` — ${msg.deliveryError}` : ''}
+                            </span>
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => retryPendingProxyMessage(activeTicket.id, msg.id)}
+                            className="flex items-center gap-1 text-indigo-600 hover:text-indigo-700 hover:underline shrink-0"
+                          >
+                            <RefreshCw size={10} /> Retry
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => deletePendingProxyMessage(activeTicket.id, msg.id)}
+                            className="flex items-center gap-1 text-slate-400 hover:text-slate-600 hover:underline shrink-0"
+                          >
+                            <Trash2 size={10} /> Delete
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  )}
                 </>
               )}
             </div>
@@ -1615,8 +1761,8 @@ export function InboxView() {
               isActiveTicketStale
                 ? 'Connection lost — reconnect to reply'
                 : guestMode
-                  ? `Chat as ${activeTicket.guestName.split(' ')[0]}...`
-                  : `Reply to ${activeTicket.guestName.split(' ')[0]}... (${navigator.platform.includes('Mac') ? '\u2318' : 'Ctrl'}+Enter)`
+                  ? `Chat as ${resolvedGuestName.split(' ')[0]}...`
+                  : `Reply to ${resolvedGuestName.split(' ')[0]}... (${navigator.platform.includes('Mac') ? '\u2318' : 'Ctrl'}+Enter)`
             }
             className={`w-full rounded-xl ${isMobile ? 'p-2.5 text-[13px] min-h-[48px] max-h-[120px]' : 'p-3 text-sm min-h-[72px] max-h-[220px]'} focus:outline-none resize-none transition-all duration-300 ${
               composeHighlight
@@ -1725,6 +1871,7 @@ export function InboxView() {
         bookingLoading={bookingLoading}
         ticketNotes={ticketNotes[activeTicket.id] || ''}
         onUpdateNotes={(v) => updateTicketNotes(activeTicket.id, v)}
+        onUpdateProperty={(property) => setProxyTicketProperty(activeTicket.id, property)}
         deescalateTicket={deescalateTicket}
         onComposeReply={handleComposeReply}
         onNavigateToKB={(propId) => navigate(`/kb/${propId}`)}

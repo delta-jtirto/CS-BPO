@@ -17,6 +17,7 @@ import { type EscalationOverride } from '@/lib/compute-ticket-state';
 import { sendGuestMessage } from '@/lib/unibox-send';
 import { sendProxyMessage, isProxyChannel } from '@/lib/proxy-send';
 import { useProxyConversations } from '@/hooks/use-proxy-conversations';
+import { useConversationOverrides } from '@/hooks/use-conversation-overrides';
 import { mapProxyConversationToTicket } from '@/lib/proxy-mappers';
 import { supabase as supabaseClient, getUserCompanyIds as fetchProxyCompanyIds, getAccessToken } from '@/lib/supabase-client';
 import { toast } from 'sonner';
@@ -108,6 +109,7 @@ interface AppState {
 
   // Channel proxy (Supabase-backed channels: WhatsApp, Instagram, LINE, Email)
   proxyCompanyIds: string[];
+  setProxyTicketProperty: (ticketId: string, property: string) => void;
 
   // Firestore connections
   firestoreConnections: import('@/hooks/use-firestore-connections').InboxConnection[];
@@ -123,6 +125,12 @@ interface AppState {
 
   resolveTicket: (id: string) => void;
   addMessageToTicket: (ticketId: string, text: string) => void;
+  /** Optimistic send state for proxy-channel messages (per ticket). */
+  pendingProxyMessages: Record<string, Message[]>;
+  /** Re-send a pending message that previously failed. */
+  retryPendingProxyMessage: (ticketId: string, localMessageId: number) => void;
+  /** Remove a pending message (typically after a failure when the user gives up). */
+  deletePendingProxyMessage: (ticketId: string, localMessageId: number) => void;
   injectGuestMessage: (ticketId: string, text: string, isGuestMode?: boolean) => void;
   addBotMessage: (ticketId: string, text: string) => void;
   addSystemMessage: (ticketId: string, text: string) => void;
@@ -315,6 +323,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // so useAutoReply can re-initialize its count without false-triggering
   const firestoreSyncedTickets = useRef<Set<string>>(new Set());
 
+  // Optimistic pending messages for proxy channels (WhatsApp, Instagram, LINE, Email).
+  // Keyed by ticket id. Each entry is a Message with deliveryStatus='sending'|'sent'|'failed'.
+  // When the real message arrives via Supabase Realtime, the pending copy is removed
+  // by a dedup effect in InboxView.
+  const [pendingProxyMessages, setPendingProxyMessages] = useState<Record<string, Message[]>>({});
+
   // ─── Firestore connections ────────────────────────────────
   // Load saved connections from Supabase KV on mount
   const [initialSavedConnections, setInitialSavedConnections] = useState<SavedConnection[]>([]);
@@ -477,6 +491,30 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     pageSize: 50,
   });
 
+  // ─── Agent-side overrides on proxy conversations (Supabase-backed) ───
+  // Persists to public.conversation_overrides — shared across devices/agents,
+  // survives localStorage clears, and scoped by RLS to the user's company.
+  const { overrides: conversationOverrides, setOverride: setConversationOverride } = useConversationOverrides({
+    supabase: supabaseClient,
+    companyIds: proxyCompanyIds,
+  });
+
+  // Public API: unchanged callsite shape — ticketId is the `proxy_<uuid>` id,
+  // we strip the prefix before persisting and look up company_id from the
+  // current tickets array so callers don't have to thread it through.
+  const setProxyTicketProperty = useCallback((ticketId: string, property: string) => {
+    const ticket = tickets.find(t => t.id === ticketId);
+    const conversationId = ticket?.proxyConversationId;
+    const companyId = ticket?.proxyCompanyId;
+    if (!conversationId || !companyId) {
+      console.warn('[setProxyTicketProperty] missing proxy linkage on ticket', ticketId);
+      return;
+    }
+    // Fire-and-forget — the hook updates local state optimistically so the
+    // UI reflects the change before the network round-trip completes.
+    void setConversationOverride(conversationId, companyId, 'property', property);
+  }, [tickets, setConversationOverride]);
+
   // Merge proxy conversations into the tickets state
   // Fetch channel accounts from proxy API to get host_id mappings
   const [proxyAccountHostMap, setProxyAccountHostMap] = useState<Record<string, string>>({});
@@ -520,7 +558,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (proxyConversations.length === 0 && !proxyConversationsLoading) return;
     const defaultHost = MOCK_HOSTS[0] || { id: 'default', name: 'Default', tone: '', brandColor: '#6366f1' };
 
-    const proxyTickets = proxyConversations.map(c => {
+    const freshProxyTickets = proxyConversations.map(c => {
       // Look up host by company_id + channel (1 account per channel per company)
       const channelKey = `${c.company_id}_${c.channel}`;
       const hostId = proxyAccountHostMap[channelKey];
@@ -529,6 +567,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     });
     setTickets(prev => {
       const nonProxy = prev.filter(t => !t.proxyConversationId);
+      // Apply Supabase-persisted overrides (e.g. manually-picked property) on
+      // top of fresh channel data. Keyed by the raw conversation_id (uuid),
+      // not the prefixed ticket.id — conversation_overrides.conversation_id
+      // is the uuid from public.conversations.
+      const proxyTickets = freshProxyTickets.map(newT => {
+        const override = newT.proxyConversationId
+          ? conversationOverrides[newT.proxyConversationId]
+          : undefined;
+        // Only spread fields that are actually set — a null from Supabase
+        // shouldn't clobber a real value from the mapper.
+        const patched = { ...newT };
+        if (override?.property) patched.property = override.property;
+        return patched;
+      });
       const merged = [...nonProxy, ...proxyTickets];
       const deduped = Array.from(new Map(merged.map(t => [t.id, t])).values());
       deduped.sort((a, b) => {
@@ -538,7 +590,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       });
       return deduped;
     });
-  }, [proxyConversations, proxyConversationsLoading]);
+  // conversationOverrides must be in deps so picking a property in the UI
+  // immediately re-merges into `tickets` — otherwise the override only takes
+  // effect on the next proxy poll, and classify-inquiry fires with
+  // ticket.property='' and no property KB.
+  }, [proxyConversations, proxyConversationsLoading, conversationOverrides, proxyAccountHostMap]);
 
   // Unified initial load flag (both Firestore and proxy must resolve)
   const isInitialLoad = firestoreThreadsLoading || proxyConversationsLoading;
@@ -985,20 +1041,64 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setDraftRepliesState(prev => { const n = { ...prev }; delete n[id]; return n; });
   }, []);
 
+  // Core optimistic send used by both initial send and retry. Transitions a
+  // pending message through 'sending' → 'sent' | 'failed'.
+  const runProxySend = useCallback((
+    conversationId: string,
+    text: string,
+    ticketId: string,
+    localId: number,
+  ) => {
+    const markStatus = (status: 'sending' | 'sent' | 'failed', error?: string) => {
+      setPendingProxyMessages(prev => {
+        const list = prev[ticketId] || [];
+        const next = list.map(m =>
+          m.id === localId
+            ? { ...m, deliveryStatus: status, deliveryError: error }
+            : m,
+        );
+        return { ...prev, [ticketId]: next };
+      });
+    };
+
+    getAccessToken().then(token => {
+      if (!token) {
+        markStatus('failed', 'Not authenticated — please sign in again');
+        return;
+      }
+      sendProxyMessage(conversationId, text, token)
+        .then(() => markStatus('sent'))
+        .catch(err => markStatus('failed', err?.message ?? 'Failed to send message'));
+    }).catch(err => {
+      markStatus('failed', err?.message ?? 'Failed to send message');
+    });
+  }, []);
+
   const addMessageToTicket = useCallback((ticketId: string, text: string) => {
     const ticket = tickets.find(t => t.id === ticketId);
 
-    // For proxy channel tickets (WhatsApp, Instagram, LINE, Email): send via channel proxy
+    // For proxy channel tickets (WhatsApp, Instagram, LINE, Email): send via channel proxy.
+    // We optimistically insert a pending message so the UI can show sending / failed states
+    // with retry/delete affordances; the real row arrives later via Supabase Realtime and is
+    // deduped by InboxView.
     if (ticket?.proxyConversationId && ticket?.proxyChannel) {
-      getAccessToken().then(token => {
-        if (!token) {
-          toast.error('Not authenticated — please sign in again');
-          return;
-        }
-        sendProxyMessage(ticket.proxyConversationId!, text, token).catch(err => {
-          toast.error('Failed to send message', { description: err.message });
-        });
-      });
+      const now = Date.now();
+      // Local IDs live in a distinct numeric range from real proxy messages
+      // (real ones start at 2_000_000 in proxy-mappers.ts); use a 3M offset.
+      const localId = 3_000_000 + Math.floor(Math.random() * 1_000_000_000);
+      const pending: Message = {
+        id: localId,
+        sender: 'agent',
+        text,
+        time: new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        createdAt: now,
+        deliveryStatus: 'sending',
+      };
+      setPendingProxyMessages(prev => ({
+        ...prev,
+        [ticketId]: [...(prev[ticketId] || []), pending],
+      }));
+      runProxySend(ticket.proxyConversationId, text, ticketId, localId);
       setAutoReplyHandedOff(ticketId, false);
       return;
     }
@@ -1038,7 +1138,40 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       return { ...t, messages: [...msgs, newMsg] };
     }));
     setAutoReplyHandedOff(ticketId, false);
-  }, [tickets, firestoreConnections, setAutoReplyHandedOff]);
+  }, [tickets, firestoreConnections, setAutoReplyHandedOff, runProxySend]);
+
+  /** Re-send a previously-failed pending proxy message. */
+  const retryPendingProxyMessage = useCallback((ticketId: string, localMessageId: number) => {
+    const ticket = tickets.find(t => t.id === ticketId);
+    if (!ticket?.proxyConversationId) return;
+    const pending = (pendingProxyMessages[ticketId] || []).find(m => m.id === localMessageId);
+    if (!pending) return;
+
+    // Reset the pending message to 'sending' before firing the request.
+    setPendingProxyMessages(prev => ({
+      ...prev,
+      [ticketId]: (prev[ticketId] || []).map(m =>
+        m.id === localMessageId
+          ? { ...m, deliveryStatus: 'sending' as const, deliveryError: undefined }
+          : m,
+      ),
+    }));
+    runProxySend(ticket.proxyConversationId, pending.text, ticketId, localMessageId);
+  }, [tickets, pendingProxyMessages, runProxySend]);
+
+  /** Drop a pending proxy message (after failure, or to dedupe post-delivery). */
+  const deletePendingProxyMessage = useCallback((ticketId: string, localMessageId: number) => {
+    setPendingProxyMessages(prev => {
+      const list = prev[ticketId] || [];
+      const next = list.filter(m => m.id !== localMessageId);
+      if (next.length === 0) {
+        const copy = { ...prev };
+        delete copy[ticketId];
+        return copy;
+      }
+      return { ...prev, [ticketId]: next };
+    });
+  }, []);
 
   const injectGuestMessage = useCallback((ticketId: string, text: string, isGuestModeFlag = false) => {
     const now = Date.now();
@@ -1823,11 +1956,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     <AppContext.Provider value={{
       activeHostFilter, setActiveHostFilter,
       tickets, setTickets, activeMessages, setActiveMessages,
-      isInitialLoad, proxyCompanyIds,
+      isInitialLoad, proxyCompanyIds, setProxyTicketProperty,
       firestoreConnections, firestoreInitializing,
       addFirestoreConnection, removeFirestoreConnection, reconnectFirestore,
       escalationOverrides, handoverReasons, setHandoverReason,
-      resolveTicket, addMessageToTicket, injectGuestMessage, addBotMessage, addSystemMessage, addMultipleMessages, escalateTicketStatus, escalateTicketWithUrgency, deescalateTicket, deleteMessageFromTicket, deleteThread,
+      resolveTicket, addMessageToTicket, pendingProxyMessages, retryPendingProxyMessage, deletePendingProxyMessage, injectGuestMessage, addBotMessage, addSystemMessage, addMultipleMessages, escalateTicketStatus, escalateTicketWithUrgency, deescalateTicket, deleteMessageFromTicket, deleteThread,
       draftReplies, setDraftReply, clearDraftReply,
       ticketNotes, updateTicketNotes,
       kbEntries, addKBEntry, updateKBEntry, deleteKBEntry, deleteKBEntriesBySource,
