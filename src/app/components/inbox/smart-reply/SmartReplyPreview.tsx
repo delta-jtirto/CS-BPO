@@ -76,7 +76,7 @@ export function SmartReplyPreview({
         })}
         <button
           onClick={() => setPhase('configure')}
-          className="text-[9px] font-medium text-indigo-600 hover:text-indigo-800 ml-1 underline underline-offset-2 decoration-indigo-300"
+          className="text-[9px] font-medium text-indigo-600 hover:text-indigo-800 ml-1 underline underline-offset-2 decoration-indigo-300 p-0 leading-[inherit]"
         >
           Edit
         </button>

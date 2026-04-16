@@ -1,4 +1,10 @@
 import { detectInquiries, scoreKBForInquiry, type DetectedInquiry } from '../inbox/InquiryDetector';
+import type { InquiryResolutionMap, InquiryResolutionState } from '../../data/types';
+import {
+  detectAgentCoverage,
+  detectReopenedInquiries,
+  reconstructResolutionState,
+} from '../inbox/inquiryResolutionUtils';
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router';
 import {
@@ -88,7 +94,7 @@ export function InboxView() {
     tickets, setTickets, setProxyTicketProperty, resolveTicket, addMessageToTicket, injectGuestMessage,
     pendingProxyMessages, retryPendingProxyMessage, deletePendingProxyMessage,
     activeHostFilter, agentName, devMode, resetToDemo, createTestTicket,
-    deleteMessageFromTicket, kbEntries,
+    deleteMessageFromTicket, kbEntries, properties,
     draftReplies, clearDraftReply, addBotMessage, addSystemMessage,
     deleteThread, deescalateTicket,
     autoReplyProcessing, cancelAutoReply, autoReplyPausedTickets, toggleAutoReplyPause, setTicketAiEnabled,
@@ -211,8 +217,10 @@ export function InboxView() {
     const sixtySecs = 60_000;
     const visiblePending = pending.filter(p => {
       if (p.deliveryStatus !== 'sent') return true;
+      // Match against agent OR bot — auto-reply pending uses sender='bot' but
+      // the real message arrives via Realtime as sender='agent'.
       return !base.some(b =>
-        b.sender === 'agent' &&
+        (b.sender === 'agent' || b.sender === 'bot') &&
         b.text === p.text &&
         Math.abs((b.createdAt ?? 0) - p.createdAt) < sixtySecs,
       );
@@ -241,7 +249,7 @@ export function InboxView() {
     const toRemove = pending.filter(p => {
       if (p.deliveryStatus !== 'sent') return false;
       return activeMessages.some(m =>
-        m.sender === 'agent' &&
+        (m.sender === 'agent' || m.sender === 'bot') &&
         m.text === p.text &&
         Math.abs((m.createdAt ?? 0) - p.createdAt) < sixtySecs,
       );
@@ -319,9 +327,11 @@ export function InboxView() {
   const [replyText, setReplyText] = useState('');
   const [showResolveConfirm, setShowResolveConfirm] = useState(false);
   const [rightTab, setRightTab] = useState<'assistant' | 'details'>('assistant');
+  const [headerPropertyOpen, setHeaderPropertyOpen] = useState(false);
   const [guestMode, setGuestMode] = useState(false);
   const [showSmartReply, setShowSmartReply] = useState(false);
   const [classifiedInquiries, setClassifiedInquiries] = useState<DetectedInquiry[]>([]);
+  const [inquiryResolutions, setInquiryResolutions] = useState<InquiryResolutionMap>({});
   const [summaryCollapsed, setSummaryCollapsed] = useState(true);
   const [viewedTickets, setViewedTickets] = useState<Record<string, number>>({});
   const [cardMenuOpen, setCardMenuOpen] = useState<string | null>(null);
@@ -402,10 +412,94 @@ export function InboxView() {
   useEffect(() => {
     if (!activeTicket) return;
     setRightTab('assistant');
+    setHeaderPropertyOpen(false);
     setShowSmartReply(false);
     setGuestMode(false);
     setViewedTickets(prev => ({ ...prev, [activeTicket.id]: getMessages(activeTicket).length }));
+    // Reset inquiry resolution state on ticket switch
+    setInquiryResolutions({});
   }, [activeTicket?.id]);
+
+  // Reconstruct resolution state from system messages once inquiries are classified
+  const prevReconstructKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!activeTicket || classifiedInquiries.length === 0) return;
+    const key = `${activeTicket.id}:${classifiedInquiries.length}`;
+    if (prevReconstructKeyRef.current === key) return;
+    prevReconstructKeyRef.current = key;
+    const msgs = getMessages(activeTicket);
+    const types = classifiedInquiries.map(inq => inq.type);
+    const reconstructed = reconstructResolutionState(msgs, types);
+    if (Object.keys(reconstructed).length > 0) {
+      setInquiryResolutions(reconstructed);
+    }
+  }, [activeTicket?.id, classifiedInquiries]);
+
+  // Layer 1: Listen for auto-reply resolution events
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { ticketId: string; handledTypes: string[] };
+      if (detail.ticketId !== activeTicket?.id) return;
+      setInquiryResolutions(prev => {
+        const next = { ...prev };
+        for (const type of detail.handledTypes) {
+          next[type] = { handled: true, source: 'ai', updatedAt: Date.now() };
+        }
+        return next;
+      });
+    };
+    window.addEventListener('inquiry-resolution', handler);
+    return () => window.removeEventListener('inquiry-resolution', handler);
+  }, [activeTicket?.id]);
+
+  // Re-open detection: watch for new guest messages that match handled inquiries
+  const prevGuestMsgCountRef = useRef<number>(0);
+  useEffect(() => {
+    if (!activeTicket) return;
+    const msgs = getMessages(activeTicket);
+    const guestMsgs = msgs.filter(m => m.sender === 'guest');
+    if (guestMsgs.length <= prevGuestMsgCountRef.current) {
+      prevGuestMsgCountRef.current = guestMsgs.length;
+      return;
+    }
+    prevGuestMsgCountRef.current = guestMsgs.length;
+
+    // Check the newest guest message(s) against handled inquiries
+    const handledTypes = Object.entries(inquiryResolutions)
+      .filter(([, state]) => state.handled)
+      .map(([type]) => type);
+    if (handledTypes.length === 0) return;
+
+    const inquiriesByType: Record<string, DetectedInquiry> = {};
+    for (const inq of classifiedInquiries) inquiriesByType[inq.type] = inq;
+
+    const lastGuestMsg = guestMsgs[guestMsgs.length - 1];
+    const reopened = detectReopenedInquiries(lastGuestMsg.text, handledTypes, inquiriesByType);
+    if (reopened.length > 0) {
+      setInquiryResolutions(prev => {
+        const next = { ...prev };
+        for (const type of reopened) {
+          next[type] = { handled: false, source: prev[type]?.source ?? 'ai', updatedAt: Date.now(), reopened: true };
+        }
+        return next;
+      });
+    }
+  }, [activeTicket?.messages?.length, classifiedInquiries, inquiryResolutions]);
+
+  // Resolution change callbacks for AssistantPanel
+  const handleResolutionChange = useCallback((type: string, state: InquiryResolutionState) => {
+    setInquiryResolutions(prev => ({ ...prev, [type]: state }));
+  }, []);
+
+  const handleBulkResolution = useCallback((handled: boolean) => {
+    setInquiryResolutions(prev => {
+      const next = { ...prev };
+      for (const inq of classifiedInquiries) {
+        next[inq.type] = { handled, source: 'manual', updatedAt: Date.now() };
+      }
+      return next;
+    });
+  }, [classifiedInquiries]);
 
   useEffect(() => {
     if (!activeTicket) return;
@@ -532,6 +626,49 @@ export function InboxView() {
         addSystemMessage(activeTicket.id, `AI handled — Agent followed up.`);
       }
       addMessageToTicket(activeTicket.id, replyText.trim());
+
+      // Layer 2: Detect which active inquiries the agent's reply covers
+      const activeInquiries = classifiedInquiries.filter(
+        inq => !inquiryResolutions[inq.type]?.handled
+      );
+      if (activeInquiries.length > 0) {
+        const coveredTypes = detectAgentCoverage(replyText.trim(), activeInquiries);
+        if (coveredTypes.length > 0) {
+          setInquiryResolutions(prev => {
+            const next = { ...prev };
+            for (const type of coveredTypes) {
+              // Don't downgrade AI-handled to heuristic
+              if (!next[type]?.handled || next[type]?.source !== 'ai') {
+                next[type] = { handled: true, source: 'heuristic', updatedAt: Date.now() };
+              }
+            }
+            return next;
+          });
+          // Undo toast for heuristic-detected resolutions
+          const coveredLabels = coveredTypes
+            .map(type => classifiedInquiries.find(inq => inq.type === type)?.label)
+            .filter(Boolean);
+          if (coveredLabels.length > 0) {
+            toast(`Marked ${coveredLabels.join(', ')} as handled`, {
+              description: 'Based on your reply.',
+              duration: 5000,
+              action: {
+                label: 'Undo',
+                onClick: () => {
+                  setInquiryResolutions(prev => {
+                    const next = { ...prev };
+                    for (const type of coveredTypes) {
+                      next[type] = { handled: false, source: 'manual', updatedAt: Date.now() };
+                    }
+                    return next;
+                  });
+                },
+              },
+            });
+          }
+        }
+      }
+
       setReplyText('');
       setShowSmartReply(false);
       if (activeDraft) clearDraftReply(activeTicket.id);
@@ -899,7 +1036,7 @@ export function InboxView() {
               : lastNonSystemMsg?.sender === 'agent' ? 'You'
               : lastNonSystemMsg?.sender === 'host' ? 'Host'
               : '';
-            const previewText = lastNonSystemMsg?.text || ticket.aiHandoverReason || '';
+            const previewText = lastNonSystemMsg?.text || ticket.summary || ticket.aiHandoverReason || '';
 
             // #11/#25: Use createdAt epoch for accurate time-since calculation
             const guestMsgCount = (ticket.messages || []).filter(m => m.sender === 'guest').length;
@@ -1052,7 +1189,10 @@ export function InboxView() {
                     })()}
 
                     {/* Meta: property · company · time */}
-                    <span className="text-[10px] text-slate-400 truncate ml-0.5">
+                    <span className="text-[10px] text-slate-400 truncate ml-0.5 inline-flex items-center gap-1">
+                      {!ticket.property && !ticket.bookingId && (
+                        <AlertCircle size={9} className="text-amber-400 shrink-0" title="No property mapped" />
+                      )}
                       {ticket.property || ticket.companyName || ticket.host.name}
                       {timeSinceGuest && ` · ${timeSinceGuest}`}
                     </span>
@@ -1149,19 +1289,55 @@ export function InboxView() {
 
           {/* Guest info — takes remaining space */}
           <div className="min-w-0 flex-1">
-            <div className="text-[9px] font-semibold text-slate-400 uppercase tracking-wider truncate">
-              {activeTicket.property}
+            {/* Eyebrow: property (or mapping chip) · channel */}
+            <div className="flex items-center gap-1 truncate mb-0.5">
+              {activeTicket.property ? (
+                <span className="text-[9px] font-semibold text-slate-400 uppercase tracking-wider truncate">
+                  {activeTicket.property}
+                </span>
+              ) : headerPropertyOpen ? (
+                <select
+                  autoFocus
+                  value=""
+                  onChange={e => {
+                    if (e.target.value) {
+                      setProxyTicketProperty(activeTicket.id, e.target.value);
+                      setHeaderPropertyOpen(false);
+                      toast.success('Property mapped', { description: `Set to ${e.target.value}`, duration: 3000 });
+                    }
+                  }}
+                  onBlur={() => setHeaderPropertyOpen(false)}
+                  className="text-[10px] text-slate-700 bg-white border border-amber-300 rounded-md px-1.5 py-0.5 focus:outline-none focus:ring-1 focus:ring-amber-400 max-w-[180px]"
+                >
+                  <option value="">Select property...</option>
+                  {(() => {
+                    const hostProps = properties.filter(p => p.hostId === activeTicket.host.id).sort((a, b) => a.name.localeCompare(b.name));
+                    return hostProps.length > 0
+                      ? hostProps.map(p => <option key={p.id} value={p.name}>{p.name}</option>)
+                      : <option disabled>No properties available</option>;
+                  })()}
+                </select>
+              ) : (
+                <button
+                  onClick={() => setHeaderPropertyOpen(true)}
+                  className="inline-flex items-center gap-1 text-[9px] font-semibold px-1.5 py-0.5 rounded-full border cursor-pointer bg-amber-50 text-amber-600 border-amber-200 hover:bg-amber-100 transition-colors shrink-0"
+                >
+                  <AlertCircle size={8} /> No property
+                </button>
+              )}
+              {activeTicket.channel && (
+                <>
+                  <span className="text-[9px] text-slate-300 shrink-0">·</span>
+                  <span className="text-[9px] font-medium text-slate-400 uppercase tracking-wider shrink-0">{activeTicket.channel}</span>
+                </>
+              )}
             </div>
+            {/* Primary: guest name */}
             <h1 className="text-sm font-bold truncate text-slate-800 leading-tight">{resolvedGuestName}</h1>
-            {/* Show human-readable contact info (email, phone) as subtitle.
-                For channels like LINE where channel_contact_id is a raw userId,
-                show the channel name instead. */}
-            {activeTicket.contactEmail && resolvedGuestName !== activeTicket.contactEmail && (
-              <div className="text-[10px] text-slate-400 truncate">
-                {activeTicket.contactEmail.includes('@') || activeTicket.contactEmail.startsWith('+')
-                  ? activeTicket.contactEmail
-                  : activeTicket.channel}
-              </div>
+            {/* Subtitle: contact email or phone (not channel — already in eyebrow) */}
+            {activeTicket.contactEmail && resolvedGuestName !== activeTicket.contactEmail
+              && (activeTicket.contactEmail.includes('@') || activeTicket.contactEmail.startsWith('+')) && (
+              <div className="text-[10px] text-slate-400 truncate">{activeTicket.contactEmail}</div>
             )}
           </div>
 
@@ -1496,9 +1672,11 @@ export function InboxView() {
               ) : msg.sender === 'bot' ? (
                 <>
                   <span className="text-[10px] text-slate-400 mb-1 px-1 text-right flex items-center gap-1 justify-end">
-                    <Bot size={10} className="text-violet-500" /> AI Auto-Reply &bull; {msg.time}
+                    <Bot size={10} className="text-violet-500" />
+                    {msg.deliveryStatus === 'sending' ? 'AI Sending…' : 'AI Auto-Reply'}
+                    {' '}&bull; {msg.time}
                   </span>
-                  <div className="p-3 rounded-2xl shadow-sm text-sm bg-violet-100 border border-violet-200 text-slate-800 rounded-tr-sm">
+                  <div className={`p-3 rounded-2xl shadow-sm text-sm bg-violet-100 border border-violet-200 text-slate-800 rounded-tr-sm${msg.deliveryStatus === 'sending' ? ' opacity-70' : ''}`}>
                     {msg.text}
                   </div>
                 </>
@@ -1519,13 +1697,13 @@ export function InboxView() {
                     {msg.isGuestMode && <span className="ml-1 text-[9px] font-bold text-amber-500">(TEST)</span>}
                     {' '}&bull; {msg.time}
                   </span>
-                  <div className={`p-3 rounded-2xl shadow-sm text-sm transition-all ${
+                  <div className={`p-3 rounded-2xl shadow-sm text-sm transition-all w-fit ${
                     msg.sender === 'guest'
                       ? 'bg-white border border-slate-200 text-slate-800 rounded-tl-sm'
                       : msg.deliveryStatus === 'failed'
                         ? 'bg-red-50 border border-red-300 text-red-900 rounded-tr-sm'
                         : 'bg-indigo-600 text-white rounded-tr-sm'
-                  } ${msg.deliveryStatus === 'sending' ? 'opacity-70' : ''}`}>
+                  } ${msg.deliveryStatus === 'sending' ? 'opacity-70' : ''} ${msg.sender !== 'guest' ? 'self-end' : ''}`}>
                     {msg.subject && (
                       <div className={`text-[11px] font-semibold mb-1.5 pb-1.5 border-b ${
                         msg.sender === 'guest'
@@ -1872,10 +2050,14 @@ export function InboxView() {
         ticketNotes={ticketNotes[activeTicket.id] || ''}
         onUpdateNotes={(v) => updateTicketNotes(activeTicket.id, v)}
         onUpdateProperty={(property) => setProxyTicketProperty(activeTicket.id, property)}
+        needsPropertyMapping={!activeTicket.property && !activeTicket.bookingId}
         deescalateTicket={deescalateTicket}
         onComposeReply={handleComposeReply}
         onNavigateToKB={(propId) => navigate(`/kb/${propId}`)}
         onInquiriesClassified={setClassifiedInquiries}
+        inquiryResolutions={inquiryResolutions}
+        onResolutionChange={handleResolutionChange}
+        onBulkResolution={handleBulkResolution}
       />
 
       <InboxDialogs

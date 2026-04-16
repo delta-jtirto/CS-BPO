@@ -8,6 +8,8 @@ export interface SmartReplyCache {
   composedMessage: string;
   decisions: Record<string, 'yes' | 'no'>;
   customTexts: Record<string, string>;
+  /** True once auto-compose has been triggered for this cache key — persists across unmount/remount */
+  triggered?: boolean;
 }
 
 export interface SmartReplyPanelProps {

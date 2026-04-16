@@ -22,7 +22,13 @@ export function buildPropertyContext(
   manualKBEntries: KBEntry[],
 ): string {
   const formData = onboardingData[propId] || {};
-  const lines: string[] = [`[Property: ${propName}]`];
+  // When no property is resolved (e.g. a proxy ticket before the agent has
+  // picked one), don't emit a misleading `[Property: ]` empty header — it
+  // signals "property exists but has no data" to the LLM, which is worse
+  // than clearly saying "no property context available".
+  const lines: string[] = propName
+    ? [`[Property: ${propName}]`]
+    : ['[No property selected — property-specific knowledge base unavailable. Use general hospitality knowledge tagged source:ai as needed.]'];
 
   for (const section of formTemplate) {
     if (section.hostHidden) continue;

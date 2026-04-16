@@ -1,14 +1,14 @@
 import { useState, useEffect, useMemo, useCallback, useRef, type ReactNode } from 'react';
 import {
   Sparkles, AlertTriangle, ChevronRight, ChevronDown,
-  Zap, Shield, MessageSquare,
+  Zap, Shield, MessageSquare, CheckSquare, Square as SquareIcon,
   BookOpen, ArrowRight, Loader2, Pencil,
   Bot, ArrowDown, Copy, RotateCcw, Trash2, Send, PawPrint, RefreshCw, CornerDownLeft
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useAppContext } from '../../context/AppContext';
 import { ScopeBadge } from '../shared/ScopeBadge';
-import type { Ticket } from '../../data/types';
+import type { Ticket, InquiryResolutionMap, InquiryResolutionState } from '../../data/types';
 import type { OnboardingSection } from '../../data/onboarding-template';
 import {
   detectInquiries,
@@ -37,6 +37,22 @@ import {
 // Inquiry type → icon + color mapping
 const INQUIRY_STYLE = { icon: <MessageSquare size={12} />, color: 'text-slate-600', bg: 'bg-slate-50', border: 'border-slate-200' };
 
+/**
+ * Filter out LLM-hallucinated filler text from context items.
+ * When the model has no real KB data it sometimes populates context with
+ * vague phrases ("I will look into this", "Let me check") instead of
+ * leaving the array empty as instructed. We treat those as empty.
+ */
+const FILLER_PATTERNS = [
+  /^i will\b/i, /^i'll\b/i, /^i can\b/i, /^let me\b/i, /^please\b/i,
+  /\blook into\b/i, /\bget back\b/i, /\bfollow up\b/i, /\binvestigate\b/i,
+  /\bcheck for you\b/i, /\bfind out\b/i, /\bmore information\b/i,
+];
+function isSubstantiveContextItem(item: { text: string }): boolean {
+  const text = item.text.trim();
+  return text.length >= 10 && !FILLER_PATTERNS.some(p => p.test(text));
+}
+
 
 interface AssistantPanelProps {
   ticket: Ticket;
@@ -44,47 +60,15 @@ interface AssistantPanelProps {
   onNavigateToKB: (propId: string) => void;
   /** Called whenever inquiry classification finishes — lets parent share context with SmartReplyPanel */
   onInquiriesClassified?: (inquiries: DetectedInquiry[]) => void;
+  /** Per-inquiry handled/active state from the three-layer resolution system */
+  inquiryResolutions?: InquiryResolutionMap;
+  /** Callback when a single inquiry's resolution state changes (manual toggle) */
+  onResolutionChange?: (type: string, state: InquiryResolutionState) => void;
+  /** Callback to mark all inquiries handled/active at once */
+  onBulkResolution?: (handled: boolean) => void;
 }
 
 // ─── Form field extraction ───────────────────────────────────────────────────
-
-/** Which form sections/fields are relevant per inquiry type */
-const INQUIRY_FORM_MAP: Record<string, { sectionId: string; fieldIds?: string[] }[]> = {
-  wifi:        [{ sectionId: 'wifi' }],
-  checkin:     [
-    { sectionId: 'checkinout', fieldIds: ['checkinTime', 'earlyCheckin', 'lateNightCheckin'] },
-    { sectionId: 'access',     fieldIds: ['entryProcedure', 'lockType', 'lockTroubleshootingProperty'] },
-  ],
-  checkout:    [
-    { sectionId: 'checkinout', fieldIds: ['checkoutTime', 'lateCheckout', 'checkoutProcedure'] },
-  ],
-  luggage:     [
-    { sectionId: 'checkinout', fieldIds: ['luggageStorage'] },
-    { sectionId: 'nearby',     fieldIds: ['coinLockers'] },
-  ],
-  maintenance: [
-    { sectionId: 'emergency',  fieldIds: ['repairName', 'repairPhone', 'repairNotes', 'onsiteResponseName', 'onsiteResponsePhone', 'onsiteResponseNotes', 'nearestHospital'] },
-  ],
-  noise:       [{ sectionId: 'rules',    fieldIds: ['quietHours', 'partyPolicy', 'visitorPolicy'] }],
-  pet:         [{ sectionId: 'rules',    fieldIds: ['petPolicy'] }],
-  houserules:  [{ sectionId: 'rules' }],
-  amenities:   [{ sectionId: 'amenities', fieldIds: ['kitchenEquipment', 'laundry', 'entertainment', 'otherCommonSupplies', 'toiletries', 'spareSupplies'] }],
-  food:        [{ sectionId: 'nearby',   fieldIds: ['restaurants', 'convenienceStore', 'supermarket'] }],
-  dining:      [{ sectionId: 'nearby',   fieldIds: ['restaurants', 'convenienceStore', 'supermarket'] }],
-  restaurant:  [{ sectionId: 'nearby',   fieldIds: ['restaurants', 'convenienceStore', 'supermarket'] }],
-  nearby:      [{ sectionId: 'nearby',   fieldIds: ['restaurants', 'convenienceStore', 'supermarket', 'touristSpots'] }],
-  breakfast:   [{ sectionId: 'amenities', fieldIds: ['kitchenEquipment'] }],
-  kitchen:     [{ sectionId: 'amenities', fieldIds: ['kitchenEquipment'] }],
-  directions:  [
-    { sectionId: 'access',  fieldIds: ['nearestStation', 'airportAccess', 'parkingInfo', 'bicycleParking'] },
-    { sectionId: 'nearby',  fieldIds: ['transportDirections', 'transportApps'] },
-  ],
-  billing:     [{ sectionId: 'pricing', fieldIds: ['cancellationPolicy', 'sharedAdditionalFees', 'paymentMethods'] }],
-  general:     [
-    { sectionId: 'basics',     fieldIds: ['propertyName', 'address', 'propertyType'] },
-    { sectionId: 'checkinout', fieldIds: ['checkinTime', 'checkoutTime'] },
-  ],
-};
 
 interface FormFieldCard {
   id: string;
@@ -95,41 +79,67 @@ interface FormFieldCard {
   roomName?: string;
 }
 
+/**
+ * Scan the onboarding form for filled fields whose label/id matches any of
+ * the inquiry's LLM-generated keywords. Avoids a hardcoded slug→section map
+ * so new inquiry types Just Work without a UI code change.
+ *
+ * Matching is substring-based on the lowercased label + id. Keywords are
+ * stemmed by the LLM classifier (via `stem()` in InquiryDetector), so we
+ * also substring-match the keyword against the label to handle both
+ * `park` ↔ `parking` and `restaurant` ↔ `restaurants`.
+ */
 function extractFormFields(
-  inqType: string,
+  keywords: string[],
   propId: string,
   onboardingData: Record<string, Record<string, string>>,
   formTemplate: OnboardingSection[],
   roomNames?: string[],
 ): FormFieldCard[] {
-  const sectionGroups = INQUIRY_FORM_MAP[inqType] || [];
+  if (!keywords.length) return [];
+  const kws = keywords.map(k => k.toLowerCase()).filter(k => k.length >= 3);
+  if (!kws.length) return [];
+
+  const matches = (label: string, id: string): boolean => {
+    const haystack = `${label.toLowerCase()} ${id.toLowerCase()}`;
+    return kws.some(kw => haystack.includes(kw) || kw.includes(id.toLowerCase()));
+  };
+
   const formData = onboardingData[propId] || {};
   const results: FormFieldCard[] = [];
 
-  for (const { sectionId, fieldIds } of sectionGroups) {
-    const section = formTemplate.find(s => s.id === sectionId);
-    if (!section) continue;
-
-    const fieldsToCheck = fieldIds
-      ? section.fields.filter(f => fieldIds.includes(f.id))
-      : section.fields.filter(f => !f.hostHidden);
+  for (const section of formTemplate) {
+    if (section.hostHidden || section.id === 'faqs') continue;
+    const candidateFields = section.fields.filter(f => !f.hostHidden && matches(f.label, f.id));
+    if (!candidateFields.length) continue;
 
     if (section.perRoom) {
-      for (let r = 0; r < 20; r++) {
-        let foundAny = false;
-        for (const field of fieldsToCheck) {
-          const val = formData[`${sectionId}__room${r}__${field.id}`]?.trim();
+      const maxRooms = roomNames?.length ?? 20;
+      for (let r = 0; r < maxRooms; r++) {
+        for (const field of candidateFields) {
+          const val = formData[`${section.id}__room${r}__${field.id}`]?.trim();
           if (val) {
-            foundAny = true;
-            results.push({ id: `${sectionId}-room${r}-${field.id}`, label: field.label, value: val, sectionTitle: section.title, roomName: roomNames?.[r] });
+            results.push({
+              id: `${section.id}-room${r}-${field.id}`,
+              label: field.label,
+              value: val,
+              sectionTitle: section.title,
+              roomName: roomNames?.[r],
+            });
           }
         }
-        if (!foundAny && r > 0) break;
       }
     } else {
-      for (const field of fieldsToCheck) {
-        const val = formData[`${sectionId}__${field.id}`]?.trim();
-        if (val) results.push({ id: `${sectionId}-${field.id}`, label: field.label, value: val, sectionTitle: section.title });
+      for (const field of candidateFields) {
+        const val = formData[`${section.id}__${field.id}`]?.trim();
+        if (val) {
+          results.push({
+            id: `${section.id}-${field.id}`,
+            label: field.label,
+            value: val,
+            sectionTitle: section.title,
+          });
+        }
       }
     }
   }
@@ -191,7 +201,7 @@ interface ChatMessage {
 // Max conversation turns to send in the prompt (sliding window)
 const MAX_CONTEXT_TURNS = 3; // 3 user+assistant pairs = 6 messages
 
-export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInquiriesClassified }: AssistantPanelProps) {
+export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInquiriesClassified, inquiryResolutions, onResolutionChange, onBulkResolution }: AssistantPanelProps) {
   const { kbEntries, hasApiKey: hasApiKeyFromCtx, aiModel, onboardingData, formTemplate, properties, hostSettings, promptOverrides, activeMessages } = useAppContext();
   const guestNeedsMode = hostSettings?.[0]?.demoFeatures?.guestNeedsMode ?? 'ai-context';
   const [isAnalyzing, setIsAnalyzing] = useState(true);
@@ -240,7 +250,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
   // For Firestore tickets, activeMessages (updated directly by the subscription) is more
   // up-to-date than ticket.messages (which goes through a setTickets → re-render cycle).
   // Fall back to ticket.messages for non-Firestore / mock tickets.
-  const resolvedMessages = ticket.firestoreThreadId && activeMessages.length > 0
+  const resolvedMessages = (ticket.firestoreThreadId || ticket.proxyConversationId) && activeMessages.length > 0
     ? activeMessages
     : (ticket.messages || []);
 
@@ -248,8 +258,8 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
     .filter(m => m.sender === 'guest')
     .map(m => m.text);
 
-  // Dedup key: re-classify when ticket OR guest message count changes
-  const classifyKey = `${ticket.id}:${resolvedGuestMessages.length}`;
+  // Dedup key: re-classify when ticket, message count, OR property changes
+  const classifyKey = `${ticket.id}:${resolvedGuestMessages.length}:${ticket.property}`;
 
   // Wrapper: set local state + notify parent (SmartReplyPanel consumes via InboxView)
   const updateAiInquiries = useCallback((result: DetectedInquiry[] | null) => {
@@ -370,19 +380,29 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
   // Extract relevant form fields per inquiry from onboardingData
   // Fields are deduplicated across inquiry cards — a field shown in card #1 won't repeat in card #2
   const formFieldsByInquiry = useMemo(() => {
+    // Resolve the prop from ticket.property first (set by the manual picker on
+    // proxy tickets), falling back to activeProp. This mirrors propContext so
+    // proxy tickets read the same onboarding data that gets injected into the
+    // classify prompt — otherwise activeProp can point at a stale default and
+    // formData comes back empty.
     const prop = properties.find(p => p.name === ticket.property) ?? activeProp;
     const roomNames = prop?.roomNames
       ?? (prop?.units === 1 ? ['Entire Property'] : Array.from({ length: prop?.units ?? 1 }, (_, i) => `Unit ${i + 1}`));
     const result: Record<string, FormFieldCard[]> = {};
     const seenFieldIds = new Set<string>();
     for (const inq of inquiries) {
-      const fields = extractFormFields(inq.type, activeProp?.id || '', onboardingData, formTemplate, roomNames)
+      const fields = extractFormFields(inq.keywords ?? [], prop?.id || '', onboardingData, formTemplate, roomNames)
         .filter(f => !seenFieldIds.has(f.id));
       for (const f of fields) seenFieldIds.add(f.id);
       result[inq.id] = fields;
     }
     return result;
-  }, [inquiries, activeProp?.id, onboardingData, formTemplate, properties, ticket.property]);
+  }, [inquiries, activeProp, onboardingData, formTemplate, properties, ticket.property]);
+
+  // ─── Inquiry Resolution: partition into Active / Handled ───
+  const activeInquiries = inquiries.filter(inq => !inquiryResolutions?.[inq.type]?.handled);
+  const handledInquiries = inquiries.filter(inq => inquiryResolutions?.[inq.type]?.handled);
+  const [handledSectionOpen, setHandledSectionOpen] = useState(false);
 
   // Quick question chips (deduplicated by inquiry type)
   const quickQuestions = useMemo(() => {
@@ -767,7 +787,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
           {/* Section header */}
           <div className="flex items-center gap-2 mb-3">
             <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">What the guest needs</span>
-            <span className="text-[10px] bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded-full font-bold tabular-nums">{inquiries.length}</span>
+            <span className="text-[10px] bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded-full font-bold tabular-nums">{activeInquiries.length}</span>
             <button
               onClick={handleRefreshInquiries}
               disabled={isRefreshing}
@@ -776,6 +796,14 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
             >
               <RefreshCw size={11} className={isRefreshing ? 'animate-spin' : ''} />
             </button>
+            {activeInquiries.length > 0 && onBulkResolution && (
+              <button
+                onClick={() => onBulkResolution(true)}
+                className="text-[9px] text-slate-400 hover:text-slate-600 hover:underline transition-colors"
+              >
+                Mark all handled
+              </button>
+            )}
             <span className={`ml-auto text-[8px] font-semibold px-1.5 py-0.5 rounded-full border ${
               hasApiKey
                 ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
@@ -797,7 +825,11 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
                   </div>
                 ))}
               </div>
-            ) : inquiries.map((inq, idx) => {
+            ) : (<>
+              {/* ── Active inquiries ── */}
+              {activeInquiries.map((inq, idx) => {
+              const isHandledCard = false;
+              const resState = inquiryResolutions?.[inq.type];
               const style = INQUIRY_STYLE;
               const isExpanded = expandedInquiries.has(inq.id);
               const matches = kbMatchesByInquiry[inq.id] || [];
@@ -838,9 +870,18 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-1.5">
                         <span className="text-[9px] font-bold text-slate-300 tabular-nums">#{idx + 1}</span>
-                        <span className={`text-[11px] font-semibold leading-tight ${style.color}`}>{inq.label}</span>
+                        {resState?.reopened && !isHandledCard && (
+                          <span className="w-1.5 h-1.5 rounded-full bg-blue-500 shrink-0" title="Guest brought this topic back" />
+                        )}
+                        <span className={`text-[11px] font-semibold leading-tight ${isHandledCard ? 'text-slate-400' : style.color}`}>{inq.label}</span>
                         {inq.aiClassified && (
                           <span className="text-[7px] font-bold text-violet-600 bg-violet-50 border border-violet-200 px-1 py-0.5 rounded">AI</span>
+                        )}
+                        {isHandledCard && resState?.source === 'ai' && (
+                          <span className="text-[7px] font-bold text-emerald-600 bg-emerald-50 border border-emerald-200 px-1 py-0.5 rounded">AI</span>
+                        )}
+                        {isHandledCard && resState?.source !== 'ai' && (
+                          <CheckSquare size={9} className="text-slate-400 shrink-0" />
                         )}
                       </div>
                       <p className="text-[10px] text-slate-400 truncate leading-tight mt-0.5">{inq.detail}</p>
@@ -875,6 +916,29 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
                           </button>
                         </>
                       )}
+                      {guestNeedsMode === 'ai-context' && needsKb && (inq.context ?? []).filter(isSubstantiveContextItem).length === 0 && formFields.length === 0 && (
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" title="No info on file for this topic" />
+                      )}
+                      {/* Resolution toggle */}
+                      {onResolutionChange && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onResolutionChange(inq.type, {
+                              handled: !isHandledCard,
+                              source: 'manual',
+                              updatedAt: Date.now(),
+                            });
+                          }}
+                          className="shrink-0 p-0.5 rounded hover:bg-slate-100 transition-colors"
+                          title={isHandledCard ? 'Mark as active' : 'Mark as handled'}
+                        >
+                          {isHandledCard
+                            ? <CheckSquare size={12} className="text-emerald-500" />
+                            : <SquareIcon size={12} className="text-slate-300 hover:text-slate-500" />
+                          }
+                        </button>
+                      )}
                       <ChevronDown
                         size={13}
                         className={`text-slate-300 transition-transform duration-200 ${isExpanded ? '' : '-rotate-90'}`}
@@ -890,10 +954,44 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
                       {guestNeedsMode === 'ai-context' && (
                         <div className="px-3 py-2.5">
                           {(() => {
-                            const items = inq.context ?? [];
-                            if (items.length === 0) return (
+                            const rawItems = inq.context ?? [];
+                            // Filter out LLM-hallucinated filler so a vague "I'll look into this"
+                            // doesn't mask a genuine KB gap
+                            const llmItems = rawItems.filter(isSubstantiveContextItem);
+                            // Deterministic fallback: when the LLM returns no usable context,
+                            // surface form-field values matched by the inquiry's keywords.
+                            // Tagged "kb" so they render as authoritative facts, not estimates.
+                            const formItems = llmItems.length === 0
+                              ? formFields.map(f => ({
+                                  section: f.roomName ? `${f.sectionTitle} — ${f.roomName}` : f.sectionTitle,
+                                  text: `${f.label}: ${f.value}`,
+                                  source: 'kb' as const,
+                                }))
+                              : [];
+                            const items = llmItems.length > 0 ? llmItems : formItems;
+                            const isGreeting = inq.needsKbSearch === false;
+                            const isGap = items.length === 0 && !isGreeting;
+
+                            if (isGreeting) return (
                               <p className="text-[10px] text-slate-400 italic">No additional context needed.</p>
                             );
+
+                            if (isGap) return (
+                              <div className="flex items-start gap-2">
+                                <div className="flex-1">
+                                  <p className="text-[10px] text-amber-700 font-medium">No info on file for this topic.</p>
+                                  <p className="text-[10px] text-slate-400 mt-0.5">Add it to your KB, or ask AI to research.</p>
+                                </div>
+                                <button
+                                  onClick={() => handleSend(generateQuickQuestion(inq, ticket.property, ticket.room))}
+                                  className="shrink-0 flex items-center gap-1 text-[9px] font-semibold text-indigo-600 bg-indigo-50 border border-indigo-100 hover:bg-indigo-100 px-2 py-1 rounded-lg transition-colors"
+                                  title="Ask AI to research this topic"
+                                >
+                                  <Bot size={9} /> Ask AI
+                                </button>
+                              </div>
+                            );
+                            // else: items.length > 0 — show context items below
                             // Group by section
                             const sections = items.reduce<Record<string, typeof items>>((acc, item) => {
                               (acc[item.section] ??= []).push(item);
@@ -1130,6 +1228,162 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
                 </div>
               );
             })}
+
+              {/* ── Handled section ── */}
+              {handledInquiries.length > 0 && (
+                <div className="mt-3">
+                  <button
+                    onClick={() => setHandledSectionOpen(prev => !prev)}
+                    className="w-full flex items-center gap-2 py-1.5 group"
+                  >
+                    <div className="flex-1 h-px bg-slate-200" />
+                    <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1">
+                      Handled
+                      <span className="text-[9px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded-full font-bold tabular-nums">{handledInquiries.length}</span>
+                      <ChevronDown size={10} className={`text-slate-300 transition-transform duration-200 ${handledSectionOpen ? '' : '-rotate-90'}`} />
+                    </span>
+                    <div className="flex-1 h-px bg-slate-200" />
+                  </button>
+
+                  {handledSectionOpen && (
+                    <div className="space-y-1.5 mt-1.5">
+                      {handledInquiries.map((inq, idx) => {
+                        const isHandledCard = true;
+                        const resState = inquiryResolutions?.[inq.type];
+                        const style = INQUIRY_STYLE;
+                        const isExpanded = expandedInquiries.has(inq.id);
+                        const matches = kbMatchesByInquiry[inq.id] || [];
+                        const formFields = formFieldsByInquiry[inq.id] || [];
+                        const coverageStatus = matches.length > 0 ? 'kb' : formFields.length > 0 ? 'form' : 'none';
+                        const needsKb = inq.needsKbSearch !== false;
+
+                        return (
+                          <div
+                            key={inq.id}
+                            className="rounded-xl border overflow-hidden transition-all duration-200 border-slate-100 bg-slate-50"
+                          >
+                            {/* ── Card header (handled — muted styling) ── */}
+                            <div
+                              role="button"
+                              tabIndex={0}
+                              onClick={() => {
+                                setExpandedInquiries(prev => { const s = new Set(prev); isExpanded ? s.delete(inq.id) : s.add(inq.id); return s; });
+                                setExpandedArticle(null);
+                              }}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter' || e.key === ' ') {
+                                  e.preventDefault();
+                                  setExpandedInquiries(prev => { const s = new Set(prev); isExpanded ? s.delete(inq.id) : s.add(inq.id); return s; });
+                                  setExpandedArticle(null);
+                                }
+                              }}
+                              className={`w-full flex items-center gap-2.5 px-3 py-2 text-left transition-colors cursor-pointer ${isExpanded ? 'bg-slate-50' : 'bg-slate-50 hover:bg-slate-100/50'}`}
+                            >
+                              {/* Desaturated icon */}
+                              <div className="shrink-0 w-6 h-6 rounded-full flex items-center justify-center bg-slate-100">
+                                <span className="text-slate-400">{style.icon}</span>
+                              </div>
+
+                              {/* Label + detail (muted) */}
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-1.5">
+                                  <span className="text-[11px] font-semibold leading-tight text-slate-400">{inq.label}</span>
+                                  {resState?.source === 'ai' && (
+                                    <span className="text-[7px] font-bold text-emerald-600 bg-emerald-50 border border-emerald-200 px-1 py-0.5 rounded">AI</span>
+                                  )}
+                                  {resState?.source !== 'ai' && (
+                                    <CheckSquare size={9} className="text-slate-400 shrink-0" />
+                                  )}
+                                </div>
+                                <p className="text-[10px] text-slate-300 truncate leading-tight mt-0.5">{inq.detail}</p>
+                              </div>
+
+                              {/* Toggle + chevron */}
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                {onResolutionChange && (
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      onResolutionChange(inq.type, {
+                                        handled: false,
+                                        source: 'manual',
+                                        updatedAt: Date.now(),
+                                      });
+                                    }}
+                                    className="shrink-0 p-0.5 rounded hover:bg-slate-200 transition-colors"
+                                    title="Mark as active"
+                                  >
+                                    <CheckSquare size={12} className="text-emerald-500" />
+                                  </button>
+                                )}
+                                <ChevronDown
+                                  size={13}
+                                  className={`text-slate-300 transition-transform duration-200 ${isExpanded ? '' : '-rotate-90'}`}
+                                />
+                              </div>
+                            </div>
+
+                            {/* ── Expanded body (renders at normal contrast for readability) ── */}
+                            {isExpanded && (
+                              <div className="border-t border-slate-100 bg-white">
+                                {guestNeedsMode === 'ai-context' && (
+                                  <div className="px-3 py-2.5">
+                                    {(() => {
+                                      const rawItems = inq.context ?? [];
+                                      const llmItems = rawItems.filter(isSubstantiveContextItem);
+                                      const formItems = llmItems.length === 0
+                                        ? formFields.map(f => ({
+                                            section: f.roomName ? `${f.sectionTitle} — ${f.roomName}` : f.sectionTitle,
+                                            text: `${f.label}: ${f.value}`,
+                                            source: 'kb' as const,
+                                          }))
+                                        : [];
+                                      const items = llmItems.length > 0 ? llmItems : formItems;
+                                      const isGreeting = inq.needsKbSearch === false;
+
+                                      if (isGreeting) return (
+                                        <p className="text-[10px] text-slate-400 italic">No additional context needed.</p>
+                                      );
+                                      if (items.length === 0) return (
+                                        <p className="text-[10px] text-slate-400 italic">No info on file for this topic.</p>
+                                      );
+
+                                      const sections = items.reduce<Record<string, typeof items>>((acc, item) => {
+                                        (acc[item.section] ??= []).push(item);
+                                        return acc;
+                                      }, {});
+                                      return (
+                                        <div className="space-y-2">
+                                          {Object.entries(sections).map(([section, sectionItems]) => (
+                                            <div key={section}>
+                                              <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide mb-1">{section}</p>
+                                              <div className="space-y-0.5">
+                                                {sectionItems.map((item, i) => (
+                                                  <div key={i} className="flex gap-1.5 items-start">
+                                                    <span className="text-slate-300 shrink-0 leading-none mt-[3px]">•</span>
+                                                    <span className={`text-[11px] leading-snug flex-1 ${item.source === 'ai' ? 'text-slate-400 italic' : 'text-slate-600'}`}>
+                                                      {item.text}
+                                                    </span>
+                                                  </div>
+                                                ))}
+                                              </div>
+                                            </div>
+                                          ))}
+                                        </div>
+                                      );
+                                    })()}
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+            </>)}
           </div>
         </div>
       </div>

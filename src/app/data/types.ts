@@ -38,6 +38,7 @@ export interface Message {
   attachments?: MessageAttachment[];
   // Email-specific fields
   subject?: string;
+  htmlBody?: string; // HTML email body for rich rendering
   // Delivery status (proxy channels)
   deliveryStatus?: 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
   deliveryError?: string; // e.g. "Outside 24-hour messaging window"
@@ -83,6 +84,7 @@ export interface Ticket {
   proxyConversationId?: string;  // Supabase conversation UUID
   proxyCompanyId?: string;       // company_id from channel proxy
   proxyChannel?: string;         // raw channel: 'whatsapp' | 'instagram' | 'line' | 'email'
+  contactEmail?: string;         // raw channel_contact_id (email address for email channel)
 }
 
 export interface KBEntry {
@@ -115,3 +117,20 @@ export function parseThreadStatus(text: string): ThreadStatus {
   if (t.startsWith('guest safety flag') || t.startsWith('urgent')) return 'safety';
   return null;
 }
+
+// ─── Inquiry Resolution Tracking ────────────────────────────
+// Per-inquiry handled/active state used by the "What the Guest Needs" panel.
+// Keyed by inquiry `type` (the stable dedup key), NOT by `id`.
+
+export type ResolutionSource = 'ai' | 'heuristic' | 'manual';
+
+export interface InquiryResolutionState {
+  handled: boolean;
+  source: ResolutionSource;
+  updatedAt: number;
+  /** True when a handled inquiry was pulled back to active by a new guest message */
+  reopened?: boolean;
+}
+
+/** Map of inquiry type → resolution state */
+export type InquiryResolutionMap = Record<string, InquiryResolutionState>;

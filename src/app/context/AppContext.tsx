@@ -18,7 +18,7 @@ import { sendGuestMessage } from '@/lib/unibox-send';
 import { sendProxyMessage, isProxyChannel } from '@/lib/proxy-send';
 import { useProxyConversations } from '@/hooks/use-proxy-conversations';
 import { useConversationOverrides } from '@/hooks/use-conversation-overrides';
-import { mapProxyConversationToTicket } from '@/lib/proxy-mappers';
+import { mapProxyConversationToTicket, markBotSent } from '@/lib/proxy-mappers';
 import { supabase as supabaseClient, getUserCompanyIds as fetchProxyCompanyIds, getAccessToken } from '@/lib/supabase-client';
 import { toast } from 'sonner';
 
@@ -1048,6 +1048,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     text: string,
     ticketId: string,
     localId: number,
+    metadata?: Record<string, unknown>,
   ) => {
     const markStatus = (status: 'sending' | 'sent' | 'failed', error?: string) => {
       setPendingProxyMessages(prev => {
@@ -1066,7 +1067,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         markStatus('failed', 'Not authenticated — please sign in again');
         return;
       }
-      sendProxyMessage(conversationId, text, token)
+      sendProxyMessage(conversationId, text, token, metadata ? { metadata } : undefined)
         .then(() => markStatus('sent'))
         .catch(err => markStatus('failed', err?.message ?? 'Failed to send message'));
     }).catch(err => {
@@ -1194,15 +1195,23 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const ticket = tickets.find(t => t.id === ticketId);
 
     // For proxy channel tickets: send via channel proxy (AI auto-reply)
+    // Use the same optimistic pending pattern as manual sends so the UI shows
+    // a sending indicator until the real message arrives via Supabase Realtime.
     if (ticket?.proxyConversationId && ticket?.proxyChannel) {
-      getAccessToken().then(token => {
-        if (!token) return;
-        sendProxyMessage(ticket.proxyConversationId!, text, token).catch(err => {
-          console.error('[AutoReply] Failed to send bot reply via proxy:', err);
-          toast.error('AI reply failed to send', { description: err.message });
-        });
-      });
-      return; // Message appears via Supabase Realtime
+      const now = Date.now();
+      const localId = 3_000_000 + Math.floor(Math.random() * 1_000_000_000);
+      const pending: Message = {
+        id: localId, sender: 'bot', text,
+        time: new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        createdAt: now, deliveryStatus: 'sending',
+      };
+      setPendingProxyMessages(prev => ({
+        ...prev,
+        [ticketId]: [...(prev[ticketId] || []), pending],
+      }));
+      markBotSent(text, now);
+      runProxySend(ticket.proxyConversationId, text, ticketId, localId, { source: 'bot' });
+      return;
     }
 
     // For Firestore-backed tickets: send via Unibox API so message is delivered
@@ -1213,6 +1222,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         const tokens = (() => { try { return JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}'); } catch { return {}; } })();
         const token = tokens[ticket.firestoreHostId];
         if (token) {
+          markBotSent(text, Date.now());
           sendGuestMessage(ticket.firestoreThreadId, conn.userId, text, token).catch(err => {
             console.error('[AutoReply] Failed to send bot reply via Unibox:', err);
             toast.error('AI reply failed to send', { description: err.message });
@@ -1253,6 +1263,44 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const addMultipleMessages = useCallback((ticketId: string, messages: { sender: Message['sender']; text: string }[]) => {
     const ticket = tickets.find(t => t.id === ticketId);
+
+    // For proxy channel tickets: bot messages go via channel proxy with optimistic
+    // pending state; system messages stay local as internal notes.
+    if (ticket?.proxyConversationId && ticket?.proxyChannel) {
+      const now = Date.now();
+      for (const msg of messages) {
+        if (msg.sender === 'bot') {
+          const localId = 3_000_000 + Math.floor(Math.random() * 1_000_000_000);
+          const pending: Message = {
+            id: localId, sender: 'bot', text: msg.text,
+            time: new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            createdAt: now, deliveryStatus: 'sending',
+          };
+          setPendingProxyMessages(prev => ({
+            ...prev,
+            [ticketId]: [...(prev[ticketId] || []), pending],
+          }));
+          markBotSent(msg.text, now);
+          runProxySend(ticket.proxyConversationId!, msg.text, ticketId, localId, { source: 'bot' });
+        }
+      }
+      const systemMsgs = messages.filter(m => m.sender === 'system');
+      if (systemMsgs.length > 0) {
+        const now = Date.now();
+        setTickets(prev => prev.map(t => {
+          if (t.id !== ticketId) return t;
+          const maxId = (t.messages || []).length > 0 ? Math.max(...(t.messages || []).map(m => m.id)) : 0;
+          const newMsgs: Message[] = systemMsgs.map((m, i) => ({
+            id: maxId + 1 + i, sender: m.sender, text: m.text,
+            time: new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            createdAt: now,
+          }));
+          return { ...t, messages: [...(t.messages || []), ...newMsgs] };
+        }));
+      }
+      return;
+    }
+
     // For Firestore-backed tickets: bot messages go via Unibox API; system messages stay local
     if (ticket?.firestoreThreadId && ticket?.firestoreHostId) {
       const conn = firestoreConnections.find(c => c.hostId === ticket.firestoreHostId && c.status === 'connected');
@@ -1262,6 +1310,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (token) {
           for (const msg of messages) {
             if (msg.sender === 'bot') {
+              markBotSent(msg.text, Date.now());
               sendGuestMessage(ticket.firestoreThreadId, conn.userId, msg.text, token).catch(err => {
                 console.error('[AutoReply] Failed to send bot reply via Unibox:', err);
               });

@@ -35,6 +35,8 @@ import { buildPropertyContext } from '../../ai/kb-context';
 import type { Ticket } from '../../data/types';
 import { collection, getDocs, query, orderBy } from 'firebase/firestore';
 import { mapFirestoreMessage, type FirestoreMessage } from '../../../lib/firestore-mappers';
+import { detectInquiries } from './InquiryDetector';
+import { getHandledTypesFromPartial } from './inquiryResolutionUtils';
 
 // ─── Debounce presets (ms) — configurable per host ───────────────
 const DEBOUNCE_PRESETS: Record<string, number> = {
@@ -68,6 +70,19 @@ const URGENCY_MAP: Record<string, { level: 'urgent' | 'warning'; sla: string }> 
   complaint:    { level: 'warning', sla: '4h' },
   // Everything else defaults to { level: 'warning', sla: '12h' }
 };
+
+/**
+ * Return a stable fingerprint for the last guest message in a list.
+ * Identical fingerprint = same message arriving again (Firestore re-subscription,
+ * page-navigation re-render, etc.) → no auto-reply re-trigger.
+ */
+function lastGuestFingerprint(messages: import('../../data/types').Message[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.sender === 'guest') return `${m.createdAt}|${(m.text ?? '').slice(0, 100)}`;
+  }
+  return '';
+}
 
 function getUrgency(inquiries: DetectedInquiry[]): { level: 'warning' | 'urgent'; sla: string } {
   let highest: { level: 'warning' | 'urgent'; sla: string } = { level: 'warning', sla: '12h' };
@@ -298,11 +313,14 @@ export function useGlobalAutoReply() {
   const autoReplyHandedOff = ctx?.autoReplyHandedOff ?? {};
   const setAutoReplyHandedOff = ctx?.setAutoReplyHandedOff ?? (() => {});
   const cancelAutoReply = ctx?.cancelAutoReply ?? (() => {});
-  const firestoreSyncedTickets = ctx?.firestoreSyncedTickets ?? { current: new Set<string>() };
   const firestoreConnections = ctx?.firestoreConnections ?? [];
+  const agentPresence = ctx?.agentPresence ?? 'away'; // default 'away' so existing behavior is preserved if context unavailable
 
-  // Track message counts per ticket (for new-message detection)
-  const prevCountsRef = useRef<Record<string, number>>({});
+  // Track last processed guest message fingerprint per ticket.
+  // Fingerprint = `${createdAt}|${text.slice(0,100)}` of the last guest message.
+  // Using a fingerprint instead of a count makes new-message detection idempotent:
+  // the same message arriving twice (Firestore re-subscription, nav back, F5) is a no-op.
+  const lastGuestMsgRef = useRef<Record<string, string>>({});
   // Track unread counts — used to detect new messages on background Firestore threads
   // (where ticket.messages is not loaded until the thread is opened)
   const prevUnreadCountsRef = useRef<Record<string, number>>({});
@@ -368,6 +386,32 @@ export function useGlobalAutoReply() {
     if (!ticket) {
       setAutoReplyProcessing(ticketId, false);
       return;
+    }
+
+    // For proxy tickets, messages live in Supabase and aren't stored in
+    // ticket.messages (to avoid feedback loops with the main detection effect).
+    // Fetch them now for the AI to work with.
+    if (ticket.proxyConversationId && (!ticket.messages || ticket.messages.length === 0)) {
+      try {
+        const { supabase } = await import('@/lib/supabase-client');
+        const { mapProxyMessageToMessage } = await import('@/lib/proxy-mappers');
+        const { data } = await supabase
+          .from('messages')
+          .select('*')
+          .eq('conversation_id', ticket.proxyConversationId)
+          .order('channel_timestamp', { ascending: true });
+        if (data && data.length > 0) {
+          const fetchedMsgs = data.map((m: any) => mapProxyMessageToMessage(m));
+          // Merge with any local bot/system messages
+          const localMsgs = (ticket.messages || []).filter(
+            m => m.sender === 'bot' || m.sender === 'system'
+          );
+          ticket = { ...ticket, messages: [...fetchedMsgs, ...localMsgs].sort((a, b) => a.createdAt - b.createdAt) };
+          console.log('[AutoReply] Fetched %d proxy messages for ticket %s', fetchedMsgs.length, ticketId);
+        }
+      } catch (err) {
+        console.error('[AutoReply] Failed to fetch proxy messages for %s:', ticketId, err);
+      }
     }
 
     // For Firestore background threads, messages aren't loaded — fetch them now so
@@ -701,6 +745,29 @@ export function useGlobalAutoReply() {
         }
       }
 
+      // ─── [STEP 6b] Inquiry Resolution Event ────────────────────
+      // Dispatch a custom event so InboxView can update per-inquiry
+      // handled/active state without threading callbacks through AppContext.
+      if (outcomeForRouting === 'answered' || outcomeForRouting === 'partial') {
+        try {
+          const guestMessages = (ticket.messages || [])
+            .filter(m => m.sender === 'guest')
+            .map(m => m.text);
+          const allTypes = detectInquiries(guestMessages, ticket.tags ?? [], ticket.summary ?? '')
+            .map(inq => inq.type);
+          const handledTypes = outcomeForRouting === 'answered'
+            ? allTypes
+            : getHandledTypesFromPartial(allTypes, output.escalate_topics);
+          if (handledTypes.length > 0) {
+            window.dispatchEvent(new CustomEvent('inquiry-resolution', {
+              detail: { ticketId, handledTypes },
+            }));
+          }
+        } catch (e) {
+          console.warn('[AutoReply] Failed to emit inquiry-resolution event:', e);
+        }
+      }
+
       // ─── [STEP 7] Safety Flag Toast ────────────────────────────
       // Shown after routing so it doesn't interfere with routing toasts.
       if (output.safetyFlagged) {
@@ -737,6 +804,10 @@ export function useGlobalAutoReply() {
   // ─── Main effect: watch all tickets for new guest messages ─────
   useEffect(() => {
     if (!hasApiKey) return;
+    // When the agent is Online, AI auto-actions are suppressed — the agent handles
+    // responses manually. Manual AI tools (compose, Ask AI) remain fully available.
+    // When Away, AI acts autonomously per autoReplyMode.
+    if (agentPresence === 'online') return;
 
     for (const ticket of tickets) {
       const hostConfig = hostSettings.find(s => s.hostId === ticket.host.id);
@@ -744,149 +815,127 @@ export function useGlobalAutoReply() {
       if (!hostConfig?.autoReply && !isExplicitlyEnabled) continue;
       if (hostConfig?.autoReplyMode === 'assist') continue;
 
-      const currentCount = (ticket.messages || []).length;
-      const prevCount = prevCountsRef.current[ticket.id];
+      const msgs = ticket.messages || [];
+      const currentCount = msgs.length; // still used for background Firestore detection
+      const currentFingerprint = lastGuestFingerprint(msgs);
       const currentUnread = ticket.unreadCount ?? 0;
       const prevUnread = prevUnreadCountsRef.current[ticket.id] ?? currentUnread;
 
-      // Initialize on first encounter
+      // ── Initialize on first encounter ──────────────────────────────────────
       if (!initializedRef.current.has(ticket.id)) {
-        prevCountsRef.current[ticket.id] = currentCount;
+        // Load the fingerprint of the last message that auto-reply already handled
+        // (persisted to sessionStorage so page refresh doesn't re-trigger old messages)
+        let savedFingerprint = '';
+        try { savedFingerprint = sessionStorage.getItem(`ar:fp:${ticket.id}`) ?? ''; } catch {}
+
+        // Baseline: prefer the saved fingerprint so we can detect truly-new messages
+        // after a refresh. If no saved fingerprint, use current (don't replay history).
+        lastGuestMsgRef.current[ticket.id] = savedFingerprint || currentFingerprint;
         prevUnreadCountsRef.current[ticket.id] = currentUnread;
         initializedRef.current.add(ticket.id);
-        
-        // If this ticket appeared AFTER initial mount (e.g. createTestTicket),
-        // and its last message is from a guest, treat it as a new guest message
-        // so auto-reply can process it.
-        const isPostMount = Date.now() - mountTimeRef.current > 1500;
-        const lastMsg = (ticket.messages || [])[(ticket.messages || []).length - 1];
-        if (isPostMount && lastMsg?.sender === 'guest') {
-          const ticketId = ticket.id;
-          console.log('[AutoReply] New ticket %s detected post-mount with guest message — processing', ticketId);
 
-          // Run through the same debounce path as normal new messages
-          if (debounceTimersRef.current[ticketId]) {
-            clearTimeout(debounceTimersRef.current[ticketId]);
-          }
+        // Post-mount new ticket (e.g. createTestTicket, or a message that arrived while
+        // the agent was away): trigger only if the last guest message wasn't already
+        // processed before this page load.
+        // Skip for proxy tickets — their messages load lazily via a sync effect, so
+        // at init time we can't distinguish "old messages loading" from "genuinely new."
+        // Proxy tickets detect new messages via the fingerprint block below once loaded.
+        const isPostMount = Date.now() - mountTimeRef.current > 1500;
+        if (isPostMount && !ticket.proxyConversationId && currentFingerprint !== '' && currentFingerprint !== savedFingerprint) {
+          const ticketId = ticket.id;
+          console.log('[AutoReply] New ticket %s post-mount with unprocessed guest message — processing', ticketId);
+          if (debounceTimersRef.current[ticketId]) clearTimeout(debounceTimersRef.current[ticketId]);
           const debounceMs = DEBOUNCE_PRESETS[hostConfig.debouncePreset || 'normal'] || DEBOUNCE_PRESETS.normal;
           autoReplyCancelledRef.current[ticketId] = false;
           setAutoReplyProcessing(ticketId, true);
           debounceTimersRef.current[ticketId] = setTimeout(() => {
-            if (autoReplyCancelledRef.current[ticketId]) {
-              setAutoReplyProcessing(ticketId, false);
-              return;
-            }
+            if (autoReplyCancelledRef.current[ticketId]) { setAutoReplyProcessing(ticketId, false); return; }
             processTicket(ticketId);
           }, debounceMs);
         }
         continue;
       }
 
-      // Re-initialize count if this ticket just received its first Firestore message
-      // sync (InboxView merges Firestore messages into ticket.messages and marks the
-      // ticket here). Without this, the count jump would look like many "new" guest
-      // messages and trigger auto-reply for the entire conversation history.
-      if (firestoreSyncedTickets.current.has(ticket.id)) {
-        firestoreSyncedTickets.current.delete(ticket.id);
-        prevCountsRef.current[ticket.id] = currentCount;
-        prevUnreadCountsRef.current[ticket.id] = currentUnread;
-        console.log('[AutoReply] Re-initialized count for %s after Firestore sync: %d msgs', ticket.id, currentCount);
-        continue;
-      }
-
-      // Detect new messages
-      if (currentCount > (prevCount || 0)) {
-        const newMessages = (ticket.messages || []).slice(prevCount || 0);
-        // #7: Include guest-mode test messages — auto-reply should respond to them too
-        const hasNewGuestMsg = newMessages.some(m => m.sender === 'guest');
+      // ── Proxy tickets: skip fingerprint detection ─────────────────────────
+      // Proxy ticket messages are NOT stored in ticket.messages (doing so creates
+      // feedback loops with this effect). Instead, proxy tickets use the unreadCount
+      // path below. processTicket fetches messages directly from Supabase when needed.
+      if (ticket.proxyConversationId) {
+        // Fall through to unreadCount detection below
+      } else {
+        // ── Idempotent new-message detection via fingerprint ─────────────────
+        // Different fingerprint = a genuinely new guest message.
+        // Same fingerprint = same message arriving again (Firestore re-sub, nav-back, F5) → skip.
+        const prevFingerprint = lastGuestMsgRef.current[ticket.id] ?? '';
+        const hasNewGuestMsg = currentFingerprint !== '' && currentFingerprint !== prevFingerprint;
 
         if (hasNewGuestMsg) {
-          // ─── Pre-checks: don't show loading for tickets that will be skipped ──
+          lastGuestMsgRef.current[ticket.id] = currentFingerprint;
+          try { sessionStorage.setItem(`ar:fp:${ticket.id}`, currentFingerprint); } catch {}
+
           const ticketId = ticket.id;
 
-          // Skip if AI is paused for this thread
           if (autoReplyPausedTickets[ticketId]) {
             console.log('[AutoReply] New guest msg on %s but AI paused — ignoring', ticketId);
-            prevCountsRef.current[ticket.id] = currentCount;
-            continue;
-          }
+          } else {
+            let cooledDown = false;
+            if (hostConfig.cooldownEnabled && (hostConfig.cooldownMinutes || 10) > 0) {
+              const cooldownMs = (hostConfig.cooldownMinutes || 10) * 60_000;
+              const recentAgentMsg = [...msgs].reverse().find(m => m.sender === 'agent' || m.sender === 'host');
+              if (recentAgentMsg?.createdAt && Date.now() - recentAgentMsg.createdAt < cooldownMs) {
+                console.log('[AutoReply] New guest msg on %s but cooldown active (%dm) — ignoring',
+                  ticketId, hostConfig.cooldownMinutes || 10);
+                cooledDown = true;
+              }
+            }
 
-          // Note: handoff no longer suppresses AI in the EFFECT — AI continues processing
-          // new guest messages even after a prior "Handed to Agent". Duplicate guest-facing
-          // holding messages are suppressed inside processTicket (escalate path).
-
-          // ─── Cooldown pre-check: don't show pending indicator if cooldown is active ──
-          if (hostConfig.cooldownEnabled && (hostConfig.cooldownMinutes || 10) > 0) {
-            const cooldownMs = (hostConfig.cooldownMinutes || 10) * 60_000;
-            const recentAgentMsg = [...(ticket.messages || [])].reverse().find(
-              m => m.sender === 'agent' || m.sender === 'host'
-            );
-            if (recentAgentMsg?.createdAt && Date.now() - recentAgentMsg.createdAt < cooldownMs) {
-              console.log('[AutoReply] New guest msg on %s but cooldown active (%dm) — ignoring',
-                ticketId, hostConfig.cooldownMinutes || 10);
-              prevCountsRef.current[ticket.id] = currentCount;
-              continue;
+            if (!cooledDown) {
+              if (debounceTimersRef.current[ticket.id]) clearTimeout(debounceTimersRef.current[ticket.id]);
+              const debounceMs = DEBOUNCE_PRESETS[hostConfig.debouncePreset || 'normal'] || DEBOUNCE_PRESETS.normal;
+              console.log('[AutoReply] New guest message on %s — starting %ds debounce', ticket.id, debounceMs / 1000);
+              autoReplyCancelledRef.current[ticketId] = false;
+              setAutoReplyProcessing(ticketId, true);
+              debounceTimersRef.current[ticketId] = setTimeout(() => {
+                if (autoReplyCancelledRef.current[ticketId]) {
+                  console.log('[AutoReply] Cancelled during debounce for %s', ticketId);
+                  setAutoReplyProcessing(ticketId, false);
+                  return;
+                }
+                console.log('[AutoReply] Debounce expired for %s — processing', ticketId);
+                processTicket(ticketId);
+              }, debounceMs);
             }
           }
-
-          // ─── Debounce: reset timer on each new guest message ──
-          if (debounceTimersRef.current[ticket.id]) {
-            clearTimeout(debounceTimersRef.current[ticket.id]);
-          }
-
-          // Use host's debounce preset (instant=2s, quick=10s, normal=30s, patient=60s)
-          const debounceMs = DEBOUNCE_PRESETS[hostConfig.debouncePreset || 'normal'] || DEBOUNCE_PRESETS.normal;
-
-          console.log('[AutoReply] New guest message on %s — starting %ds debounce',
-            ticket.id, debounceMs / 1000);
-
-          autoReplyCancelledRef.current[ticketId] = false;
-          setAutoReplyProcessing(ticketId, true);
-
-          debounceTimersRef.current[ticketId] = setTimeout(() => {
-            if (autoReplyCancelledRef.current[ticketId]) {
-              console.log('[AutoReply] Cancelled during debounce for %s', ticketId);
-              setAutoReplyProcessing(ticketId, false);
-              return;
-            }
-            console.log('[AutoReply] Debounce expired for %s — processing', ticketId);
-            processTicket(ticketId);
-          }, debounceMs);
         }
       }
 
-      // Detect new messages on background Firestore threads via unreadCount.
-      // ticket.messages is only populated when the thread is open; for background
-      // threads the message count is always 0, so we use unreadCount as the trigger.
-      const isBackgroundFirestore = !!ticket.firestoreThreadId && currentCount === 0;
-      if (isBackgroundFirestore && currentUnread > prevUnread) {
+      // Detect new messages on background threads (Firestore or proxy) via unreadCount.
+      // ticket.messages is only populated for the active thread; for background threads
+      // the message count is always 0, so we use unreadCount as the trigger.
+      const isBackground = (!!ticket.firestoreThreadId || !!ticket.proxyConversationId) && currentCount === 0;
+      if (isBackground && currentUnread > prevUnread) {
         const ticketId = ticket.id;
         if (autoReplyPausedTickets[ticketId]) {
           console.log('[AutoReply] New unread on %s but AI paused — ignoring', ticketId);
         } else {
-          if (debounceTimersRef.current[ticketId]) {
-            clearTimeout(debounceTimersRef.current[ticketId]);
-          }
+          if (debounceTimersRef.current[ticketId]) clearTimeout(debounceTimersRef.current[ticketId]);
           const debounceMs = DEBOUNCE_PRESETS[hostConfig?.debouncePreset || 'normal'] || DEBOUNCE_PRESETS.normal;
           console.log('[AutoReply] New unread on background Firestore ticket %s (%d→%d) — starting %ds debounce',
             ticket.id, prevUnread, currentUnread, debounceMs / 1000);
           autoReplyCancelledRef.current[ticketId] = false;
           setAutoReplyProcessing(ticketId, true);
           debounceTimersRef.current[ticketId] = setTimeout(() => {
-            if (autoReplyCancelledRef.current[ticketId]) {
-              setAutoReplyProcessing(ticketId, false);
-              return;
-            }
+            if (autoReplyCancelledRef.current[ticketId]) { setAutoReplyProcessing(ticketId, false); return; }
             console.log('[AutoReply] Debounce expired for background Firestore ticket %s — processing', ticketId);
             processTicket(ticketId);
           }, debounceMs);
         }
       }
 
-      prevCountsRef.current[ticket.id] = currentCount;
+      // lastGuestMsgRef is updated inline above when hasNewGuestMsg is true
       prevUnreadCountsRef.current[ticket.id] = currentUnread;
     }
-  }, [tickets, hasApiKey, hostSettings, processTicket, autoReplyPausedTickets, setAutoReplyProcessing, autoReplyCancelledRef]);
+  }, [tickets, hasApiKey, agentPresence, hostSettings, processTicket, autoReplyPausedTickets, setAutoReplyProcessing, autoReplyCancelledRef]);
 
   // Cleanup timers on unmount
   useEffect(() => {

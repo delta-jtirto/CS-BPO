@@ -223,11 +223,11 @@ Example context value:
 ]
 
 Rules:
-- Prefer "kb" items — draw from the Property Knowledge Base first
-- Use "source":"ai" ONLY for general hospitality knowledge absent from the KB — agents must treat these as estimates, not guaranteed facts
+- Prefer "kb" items — draw from the Property Knowledge Base first when relevant data exists there
+- When the KB has NO relevant data for a substantive question, DO NOT return an empty array. Instead, populate "context" with 2-4 "source":"ai" items containing concrete general hospitality knowledge the agent can use as a starting point (e.g. "Check Google Maps for '<cuisine> near <area>' — filter by 4+ stars", "Typical Japanese izakaya hours: 17:00–23:00, closed Sundays"). Agents treat these as estimates, not guaranteed facts — the "est." label in the UI signals this to them. An empty result leaves the agent with nothing to work with, which is worse than a cautious estimate.
 - Group related items under the same "section" value
-- Be specific: use actual values, not generic descriptions
-- Leave "context" as [] for pure greetings or when the KB has no relevant data`;
+- Be specific: use actual values, concrete suggestions, and named resources — never vague filler like "I will look into this" or "I can check"
+- Leave "context" as [] ONLY for pure greetings or non-informational messages (hello, thank you, etc.) where needsKbSearch is already false. For any substantive inquiry, return at least one useful item — kb-sourced if available, ai-sourced otherwise`;
 
 export const INQUIRY_SUMMARY_USER = ``;
 

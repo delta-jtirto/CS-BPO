@@ -3,6 +3,7 @@ import { toast } from 'sonner';
 import {
   Plus, Trash2, Eye, EyeOff, CheckCircle2, Loader2, Copy,
   MessageSquare, Globe, Phone, Mail, AlertCircle, HelpCircle, ExternalLink,
+  ChevronDown, ChevronUp, ArrowRight,
 } from 'lucide-react';
 import { getAccessToken, getUserCompanyIds, COMPANY_ID } from '@/lib/supabase-client';
 import { channelDisplayName } from '@/lib/channel-config';
@@ -20,6 +21,85 @@ import {
 } from '@/app/components/ui/tooltip';
 
 const PROXY_URL = import.meta.env.VITE_CHANNEL_PROXY_URL || '';
+
+// ─── LINE Setup Guide ───────────────────────────────────────
+const LINE_STEPS = [
+  {
+    num: 1,
+    title: 'Create a LINE Official Account',
+    desc: 'Sign up or log in with your LINE account, then create a free Official Account.',
+    action: { label: 'Open LINE Official Account', url: 'https://account.line.biz/signup' },
+  },
+  {
+    num: 2,
+    title: 'Enable Messaging API',
+    desc: 'Inside your Official Account → Settings → Messaging API → Enable. Link it to a Provider (create one if needed).',
+    action: { label: 'Open Account Manager', url: 'https://manager.line.biz' },
+  },
+  {
+    num: 3,
+    title: 'Copy Channel ID & Secret',
+    desc: 'Go to LINE Developers Console → your channel → Basic Settings tab. Copy the Channel ID and Channel Secret.',
+    action: { label: 'Open Developers Console', url: 'https://developers.line.biz/console' },
+  },
+  {
+    num: 4,
+    title: 'Issue a Channel Access Token',
+    desc: 'Still in Developers Console → Messaging API tab → scroll to "Channel access token" → click Issue.',
+    action: { label: 'Open Developers Console', url: 'https://developers.line.biz/console' },
+  },
+];
+
+function LineSetupGuide() {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="rounded-lg border border-green-100 bg-green-50/60 overflow-hidden">
+      <button
+        onClick={() => setOpen(v => !v)}
+        className="w-full flex items-center justify-between px-3 py-2.5 text-left"
+      >
+        <span className="text-xs font-semibold text-green-800 flex items-center gap-1.5">
+          <span className="inline-flex items-center justify-center w-4 h-4 rounded-full bg-green-600 text-white text-[9px] font-bold">?</span>
+          Need help finding these values?
+        </span>
+        {open
+          ? <ChevronUp size={13} className="text-green-600 shrink-0" />
+          : <ChevronDown size={13} className="text-green-600 shrink-0" />}
+      </button>
+
+      {open && (
+        <div className="px-3 pb-3 space-y-2.5 border-t border-green-100 pt-2.5">
+          {LINE_STEPS.map((step, idx) => (
+            <div key={step.num} className="flex gap-2.5">
+              {/* Step number + connector */}
+              <div className="flex flex-col items-center shrink-0">
+                <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-green-600 text-white text-[10px] font-bold shrink-0">
+                  {step.num}
+                </span>
+                {idx < LINE_STEPS.length - 1 && (
+                  <div className="w-px flex-1 bg-green-200 my-1" />
+                )}
+              </div>
+              {/* Content */}
+              <div className="pb-1 min-w-0">
+                <p className="text-xs font-semibold text-slate-700 leading-snug">{step.title}</p>
+                <p className="text-[10px] text-slate-500 mt-0.5 leading-relaxed">{step.desc}</p>
+                <a
+                  href={step.action.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1 mt-1 text-[10px] font-medium text-green-700 hover:text-green-900 hover:underline"
+                >
+                  {step.action.label} <ArrowRight size={9} />
+                </a>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 // ─── Types ─────────────────────────────────────────────────
 interface ChannelAccount {
@@ -444,7 +524,7 @@ export default function ConnectedChannelsPanel() {
 
       {/* ─── Connect Dialog ────────────────────────── */}
       <Dialog open={connectOpen} onOpenChange={setConnectOpen}>
-        <DialogContent className="max-w-md">
+        <DialogContent className="max-w-md max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>
               {connectChannel ? `Connect ${CHANNEL_CONFIGS[connectChannel]?.label}` : 'Choose Channel'}
@@ -455,22 +535,19 @@ export default function ConnectedChannelsPanel() {
           {!connectChannel && (
             <div className="grid grid-cols-2 gap-3 py-2">
               {(Object.entries(CHANNEL_CONFIGS) as [ChannelType, ChannelConfig][]).map(([key, config]) => {
-                const already = accounts.some(a => a.channel === key);
+                const count = accounts.filter(a => a.channel === key).length;
                 return (
                   <button
                     key={key}
-                    disabled={already}
                     onClick={() => openConnectDialog(key)}
-                    className={`p-4 rounded-lg border text-left transition-all ${
-                      already
-                        ? 'border-slate-100 bg-slate-50 opacity-50 cursor-not-allowed'
-                        : 'border-slate-200 hover:border-indigo-300 hover:bg-indigo-50/30'
-                    }`}
+                    className="p-4 rounded-lg border text-left transition-all border-slate-200 hover:border-indigo-300 hover:bg-indigo-50/30"
                   >
                     <config.icon size={20} className="mb-2 text-slate-600" />
                     <p className="text-sm font-semibold">{config.label}</p>
                     <p className="text-[10px] text-slate-400 mt-0.5">
-                      {already ? 'Already connected' : key === 'email' ? 'OAuth flow' : `${config.fields.length} fields`}
+                      {count > 0
+                        ? `${count} connected · add another`
+                        : key === 'email' ? 'OAuth flow' : `${config.fields.length} fields`}
                     </p>
                   </button>
                 );
@@ -487,6 +564,9 @@ export default function ConnectedChannelsPanel() {
                   {formError}
                 </div>
               )}
+
+              {/* LINE-specific inline setup guide */}
+              {connectChannel === 'line' && <LineSetupGuide />}
 
               {CHANNEL_CONFIGS[connectChannel].fields.map(field => (
                 <div key={field.key}>
@@ -540,14 +620,16 @@ export default function ConnectedChannelsPanel() {
               </div>
 
               <div className="flex items-center justify-between pt-2">
-                <a
-                  href={CHANNEL_CONFIGS[connectChannel].docsUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-xs text-indigo-500 hover:text-indigo-700 flex items-center gap-1"
-                >
-                  <ExternalLink size={10} /> View setup docs
-                </a>
+                {connectChannel !== 'line' ? (
+                  <a
+                    href={CHANNEL_CONFIGS[connectChannel].docsUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-xs text-indigo-500 hover:text-indigo-700 flex items-center gap-1"
+                  >
+                    <ExternalLink size={10} /> View setup docs
+                  </a>
+                ) : <span />}
                 <div className="flex gap-2">
                   <button
                     onClick={() => { setConnectChannel(null); setFormError(''); }}

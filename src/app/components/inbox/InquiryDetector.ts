@@ -265,7 +265,7 @@ const STOP_WORDS = new Set([
  * Basic English stemmer — strips common suffixes.
  * Not a full Porter stemmer, but catches the most impactful inflections.
  */
-function stem(word: string): string {
+export function stem(word: string): string {
   if (word.length < 5) return word;
   return word
     .replace(/ies$/i, 'y')
@@ -280,7 +280,7 @@ function stem(word: string): string {
     .replace(/ed$/i, '');
 }
 
-function extractKeywords(text: string, _type: InquiryType | string): string[] {
+export function extractKeywords(text: string, _type: InquiryType | string): string[] {
   const words = text.toLowerCase().split(/\W+/).filter(w => w.length > 2);
   const stemmed = words.map(w => stem(w));
   const unique = [...new Set(stemmed)];
@@ -433,7 +433,7 @@ export async function classifyWithLLM(
 ): Promise<DetectedInquiry[]> {
   // Cache key = prompt version + mode + guest messages + first 100 chars of KB
   // Bump PROMPT_V when prompt format changes to bust stale cache
-  const PROMPT_V = 'v9';
+  const PROMPT_V = 'v10';
   const cacheKey = (PROMPT_V + '|' + (mode ?? 'ai-context') + '|' + guestMessages.join('|') + '|' + (kbContext ?? '').slice(0, 100)).slice(0, 300);
   const cached = _classifyCache.get(cacheKey);
   if (cached && !skipCache) return cached;

@@ -1,6 +1,6 @@
 import { Clock, Sparkles, User, ArrowDown, ArrowLeft, X } from 'lucide-react';
 import { toast } from 'sonner';
-import type { Ticket } from '../../data/types';
+import type { Ticket, InquiryResolutionMap, InquiryResolutionState } from '../../data/types';
 import type { DetectedInquiry } from './InquiryDetector';
 import type { BookingDetails } from '@/lib/pms-api';
 import { AssistantPanel } from './AssistantPanel';
@@ -28,12 +28,18 @@ interface ContextSidebarPaneProps {
   bookingLoading: boolean;
   ticketNotes: string;
   onUpdateNotes: (v: string) => void;
+  onUpdateProperty?: (property: string) => void;
+  needsPropertyMapping?: boolean;
   // De-escalation
   deescalateTicket: (id: string) => void;
   // AssistantPanel props
   onComposeReply: (text: string) => void;
   onNavigateToKB: (propId: string) => void;
   onInquiriesClassified: (inquiries: DetectedInquiry[]) => void;
+  // Inquiry resolution tracking
+  inquiryResolutions?: InquiryResolutionMap;
+  onResolutionChange?: (type: string, state: InquiryResolutionState) => void;
+  onBulkResolution?: (handled: boolean) => void;
 }
 
 export function ContextSidebarPane({
@@ -45,9 +51,11 @@ export function ContextSidebarPane({
   displayRightWidth, RIGHT_MIN, rightWidth, resizing,
   rightTab, setRightTab,
   bookingDetails, bookingLoading,
-  ticketNotes, onUpdateNotes,
+  ticketNotes, onUpdateNotes, onUpdateProperty,
+  needsPropertyMapping,
   deescalateTicket,
   onComposeReply, onNavigateToKB, onInquiriesClassified,
+  inquiryResolutions, onResolutionChange, onBulkResolution,
 }: ContextSidebarPaneProps) {
   return (
     <div
@@ -119,6 +127,9 @@ export function ContextSidebarPane({
           }`}
         >
           <User size={12} /> Details
+          {needsPropertyMapping && rightTab !== 'details' && (
+            <span className="absolute -top-0.5 -right-1 w-2 h-2 bg-amber-400 rounded-full" />
+          )}
           {rightTab === 'details' && (
             <div className="absolute bottom-0 left-2 right-2 h-0.5 bg-indigo-600 rounded-full" />
           )}
@@ -133,6 +144,9 @@ export function ContextSidebarPane({
             onComposeReply={onComposeReply}
             onNavigateToKB={onNavigateToKB}
             onInquiriesClassified={onInquiriesClassified}
+            inquiryResolutions={inquiryResolutions}
+            onResolutionChange={onResolutionChange}
+            onBulkResolution={onBulkResolution}
           />
         ) : (
           <div>
@@ -142,6 +156,7 @@ export function ContextSidebarPane({
               activeTicket={activeTicket}
               ticketNotes={ticketNotes}
               onUpdateNotes={onUpdateNotes}
+              onUpdateProperty={onUpdateProperty}
             />
             <TicketDetailsSection ticket={activeTicket} tags={activeTags} />
             <HostSection host={activeTicket.host} />

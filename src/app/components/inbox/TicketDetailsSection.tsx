@@ -1,4 +1,4 @@
-import { Globe2, Tag } from 'lucide-react';
+import { Globe2, Mail, Tag } from 'lucide-react';
 import type { Ticket } from '../../data/types';
 
 interface TicketDetailsSectionProps {
@@ -19,6 +19,19 @@ export function TicketDetailsSection({ ticket, tags }: TicketDetailsSectionProps
             <ticket.channelIcon size={14} className="text-slate-500" /> {ticket.channel}
           </span>
         </div>
+        {ticket.contactEmail && (
+          <div>
+            <span className="block text-[10px] text-slate-400 mb-1">From</span>
+            <a
+              href={`mailto:${ticket.contactEmail}`}
+              className="text-sm font-medium flex items-center gap-1.5 text-indigo-600 hover:text-indigo-800 truncate"
+              title={ticket.contactEmail}
+            >
+              <Mail size={14} className="text-slate-500 shrink-0" />
+              <span className="truncate">{ticket.contactEmail}</span>
+            </a>
+          </div>
+        )}
         <div>
           <span className="block text-[10px] text-slate-400 mb-1">Language</span>
           <span className="text-sm font-medium flex items-center gap-1.5">

@@ -81,7 +81,7 @@ export function ConnectionStatusBar({
               {c.companyName}
               <button
                 onClick={() => onReconnectClick(c.hostId)}
-                className="ml-1 underline hover:no-underline font-medium"
+                className="ml-1 underline hover:no-underline font-medium p-0 leading-[inherit]"
               >
                 Reconnect
               </button>

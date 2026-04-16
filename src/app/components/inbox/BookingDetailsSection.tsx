@@ -7,6 +7,7 @@ import { toast } from 'sonner';
 import type { BookingDetails } from '@/lib/pms-api';
 import type { Ticket } from '../../data/types';
 import { BookingStatusBadge, PaymentStatusBadge } from './BookingStatusBadge';
+import { useAppContext } from '../../context/AppContext';
 
 interface BookingDetailsSectionProps {
   bookingDetails: BookingDetails | null;
@@ -14,6 +15,7 @@ interface BookingDetailsSectionProps {
   activeTicket: Ticket;
   ticketNotes: string;
   onUpdateNotes: (notes: string) => void;
+  onUpdateProperty?: (property: string) => void;
 }
 
 function getInitials(firstName?: string, lastName?: string, fallback?: string): string {
@@ -65,23 +67,41 @@ export function BookingDetailsSection({
   activeTicket,
   ticketNotes,
   onUpdateNotes,
+  onUpdateProperty,
 }: BookingDetailsSectionProps) {
   const [expanded, setExpanded] = useState(false);
+  const { properties } = useAppContext();
 
   const hasBookingId = Boolean(activeTicket.bookingId);
   const guestFullName = bd
     ? [bd.guestFirstName, bd.guestLastName].filter(Boolean).join(' ') || activeTicket.guestName
     : activeTicket.guestName;
 
-  // No booking at all
+  // No booking at all — show property picker filtered to this host
   if (!hasBookingId && !bd) {
+    const hostProperties = properties.filter(p => p.hostId === activeTicket.host.id);
     return (
       <div>
         <div className="p-5 border-b border-slate-100">
           <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-4 flex items-center gap-2">
             <User size={14} /> Guest & Booking
           </h3>
-          <div className="text-xs text-slate-400">No booking data available</div>
+          <div className="space-y-2">
+            <span className="block text-[10px] text-slate-400 uppercase tracking-wider font-bold">Property</span>
+            <select
+              value={activeTicket.property || ''}
+              onChange={e => onUpdateProperty?.(e.target.value)}
+              className="w-full text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 focus:border-indigo-400"
+            >
+              <option value="">— Select property —</option>
+              {hostProperties.map(p => (
+                <option key={p.id} value={p.name}>{p.name}</option>
+              ))}
+            </select>
+            {!activeTicket.property && (
+              <p className="text-[10px] text-slate-400">Select a property so the AI uses the right knowledge base.</p>
+            )}
+          </div>
         </div>
         <IncidentLog notes={ticketNotes} onUpdate={onUpdateNotes} />
       </div>

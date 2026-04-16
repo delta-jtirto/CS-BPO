@@ -1,5 +1,6 @@
 import type { Host, Message, Ticket } from '@/app/data/types';
 import { computeSLA, formatSLARelative, type EscalationOverride } from './compute-ticket-state';
+import { isBotSentMessage } from './proxy-mappers';
 
 // ---------------------------------------------------------------------------
 // Firestore types (matching Unified Inbox's data model)
@@ -243,6 +244,12 @@ export function mapFirestoreMessage(msg: FirestoreMessage, guestUserId?: string)
     sender = 'guest';
   } else {
     sender = senderRoleToSender(msg.sender_role);
+    // Auto-reply messages are sent as the authenticated user (admin/staff role),
+    // so sender_role won't be 'bot'. Check the session-scoped registry to
+    // correctly render them as AI Auto-Reply bubbles.
+    if (sender === 'agent' && isBotSentMessage(msg.text || '', tsMs)) {
+      sender = 'bot';
+    }
   }
   return {
     id: _messageIdCounter++,

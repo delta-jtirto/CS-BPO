@@ -65,7 +65,8 @@ export function useSmartReply({ ticket, existingDraft, cacheRef, aiInquiries }: 
   const [composedMessage, setComposedMessage] = useState(() => {
     return cacheRef.current[cacheKey]?.composedMessage || '';
   });
-  const composeTriggered = useRef(!!cacheRef.current[cacheKey]);
+  // Read from cache so switching away and back doesn't re-trigger auto-compose
+  const composeTriggered = useRef(cacheRef.current[cacheKey]?.triggered ?? false);
 
   const activeProp = properties.find(p => p.name === ticket.property);
   const ticketRoom = ticket.room.replace(/[^0-9]/g, '');
@@ -260,6 +261,11 @@ export function useSmartReply({ ticket, existingDraft, cacheRef, aiInquiries }: 
     if (allUncovered) return;
     const timer = setTimeout(() => {
       composeTriggered.current = true;
+      // Persist to cache so navigating away and back doesn't re-trigger
+      const existing = cacheRef.current[cacheKey];
+      cacheRef.current[cacheKey] = existing
+        ? { ...existing, triggered: true }
+        : { composedMessage: '', decisions: {}, customTexts: {}, triggered: true };
       const yesDecisions: Record<string, 'yes' | 'no'> = {};
       const autoInquiryDecisions: Record<string, InquiryDecision> = {};
       for (const inq of inquiries) {
@@ -270,7 +276,7 @@ export function useSmartReply({ ticket, existingDraft, cacheRef, aiInquiries }: 
       doCompose(autoInquiryDecisions);
     }, 200);
     return () => clearTimeout(timer);
-  }, [inquiries, doCompose, hasDraft, allUncovered]);
+  }, [inquiries, doCompose, hasDraft, allUncovered, cacheKey, cacheRef]);
 
   // ─── Write to cache ───────────────────────────────────────────
   useEffect(() => {

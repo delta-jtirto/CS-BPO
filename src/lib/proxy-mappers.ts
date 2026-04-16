@@ -19,11 +19,12 @@ export function mapProxyConversationToTicket(
   resolvedAt?: number | null,
   escalationOverride?: EscalationOverride | null,
 ): Ticket {
-  const contact = conversation.contacts as unknown as {
+  const contactRaw = conversation.contacts;
+  const contact = (Array.isArray(contactRaw) ? contactRaw[0] : contactRaw) as {
     display_name: string | null;
     avatar_url: string | null;
     channel_contact_id: string;
-  };
+  } | null;
 
   const lastMessageAtMs = conversation.last_message_at
     ? new Date(conversation.last_message_at).getTime()
@@ -64,6 +65,7 @@ export function mapProxyConversationToTicket(
     proxyConversationId: conversation.id,
     proxyCompanyId: conversation.company_id,
     proxyChannel: conversation.channel,
+    contactEmail: contact?.channel_contact_id || undefined,
     // No Firestore linkage
     firestoreThreadId: undefined,
     firestoreHostId: undefined,
@@ -76,6 +78,47 @@ export function mapProxyConversationToTicket(
 // ---------------------------------------------------------------------------
 
 let _proxyMessageIdCounter = 2_000_000; // Offset from Firestore counter (1M) to avoid collision
+
+// Persistent registry of bot-sent message signatures.
+// When addBotMessage sends a reply via proxy, it registers the text+timestamp here.
+// When the real message arrives via Realtime (always as direction='outbound', sender_id=agent),
+// the mapper checks this registry to assign sender='bot' for the violet AI bubble.
+// Persisted to sessionStorage so signatures survive page refresh and HMR.
+const STORAGE_KEY = 'ar:bot-sigs';
+const MAX_SIGS = 200;
+
+const _botSentSignatures: Set<string> = new Set(
+  (() => { try { return JSON.parse(sessionStorage.getItem(STORAGE_KEY) || '[]'); } catch { return []; } })()
+);
+
+function botSig(text: string, tsMinute: number): string {
+  return `${text.slice(0, 120)}|${tsMinute}`;
+}
+
+function persistSigs() {
+  try {
+    const arr = [..._botSentSignatures];
+    // Keep only most recent entries if over limit
+    const trimmed = arr.length > MAX_SIGS ? arr.slice(arr.length - MAX_SIGS) : arr;
+    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(trimmed));
+  } catch { /* sessionStorage full or unavailable */ }
+}
+
+/** Register a message as bot-sent so Realtime arrivals render as AI Auto-Reply. */
+export function markBotSent(text: string, timestamp: number) {
+  const minute = Math.floor(timestamp / 60_000);
+  _botSentSignatures.add(botSig(text, minute));
+  persistSigs();
+}
+
+export { isBotSent as isBotSentMessage };
+
+function isBotSent(text: string, tsMs: number): boolean {
+  const minute = Math.floor(tsMs / 60_000);
+  return _botSentSignatures.has(botSig(text, minute))
+    || _botSentSignatures.has(botSig(text, minute - 1))
+    || _botSentSignatures.has(botSig(text, minute + 1));
+}
 
 function timestampToTimeString(epoch: number): string {
   const d = new Date(epoch);
@@ -97,8 +140,10 @@ export function mapProxyMessageToMessage(
   if (msg.direction === 'inbound') {
     sender = 'guest';
   } else {
-    // Outbound: check if it was a bot reply or human agent
-    if (msg.sender_id?.startsWith('bot:')) {
+    // Outbound: check if it was a bot reply or human agent.
+    // sender_id prefix 'bot:' = legacy indicator; metadata.source = 'bot'
+    // is set by addBotMessage/addMultipleMessages for AI auto-replies.
+    if (msg.sender_id?.startsWith('bot:') || msg.metadata?.source === 'bot' || isBotSent(msg.text_body || '', tsMs)) {
       sender = 'bot';
     } else {
       sender = 'agent';
@@ -113,6 +158,7 @@ export function mapProxyMessageToMessage(
     createdAt: tsMs,
     senderName: msg.sender_name ?? undefined,
     subject: msg.subject ?? undefined,
+    htmlBody: msg.html_body ?? undefined,
     attachments: msg.attachments?.length ? msg.attachments : undefined,
     deliveryStatus: msg.status === 'failed' ? 'failed' : undefined,
     deliveryError: msg.error_message ?? undefined,
