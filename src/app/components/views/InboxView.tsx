@@ -332,12 +332,13 @@ export function InboxView() {
   const [viewedTickets, setViewedTickets] = useState<Record<string, number>>({});
   const [cardMenuOpen, setCardMenuOpen] = useState<string | null>(null);
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
+  const [inboxMenuOpen, setInboxMenuOpen] = useState(false);
   useEffect(() => {
-    if (!cardMenuOpen && !headerMenuOpen) return;
-    const close = () => { setCardMenuOpen(null); setHeaderMenuOpen(false); };
+    if (!cardMenuOpen && !headerMenuOpen && !inboxMenuOpen) return;
+    const close = () => { setCardMenuOpen(null); setHeaderMenuOpen(false); setInboxMenuOpen(false); };
     const t = setTimeout(() => document.addEventListener('click', close), 0);
     return () => { clearTimeout(t); document.removeEventListener('click', close); };
-  }, [cardMenuOpen, headerMenuOpen]);
+  }, [cardMenuOpen, headerMenuOpen, inboxMenuOpen]);
   const chatEndRef = useRef<HTMLDivElement>(null);
   /** Ref to the main reply compose textarea — used for cursor-position insertion */
   const composeTextareaRef = useRef<HTMLTextAreaElement>(null);
@@ -721,45 +722,56 @@ export function InboxView() {
           </div>
           <div className="flex items-center gap-1">
             <button
-              onClick={async () => {
-                try {
-                  const { getAccessToken, COMPANY_ID } = await import('@/lib/supabase-client');
-                  const token = await getAccessToken();
-                  const PROXY_URL = import.meta.env.VITE_CHANNEL_PROXY_URL || '';
-                  if (!token || !PROXY_URL) return;
-                  const btn = document.getElementById('email-refresh-btn');
-                  if (btn) btn.classList.add('animate-spin');
-                  const res = await fetch(`${PROXY_URL}/api/proxy/email/fetch`, {
-                    method: 'POST',
-                    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ company_id: COMPANY_ID }),
-                  });
-                  if (btn) btn.classList.remove('animate-spin');
-                  if (res.ok) {
-                    const data = await res.json();
-                    if (data.stored > 0) {
-                      const { toast } = await import('sonner');
-                      toast.success(`${data.stored} new email(s) fetched`);
-                    }
-                  }
-                } catch {}
-              }}
-              className="w-6 h-6 rounded-md flex items-center justify-center text-slate-400 hover:bg-indigo-50 hover:text-indigo-600 transition-colors"
-              title="Check for new emails"
-            >
-              <RefreshCw id="email-refresh-btn" size={13} />
-            </button>
-            <button
               onClick={() => setShowNewThread(prev => !prev)}
               className={`w-6 h-6 rounded-md flex items-center justify-center transition-colors ${
                 showNewThread
                   ? 'bg-indigo-600 text-white'
                   : 'text-slate-400 hover:bg-indigo-50 hover:text-indigo-600'
               }`}
-              title="Start a new test conversation"
+              title="New conversation"
             >
               <Plus size={14} />
             </button>
+            <div className="relative">
+              <button
+                onClick={(e) => { e.stopPropagation(); setInboxMenuOpen(prev => !prev); }}
+                className="w-6 h-6 rounded-md flex items-center justify-center text-slate-400 hover:bg-indigo-50 hover:text-indigo-600 transition-colors"
+                title="More actions"
+              >
+                <MoreVertical size={13} />
+              </button>
+              {inboxMenuOpen && (
+                <div className="absolute right-0 top-7 z-50 bg-white border border-slate-200 rounded-lg shadow-lg py-1 min-w-[150px]">
+                  <button
+                    onClick={async () => {
+                      setInboxMenuOpen(false);
+                      try {
+                        const { getAccessToken, COMPANY_ID } = await import('@/lib/supabase-client');
+                        const token = await getAccessToken();
+                        const PROXY_URL = import.meta.env.VITE_CHANNEL_PROXY_URL || '';
+                        if (!token || !PROXY_URL) return;
+                        const res = await fetch(`${PROXY_URL}/api/proxy/email/fetch`, {
+                          method: 'POST',
+                          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ company_id: COMPANY_ID }),
+                        });
+                        if (res.ok) {
+                          const data = await res.json();
+                          if (data.stored > 0) {
+                            toast.success(`${data.stored} new email(s) fetched`);
+                          } else {
+                            toast('No new emails');
+                          }
+                        }
+                      } catch {}
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] text-slate-600 hover:bg-slate-50 transition-colors text-left"
+                  >
+                    <RefreshCw size={11} /> Sync email
+                  </button>
+                </div>
+              )}
+            </div>
             {!isMobile && (
               <button
                 onClick={() => { setLeftCollapsed(true); setLeftOverlayOpen(false); }}
