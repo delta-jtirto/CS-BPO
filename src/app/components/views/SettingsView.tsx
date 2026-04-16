@@ -15,7 +15,7 @@ import { MOCK_HOSTS } from '../../data/mock-data';
 import { useAppContext } from '../../context/AppContext';
 import { useIsMobile } from '../ui/use-mobile';
 import { validateToken, maskToken, AuthError } from '@/lib/unibox-auth';
-import { Wifi, WifiOff, Plug, CheckCircle2, Loader2, Radio } from 'lucide-react';
+import { Wifi, WifiOff, Plug, CheckCircle2, Loader2, Radio, AlertCircle } from 'lucide-react';
 import ConnectedChannelsPanel from './ConnectedChannelsPanel';
 
 // ─── Helper: localStorage-backed state ─────────────────────────
@@ -1368,6 +1368,9 @@ function ConnectedInboxesPanel() {
 
   const [testingId, setTestingId] = useState<string | null>(null);
   const [disconnectingId, setDisconnectingId] = useState<string | null>(null);
+  const [updatingTokenId, setUpdatingTokenId] = useState<string | null>(null);
+  const [updateTokenInput, setUpdateTokenInput] = useState('');
+  const [updateTokenValidating, setUpdateTokenValidating] = useState(false);
 
   const handleValidate = async () => {
     if (!tokenInput.trim()) return;
@@ -1494,6 +1497,50 @@ function ConnectedInboxesPanel() {
     }
   };
 
+  const handleUpdateToken = async (hostId: string) => {
+    if (!updateTokenInput.trim()) return;
+    setUpdateTokenValidating(true);
+    try {
+      const user = await validateToken(updateTokenInput.trim());
+      // Update saved inbox metadata
+      const masked = maskToken(updateTokenInput.trim());
+      setSavedInboxes(prev => prev.map(i =>
+        i.hostId === hostId ? { ...i, maskedToken: masked, companyName: user.name } : i
+      ));
+      // Persist to Supabase KV
+      const { saveInbox } = await import('../../ai/api-client');
+      await saveInbox(hostId, {
+        companyName: user.name,
+        maskedToken: masked,
+        connectedAt: new Date().toISOString(),
+        accessToken: updateTokenInput.trim(),
+      });
+      // Update localStorage cache
+      try {
+        const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
+        tokens[hostId] = updateTokenInput.trim();
+        localStorage.setItem('settings_inbox_tokens', JSON.stringify(tokens));
+      } catch { /* ignore */ }
+      // Reconnect with new token
+      const host = MOCK_HOSTS.find(h => h.id === hostId);
+      if (host) {
+        await removeFirestoreConnection(hostId);
+        await addFirestoreConnection(updateTokenInput.trim(), host);
+      }
+      toast.success('Token updated', { description: `Reconnected to ${user.name}` });
+      setUpdatingTokenId(null);
+      setUpdateTokenInput('');
+    } catch (err) {
+      if (err instanceof AuthError) {
+        toast.error(err.message);
+      } else {
+        toast.error('Invalid token — check and try again');
+      }
+    } finally {
+      setUpdateTokenValidating(false);
+    }
+  };
+
   const availableHosts = MOCK_HOSTS.filter(h => !savedInboxes.some(i => i.hostId === h.id));
 
   return (
@@ -1510,6 +1557,20 @@ function ConnectedInboxesPanel() {
             const host = MOCK_HOSTS.find(h => h.id === inbox.hostId);
             const isDisconnecting = disconnectingId === inbox.hostId;
             const isTesting = testingId === inbox.hostId;
+            const isUpdatingToken = updatingTokenId === inbox.hostId;
+
+            // Wire live status from firestoreConnections
+            const liveConn = firestoreConnections.find(c => c.hostId === inbox.hostId);
+            const liveStatus = liveConn?.status || 'disconnected';
+            const statusConfig = liveStatus === 'connected'
+              ? { label: 'Connected', color: 'bg-emerald-50 text-emerald-600', icon: <Wifi size={10} /> }
+              : liveStatus === 'expired'
+              ? { label: 'Token Expired', color: 'bg-red-50 text-red-500', icon: <AlertCircle size={10} /> }
+              : liveStatus === 'permission-denied'
+              ? { label: 'Permission Denied', color: 'bg-red-50 text-red-500', icon: <AlertCircle size={10} /> }
+              : liveStatus === 'network-error'
+              ? { label: 'Network Error', color: 'bg-amber-50 text-amber-600', icon: <Wifi size={10} /> }
+              : { label: 'Disconnected', color: 'bg-slate-100 text-slate-400', icon: <Wifi size={10} /> };
 
             return (
               <div key={inbox.hostId} className="bg-white border border-slate-200 rounded-xl shadow-sm p-4">
@@ -1534,38 +1595,68 @@ function ConnectedInboxesPanel() {
                     </div>
                   </div>
                 ) : (
-                  <div className="flex items-center gap-3">
-                    <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-white text-xs font-bold ${host?.brandColor || 'bg-slate-400'}`}>
-                      {(host?.name || '?').charAt(0)}
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm font-semibold text-slate-800 truncate">{inbox.companyName}</span>
-                        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-600 text-[10px] font-medium">
-                          <Wifi size={10} /> Connected
-                        </span>
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-3">
+                      <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-white text-xs font-bold ${host?.brandColor || 'bg-slate-400'}`}>
+                        {(host?.name || '?').charAt(0)}
                       </div>
-                      <div className="flex items-center gap-2 text-[11px] text-slate-400">
-                        <span>Mapped to {host?.name || 'Unknown'}</span>
-                        <span>·</span>
-                        <span>Token: {inbox.maskedToken}</span>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-semibold text-slate-800 truncate">{inbox.companyName}</span>
+                          <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-medium ${statusConfig.color}`}>
+                            {statusConfig.icon} {statusConfig.label}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2 text-[11px] text-slate-400">
+                          <span>Mapped to {host?.name || 'Unknown'}</span>
+                          <span>·</span>
+                          <span>Token: {inbox.maskedToken}</span>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          onClick={() => handleTestConnection(inbox.hostId)}
+                          disabled={isTesting}
+                          className="px-2.5 py-1.5 text-[11px] font-medium text-slate-600 bg-slate-50 border border-slate-200 rounded-lg hover:bg-slate-100 disabled:opacity-50"
+                        >
+                          {isTesting ? <Loader2 size={12} className="animate-spin" /> : 'Test'}
+                        </button>
+                        <button
+                          onClick={() => { setUpdatingTokenId(isUpdatingToken ? null : inbox.hostId); setUpdateTokenInput(''); }}
+                          className="px-2.5 py-1.5 text-[11px] font-medium text-indigo-600 bg-indigo-50 border border-indigo-200 rounded-lg hover:bg-indigo-100"
+                        >
+                          {isUpdatingToken ? 'Cancel' : 'Update'}
+                        </button>
+                        <button
+                          onClick={() => handleDisconnect(inbox.hostId)}
+                          className="px-2 py-1.5 text-[11px] font-medium text-slate-400 hover:text-red-500 transition-colors"
+                          title="Disconnect"
+                        >
+                          <Trash2 size={13} />
+                        </button>
                       </div>
                     </div>
-                    <div className="flex items-center gap-1.5 shrink-0">
-                      <button
-                        onClick={() => handleTestConnection(inbox.hostId)}
-                        disabled={isTesting}
-                        className="px-2.5 py-1.5 text-[11px] font-medium text-slate-600 bg-slate-50 border border-slate-200 rounded-lg hover:bg-slate-100 disabled:opacity-50"
-                      >
-                        {isTesting ? <Loader2 size={12} className="animate-spin" /> : 'Test'}
-                      </button>
-                      <button
-                        onClick={() => handleDisconnect(inbox.hostId)}
-                        className="px-2.5 py-1.5 text-[11px] font-medium text-red-500 bg-red-50 border border-red-200 rounded-lg hover:bg-red-100"
-                      >
-                        Disconnect
-                      </button>
-                    </div>
+                    {/* Inline token update */}
+                    {isUpdatingToken && (
+                      <div className="flex items-center gap-2 pl-11">
+                        <input
+                          type="password"
+                          autoFocus
+                          value={updateTokenInput}
+                          onChange={e => setUpdateTokenInput(e.target.value)}
+                          onKeyDown={e => e.key === 'Enter' && handleUpdateToken(inbox.hostId)}
+                          placeholder="Paste new token..."
+                          className="flex-1 text-xs bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 focus:border-indigo-400"
+                        />
+                        <button
+                          onClick={() => handleUpdateToken(inbox.hostId)}
+                          disabled={updateTokenValidating || !updateTokenInput.trim()}
+                          className="px-3 py-1.5 text-[11px] font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 disabled:opacity-50"
+                        >
+                          {updateTokenValidating ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
+                        </button>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
