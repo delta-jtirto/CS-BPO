@@ -427,6 +427,13 @@ export interface ClassifyResult {
   summary?: string;
 }
 
+/**
+ * Prompt/model version baked into the classify-inquiry cache signature.
+ * Bump this any time the prompt, parser, or model tier changes so that stale
+ * persisted cache entries are invalidated (they simply miss on lookup).
+ */
+export const CLASSIFY_MODEL_VERSION = 'v10';
+
 const _classifyCache = new Map<string, ClassifyResult>();
 
 export async function classifyWithLLM(
@@ -440,9 +447,8 @@ export async function classifyWithLLM(
   skipCache?: boolean,
 ): Promise<ClassifyResult> {
   // Cache key = prompt version + mode + guest messages + first 100 chars of KB
-  // Bump PROMPT_V when prompt format changes to bust stale cache
-  const PROMPT_V = 'v10';
-  const cacheKey = (PROMPT_V + '|' + (mode ?? 'ai-context') + '|' + guestMessages.join('|') + '|' + (kbContext ?? '').slice(0, 100)).slice(0, 300);
+  // Bump CLASSIFY_MODEL_VERSION when prompt format changes to bust stale cache
+  const cacheKey = (CLASSIFY_MODEL_VERSION + '|' + (mode ?? 'ai-context') + '|' + guestMessages.join('|') + '|' + (kbContext ?? '').slice(0, 100)).slice(0, 300);
   const cached = _classifyCache.get(cacheKey);
   if (cached && !skipCache) return cached;
   const EMPTY_RESULT: ClassifyResult = { inquiries: [], summary: undefined };

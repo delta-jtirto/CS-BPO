@@ -72,7 +72,7 @@ function ContextSidebarPaneImpl({
       style={!isMobile ? { width: rightCollapsed && rightOverlayOpen ? Math.min(rightWidth, 380) : rightCollapsed ? 0 : displayRightWidth, minWidth: rightCollapsed ? 0 : RIGHT_MIN, transition: resizing ? 'none' : 'width 0.2s ease' } : undefined}
     >
       {/* SLA header */}
-      <div className={`p-3 border-b flex items-center justify-between shrink-0 ${activeTicket.status === 'urgent' ? 'bg-red-50 border-red-200' : activeTicket.status === 'warning' ? 'bg-amber-50 border-amber-200' : 'bg-slate-50 border-slate-200'}`}>
+      <div className={`px-3 py-2 border-b flex items-center justify-between shrink-0 min-h-[52px] ${activeTicket.status === 'urgent' ? 'bg-red-50 border-red-200' : activeTicket.status === 'warning' ? 'bg-amber-50 border-amber-200' : 'bg-slate-50 border-slate-200'}`}>
         <div className="flex items-center gap-2">
           {isMobile && (
             <button onClick={() => setShowMobileDetails(false)} className="w-7 h-7 rounded-md flex items-center justify-center text-slate-400 hover:bg-slate-200 transition-colors">

@@ -15,6 +15,7 @@ import {
   classifyWithLLM,
   scoreKBForInquiry,
   filterGreetingNoise,
+  CLASSIFY_MODEL_VERSION,
   type DetectedInquiry,
   type InquiryKBMatch,
   type ClassifyResult,
@@ -207,7 +208,7 @@ interface ChatMessage {
 const MAX_CONTEXT_TURNS = 3; // 3 user+assistant pairs = 6 messages
 
 export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInquiriesClassified, inquiryResolutions, onResolutionChange, onBulkResolution, onSummaryUpdate, onClassifyingChange }: AssistantPanelProps) {
-  const { kbEntries, hasApiKey: hasApiKeyFromCtx, aiModel, onboardingData, formTemplate, properties, hostSettings, promptOverrides, activeMessages } = useAppContext();
+  const { kbEntries, hasApiKey: hasApiKeyFromCtx, aiModel, onboardingData, formTemplate, properties, hostSettings, promptOverrides, activeMessages, classifyCache } = useAppContext();
   const guestNeedsMode = hostSettings?.[0]?.demoFeatures?.guestNeedsMode ?? 'ai-context';
   const [isAnalyzing, setIsAnalyzing] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -280,6 +281,23 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
   // Uses total message count (not just guest) so agent replies trigger re-classification
   const classifyKey = `${ticket.id}:${resolvedMessages.filter(m => m.sender !== 'system').length}:${ticket.property}`;
 
+  // Persistence signature for the cross-session cache. Invariants:
+  //   - lastMessageId captures *what* the guest/agent last said
+  //   - messageCount captures the length of the thread at classification time
+  //   - modelVersion captures the prompt/model tier
+  // When any of these drift from the stored row, we re-classify.
+  const nonSystemMessages = resolvedMessages.filter(m => m.sender !== 'system');
+  const lastNonSystem = nonSystemMessages[nonSystemMessages.length - 1];
+  const classifySignature = {
+    lastMessageId: lastNonSystem ? String(lastNonSystem.id ?? '') : '',
+    messageCount: nonSystemMessages.length,
+    modelVersion: CLASSIFY_MODEL_VERSION,
+  };
+  // RLS-scoped company id. Proxy tickets carry their own; Firestore tickets
+  // don't surface one (they're scoped by Unified Inbox host), so we fall back
+  // to the agent's single-tenant company so the upsert passes RLS.
+  const classifyCompanyId = ticket.proxyCompanyId ?? 'delta-hq';
+
   // Wrapper: set local state + notify parent (SmartReplyPanel consumes via InboxView)
   const updateAiInquiries = useCallback((result: DetectedInquiry[] | null) => {
     setAiInquiries(result);
@@ -297,6 +315,9 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
   const handleRefreshInquiries = () => {
     setIsRefreshing(true);
     llmClassifyRef.current = null;
+    // Manual refresh bypasses the persisted cache (skipCache=true on LLM
+    // side, no cache lookup here) — but we still OVERWRITE the persisted row
+    // on success so the next reload picks up the fresh classification.
     classifyWithLLM(
       resolvedConversation,
       ticket.property,
@@ -309,6 +330,9 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
     ).then(cr => {
       llmClassifyRef.current = classifyKey;
       handleClassifyResult(cr);
+      if (cr.inquiries.length > 0 && classifySignature.lastMessageId) {
+        void classifyCache.save(ticket.id, classifyCompanyId, classifySignature, cr);
+      }
     }).catch(() => {
       llmClassifyRef.current = classifyKey;
       updateAiInquiries(filterGreetingNoise(detectInquiries(resolvedGuestMessages, ticket.tags, ticket.summary)));
@@ -334,6 +358,19 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
       return;
     }
 
+    // Persisted cache short-circuit: if Supabase already has a classification
+    // for this exact (thread, lastMessageId, messageCount, modelVersion) tuple,
+    // reuse it. Skips the LLM call entirely across reloads and devices.
+    if (classifySignature.lastMessageId) {
+      const persisted = classifyCache.getIfFresh(ticket.id, classifySignature);
+      if (persisted) {
+        console.log('[AssistantPanel] classify cache hit for %s (%d msgs)', ticket.id, classifySignature.messageCount);
+        handleClassifyResult(persisted);
+        setIsAnalyzing(false);
+        return;
+      }
+    }
+
     // Show inline refresh spinner (not full skeleton) when re-classifying with existing results
     const isReClassify = aiInquiries !== null && aiInquiries.length > 0;
     if (isReClassify) setIsRefreshing(true);
@@ -349,6 +386,12 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
     ).then(cr => {
       console.log('[AssistantPanel] LLM classified %d inquiries for key %s', cr.inquiries.length, classifyKey);
       handleClassifyResult(cr);
+      // Persist for future sessions. Skip empty results — they usually mean a
+      // transient failure, not a real "nothing to classify" state, and we'd
+      // rather re-run on reload than cache an empty row.
+      if (cr.inquiries.length > 0 && classifySignature.lastMessageId) {
+        void classifyCache.save(ticket.id, classifyCompanyId, classifySignature, cr);
+      }
     }).catch(err => {
       console.error('[AssistantPanel] LLM classification failed, falling back to regex:', err);
       updateAiInquiries(filterGreetingNoise(detectInquiries(resolvedGuestMessages, ticket.tags, ticket.summary)));

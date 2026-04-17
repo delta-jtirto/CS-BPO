@@ -18,6 +18,7 @@ import { sendGuestMessage } from '@/lib/unibox-send';
 import { sendProxyMessage, isProxyChannel } from '@/lib/proxy-send';
 import { useProxyConversations } from '@/hooks/use-proxy-conversations';
 import { useConversationOverrides } from '@/hooks/use-conversation-overrides';
+import { useClassifyCache, type UseClassifyCacheResult } from '@/hooks/use-classify-cache';
 import { mapProxyConversationToTicket, markBotSent } from '@/lib/proxy-mappers';
 import { supabase as supabaseClient, getUserCompanyIds as fetchProxyCompanyIds, getAccessToken } from '@/lib/supabase-client';
 import { toast } from 'sonner';
@@ -121,6 +122,11 @@ interface AppState {
    *  Call when a downstream API returns 401/403 or Firestore snapshot errors
    *  with permission-denied / unauthenticated. */
   markFirestoreConnectionExpired: (hostId: string) => void;
+
+  /** Persisted classify-inquiry cache. Consumers call getIfFresh(threadKey,
+   *  signature) before running the LLM, and save(...) after a successful
+   *  classification. See use-classify-cache.ts for signature semantics. */
+  classifyCache: UseClassifyCacheResult;
 
   // BPO overlay state (persisted in Supabase KV)
   escalationOverrides: Record<string, import('@/lib/compute-ticket-state').EscalationOverride>;
@@ -501,6 +507,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // Persists to public.conversation_overrides — shared across devices/agents,
   // survives localStorage clears, and scoped by RLS to the user's company.
   const { overrides: conversationOverrides, setOverride: setConversationOverride } = useConversationOverrides({
+    supabase: supabaseClient,
+    companyIds: proxyCompanyIds,
+  });
+
+  // ─── Persisted classify-inquiry cache (Supabase-backed) ──────────────
+  // Stores LLM classification results keyed by ticket.id + (lastMessageId,
+  // messageCount, modelVersion) signature. AssistantPanel short-circuits the
+  // LLM call when the signature matches, saving tokens across reloads too.
+  const classifyCache = useClassifyCache({
     supabase: supabaseClient,
     companyIds: proxyCompanyIds,
   });
@@ -2014,6 +2029,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       isInitialLoad, proxyCompanyIds, setProxyTicketProperty,
       firestoreConnections, firestoreInitializing,
       addFirestoreConnection, removeFirestoreConnection, reconnectFirestore, markFirestoreConnectionExpired,
+      classifyCache,
       escalationOverrides, handoverReasons, setHandoverReason,
       resolveTicket, addMessageToTicket, pendingProxyMessages, retryPendingProxyMessage, deletePendingProxyMessage, injectGuestMessage, addBotMessage, addSystemMessage, addMultipleMessages, escalateTicketStatus, escalateTicketWithUrgency, deescalateTicket, deleteMessageFromTicket, deleteThread,
       draftReplies, setDraftReply, clearDraftReply,

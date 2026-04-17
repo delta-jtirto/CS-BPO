@@ -746,7 +746,7 @@ export function InboxView() {
         } bg-white border-r border-slate-200 flex-col`}
         style={!isMobile ? { width: leftCollapsed && leftOverlayOpen ? Math.min(leftWidth, 360) : leftCollapsed ? 0 : displayLeftWidth, minWidth: leftCollapsed ? 0 : LEFT_MIN, transition: resizing ? 'none' : 'width 0.2s ease' } : undefined}
       >
-        <div className="px-4 py-3 border-b border-slate-200 bg-slate-50 flex items-center justify-between">
+        <div className="px-4 py-2 border-b border-slate-200 bg-slate-50 flex items-center justify-between min-h-[52px]">
           <div className="flex items-center gap-2">
             <h2 className="text-sm font-bold text-slate-800">Inbox</h2>
             <span className="bg-slate-200 text-slate-600 text-[11px] font-semibold px-2 py-0.5 rounded-full tabular-nums">

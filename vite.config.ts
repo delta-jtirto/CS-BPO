@@ -19,7 +19,8 @@ export default defineConfig({
     },
   },
   server: {
-    port: 5174,
+    port: 7174,
+    strictPort: true,
   },
 
   // File types to support raw imports. Never add .css, .tsx, or .ts files to this.
