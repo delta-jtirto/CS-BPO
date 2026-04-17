@@ -329,10 +329,12 @@ export function InboxView() {
   const [inquiryResolutions, setInquiryResolutions] = useState<InquiryResolutionMap>({});
   const [summaryCollapsed, setSummaryCollapsed] = useState(true);
   const [aiSummary, setAiSummary] = useState<string | null>(null);
+  const [isClassifying, setIsClassifying] = useState(false);
   const [viewedTickets, setViewedTickets] = useState<Record<string, number>>({});
   const [cardMenuOpen, setCardMenuOpen] = useState<string | null>(null);
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
   const [inboxMenuOpen, setInboxMenuOpen] = useState(false);
+  const [syncingEmail, setSyncingEmail] = useState(false);
   useEffect(() => {
     if (!cardMenuOpen && !headerMenuOpen && !inboxMenuOpen) return;
     const close = () => { setCardMenuOpen(null); setHeaderMenuOpen(false); setInboxMenuOpen(false); };
@@ -413,9 +415,12 @@ export function InboxView() {
     setShowSmartReply(false);
     setGuestMode(false);
     setViewedTickets(prev => ({ ...prev, [activeTicket.id]: getMessages(activeTicket).length }));
-    // Reset inquiry resolution state and AI summary on ticket switch
+    // Reset inquiry state on ticket switch to avoid showing previous thread's
+    // context while new classification is in flight.
     setInquiryResolutions({});
     setAiSummary(null);
+    setClassifiedInquiries([]);
+    setIsClassifying(true);
   }, [activeTicket?.id]);
 
   // Resolution change callbacks for AssistantPanel (manual toggles only —
@@ -743,8 +748,9 @@ export function InboxView() {
               {inboxMenuOpen && (
                 <div className="absolute right-0 top-7 z-50 bg-white border border-slate-200 rounded-lg shadow-lg py-1 min-w-[150px]">
                   <button
+                    disabled={syncingEmail}
                     onClick={async () => {
-                      setInboxMenuOpen(false);
+                      setSyncingEmail(true);
                       try {
                         const { getAccessToken, COMPANY_ID } = await import('@/lib/supabase-client');
                         const token = await getAccessToken();
@@ -763,11 +769,15 @@ export function InboxView() {
                             toast('No new emails');
                           }
                         }
-                      } catch {}
+                      } catch {} finally {
+                        setSyncingEmail(false);
+                        setInboxMenuOpen(false);
+                      }
                     }}
-                    className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] text-slate-600 hover:bg-slate-50 transition-colors text-left"
+                    className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] text-slate-600 hover:bg-slate-50 transition-colors text-left disabled:opacity-50"
                   >
-                    <RefreshCw size={11} /> Sync email
+                    <RefreshCw size={11} className={syncingEmail ? 'animate-spin' : ''} />
+                    {syncingEmail ? 'Syncing...' : 'Sync email'}
                   </button>
                 </div>
               )}
@@ -778,7 +788,7 @@ export function InboxView() {
                 className="w-6 h-6 rounded-md flex items-center justify-center text-slate-400 hover:bg-indigo-50 hover:text-indigo-600 transition-colors"
                 title="Collapse sidebar"
               >
-                <ChevronsLeft size={13} />
+                <PanelLeftClose size={14} />
               </button>
             )}
           </div>
@@ -797,7 +807,7 @@ export function InboxView() {
                 if (e.key === 'Escape') { setSearchQuery(''); searchInputRef.current?.blur(); }
               }}
               placeholder="Search guests, bookings..."
-              className="w-full text-[11px] pl-6 pr-12 py-1 rounded-md bg-slate-50 border-0 focus:ring-1 focus:ring-indigo-300 focus:bg-white outline-none placeholder:text-slate-300 transition-colors"
+              className="w-full text-[11px] pl-6 pr-12 py-1 rounded-md bg-slate-100 text-slate-700 border-0 focus:ring-1 focus:ring-indigo-300 focus:bg-white outline-none placeholder:text-slate-500 transition-colors"
             />
             {searchQuery ? (
               <button
@@ -1440,19 +1450,45 @@ export function InboxView() {
           </div>
         </div>
 
-        {/* AI Context Summary — single-line bar, AI-generated when available */}
-        {(aiSummary || activeTicket.summary) && (
-          <div className="px-3 md:px-4 py-1.5 flex items-center gap-2 bg-slate-50 border-b border-slate-100 shrink-0">
-            <Sparkles size={10} className="text-indigo-400 shrink-0" />
-            <p className="text-[11px] text-slate-600 truncate flex-1">
+        {/* AI Context Summary — blue info banner, expandable for full summary + tags.
+            Shows a loading skeleton while classification is in flight to avoid
+            displaying stale summary from the previous thread. */}
+        {isClassifying && !aiSummary ? (
+          <div className="w-full px-3 md:px-4 py-1.5 flex items-center gap-2 bg-blue-50 border-b border-blue-100 shrink-0">
+            <Sparkles size={11} className="text-blue-400 shrink-0 animate-pulse" />
+            <div className="flex-1 h-2.5 bg-blue-100 rounded animate-pulse max-w-[60%]" />
+          </div>
+        ) : (aiSummary || activeTicket.summary) && (
+          <button
+            onClick={() => setSummaryCollapsed(prev => !prev)}
+            className="w-full px-3 md:px-4 py-1.5 flex items-start gap-2 bg-blue-50 border-b border-blue-100 text-left hover:bg-blue-100/60 transition-colors shrink-0"
+          >
+            <Sparkles size={11} className="text-blue-500 shrink-0 mt-[1px]" />
+            <p className={`text-[11px] text-blue-900 flex-1 ${summaryCollapsed ? 'truncate' : 'whitespace-normal leading-relaxed'}`}>
               {aiSummary || activeTicket.summary}
             </p>
-            {activeTicket.tags.slice(0, 2).map(tag => (
-              <span key={tag} className="text-[9px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded-full shrink-0">{tag}</span>
-            ))}
-            {activeTicket.tags.length > 2 && (
-              <span className="text-[9px] text-slate-400 shrink-0">+{activeTicket.tags.length - 2}</span>
+            {summaryCollapsed && activeTicket.tags.length > 0 && (
+              <div className="flex items-center gap-1 shrink-0">
+                {activeTicket.tags.slice(0, 2).map(tag => (
+                  <span key={tag} className="text-[9px] bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded-full">{tag}</span>
+                ))}
+                {activeTicket.tags.length > 2 && (
+                  <span className="text-[9px] text-blue-500">+{activeTicket.tags.length - 2}</span>
+                )}
+              </div>
             )}
+            <ChevronDown
+              size={12}
+              className={`text-blue-400 shrink-0 mt-[1px] transition-transform duration-200 ${summaryCollapsed ? '-rotate-90' : ''}`}
+            />
+          </button>
+        )}
+        {/* Expanded: show all tags below summary */}
+        {!summaryCollapsed && (aiSummary || activeTicket.summary) && activeTicket.tags.length > 0 && (
+          <div className="px-3 md:px-4 pb-2 flex items-center gap-1 flex-wrap bg-blue-50 border-b border-blue-100 shrink-0">
+            {activeTicket.tags.map(tag => (
+              <span key={tag} className="text-[9px] bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded-full">{tag}</span>
+            ))}
           </div>
         )}
 
@@ -1718,8 +1754,51 @@ export function InboxView() {
           />
         )}
 
+        {/* Email sync notice — sticks to top of compose box (emails poll, not real-time) */}
+        {activeTicket.channel?.toLowerCase() === 'email' && !guestMode && (
+          <div className="px-3 md:px-4 py-1.5 flex items-center gap-2 text-[10px] text-slate-500 bg-slate-50 border-t border-slate-200 shrink-0">
+            <Info size={11} className="text-slate-400 shrink-0" />
+            <span className="flex-1 truncate">Emails sync periodically, not in real-time.</span>
+            <button
+              disabled={syncingEmail}
+              onClick={async () => {
+                if (syncingEmail) return;
+                setSyncingEmail(true);
+                try {
+                  const { getAccessToken, COMPANY_ID } = await import('@/lib/supabase-client');
+                  const token = await getAccessToken();
+                  const PROXY_URL = import.meta.env.VITE_CHANNEL_PROXY_URL || '';
+                  if (!token || !PROXY_URL) return;
+                  const res = await fetch(`${PROXY_URL}/api/proxy/email/fetch`, {
+                    method: 'POST',
+                    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ company_id: COMPANY_ID }),
+                  });
+                  if (res.ok) {
+                    const data = await res.json();
+                    if (data.stored > 0) toast.success(`${data.stored} new email(s) fetched`);
+                    else toast('No new emails');
+                  } else {
+                    toast.error('Sync failed');
+                  }
+                } catch {
+                  toast.error('Sync failed');
+                } finally {
+                  setSyncingEmail(false);
+                }
+              }}
+              className="flex items-center gap-1 text-[10px] font-medium text-indigo-600 hover:text-indigo-700 hover:underline transition-colors shrink-0 disabled:opacity-60 disabled:cursor-wait disabled:hover:no-underline"
+            >
+              <RefreshCw size={10} className={syncingEmail ? 'animate-spin' : ''} />
+              {syncingEmail ? 'Syncing…' : 'Sync now'}
+            </button>
+          </div>
+        )}
+
         {/* Reply area */}
-        <div className={`px-3 py-2 md:px-4 md:py-3 border-t shrink-0 transition-colors ${
+        <div className={`px-3 py-2 md:px-4 md:py-3 shrink-0 transition-colors ${
+          activeTicket.channel?.toLowerCase() === 'email' && !guestMode ? '' : 'border-t'
+        } ${
           guestMode ? 'bg-emerald-50/80 border-emerald-200' : 'bg-white border-slate-200'
         }`}>
           {activeDraft && !guestMode && (
@@ -1932,6 +2011,7 @@ export function InboxView() {
         onResolutionChange={handleResolutionChange}
         onBulkResolution={handleBulkResolution}
         onSummaryUpdate={setAiSummary}
+        onClassifyingChange={setIsClassifying}
       />
 
       <InboxDialogs

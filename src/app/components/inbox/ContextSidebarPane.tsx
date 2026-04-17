@@ -41,6 +41,7 @@ interface ContextSidebarPaneProps {
   onResolutionChange?: (type: string, state: InquiryResolutionState) => void;
   onBulkResolution?: (handled: boolean) => void;
   onSummaryUpdate?: (summary: string) => void;
+  onClassifyingChange?: (isClassifying: boolean) => void;
 }
 
 export function ContextSidebarPane({
@@ -56,7 +57,7 @@ export function ContextSidebarPane({
   needsPropertyMapping,
   deescalateTicket,
   onComposeReply, onNavigateToKB, onInquiriesClassified,
-  inquiryResolutions, onResolutionChange, onBulkResolution, onSummaryUpdate,
+  inquiryResolutions, onResolutionChange, onBulkResolution, onSummaryUpdate, onClassifyingChange,
 }: ContextSidebarPaneProps) {
   return (
     <div
@@ -149,6 +150,7 @@ export function ContextSidebarPane({
             onResolutionChange={onResolutionChange}
             onBulkResolution={onBulkResolution}
             onSummaryUpdate={onSummaryUpdate}
+            onClassifyingChange={onClassifyingChange}
           />
         ) : (
           <div>

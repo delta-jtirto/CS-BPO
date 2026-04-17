@@ -69,6 +69,8 @@ interface AssistantPanelProps {
   onBulkResolution?: (handled: boolean) => void;
   /** Callback when AI generates a conversation summary */
   onSummaryUpdate?: (summary: string) => void;
+  /** Callback to notify parent about classification loading state */
+  onClassifyingChange?: (isClassifying: boolean) => void;
 }
 
 // ─── Form field extraction ───────────────────────────────────────────────────
@@ -204,11 +206,16 @@ interface ChatMessage {
 // Max conversation turns to send in the prompt (sliding window)
 const MAX_CONTEXT_TURNS = 3; // 3 user+assistant pairs = 6 messages
 
-export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInquiriesClassified, inquiryResolutions, onResolutionChange, onBulkResolution, onSummaryUpdate }: AssistantPanelProps) {
+export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInquiriesClassified, inquiryResolutions, onResolutionChange, onBulkResolution, onSummaryUpdate, onClassifyingChange }: AssistantPanelProps) {
   const { kbEntries, hasApiKey: hasApiKeyFromCtx, aiModel, onboardingData, formTemplate, properties, hostSettings, promptOverrides, activeMessages } = useAppContext();
   const guestNeedsMode = hostSettings?.[0]?.demoFeatures?.guestNeedsMode ?? 'ai-context';
   const [isAnalyzing, setIsAnalyzing] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  // Emit classifying state to parent so it can show loading placeholders
+  // (e.g. summary banner skeleton) while new classification is in flight.
+  useEffect(() => {
+    onClassifyingChange?.(isAnalyzing || isRefreshing);
+  }, [isAnalyzing, isRefreshing, onClassifyingChange]);
   const [expandedInquiries, setExpandedInquiries] = useState<Set<string>>(new Set());
   const [expandedArticle, setExpandedArticle] = useState<string | null>(null);
 
@@ -443,19 +450,17 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
   }, [inquiries, ticket.property, ticket.room]);
 
   // Reset state + load chat on ticket switch
-  // isAnalyzing is set to false by the classification effect when LLM returns
+  // This fires only when ticket.id changes — same-ticket re-classification
+  // uses the classifyKey effect below (which keeps stale cards visible).
   useEffect(() => {
-    // Only show full skeleton on first load — keep stale inquiries visible during
-    // re-classification to avoid flash. isRefreshing handles the inline indicator.
-    if (aiInquiries === null) {
-      setIsAnalyzing(true);
-    }
+    setIsAnalyzing(true);
     setExpandedInquiries(new Set());
     setExpandedArticle(null);
     setInputText('');
     setIsThinking(false);
-    // Don't clear inquiries — let them go stale briefly while re-classifying
-    // to avoid the flash of empty → skeleton → new content
+    // Clear stale inquiries from the previous ticket so skeleton shows
+    // while the new ticket is being classified. Prevents wrong-context flash.
+    updateAiInquiries(null);
     setChatMessages([]); // Clear old thread's chat immediately
     llmClassifyRef.current = null;
 
