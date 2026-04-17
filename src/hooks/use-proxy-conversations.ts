@@ -203,6 +203,38 @@ export function useProxyConversations({
   return { conversations, isLoading, loadMore };
 }
 
+// ─── Proxy message cache + warm subscriptions ───────────────────────────────
+// Parity with useFirestoreMessages: LRU cache + 10s warm unsubscribe so rapid
+// thread switching doesn't tear down and recreate the Realtime channel and
+// poll loop. Module-level so all useProxyMessages instances share state.
+
+const PROXY_CACHE_SIZE = 5;
+const PROXY_WARM_MS = 10_000;
+const proxyMessageCache = new Map<string, ProxyMessage[]>();
+
+function proxyCacheSet(conversationId: string, rows: ProxyMessage[]) {
+  if (proxyMessageCache.size >= PROXY_CACHE_SIZE && !proxyMessageCache.has(conversationId)) {
+    const oldest = proxyMessageCache.keys().next().value;
+    if (oldest) proxyMessageCache.delete(oldest);
+  }
+  proxyMessageCache.set(conversationId, rows);
+}
+
+interface WarmProxySub {
+  teardown: () => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+const proxyWarmSubs = new Map<string, WarmProxySub>();
+
+function reclaimProxyWarmSub(conversationId: string): boolean {
+  const warm = proxyWarmSubs.get(conversationId);
+  if (!warm) return false;
+  clearTimeout(warm.timer);
+  proxyWarmSubs.delete(conversationId);
+  warm.teardown();
+  return true;
+}
+
 /**
  * Hook for messages within a specific proxy conversation.
  *
@@ -213,6 +245,10 @@ export function useProxyConversations({
  *
  * Polling also re-runs when the window regains focus so agents coming back
  * to a tab see fresh content immediately.
+ *
+ * Switching conversations keeps the previous conversation's subscription alive
+ * for 10s and caches its last message list, so rapid back-and-forth navigation
+ * is instant and doesn't churn Realtime channels.
  */
 export function useProxyMessages(
   supabase: SupabaseClient,
@@ -221,21 +257,45 @@ export function useProxyMessages(
   const [messages, setMessages] = useState<ProxyMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
 
+  // Current visible conversationId. Warm poll loops and Realtime subscriptions
+  // capture their own conversationId at setup time and only update UI state
+  // when this ref still matches — so messages from a previously-viewed
+  // conversation can't stomp the current view.
+  const currentConvIdRef = useRef<string | null>(conversationId);
+  currentConvIdRef.current = conversationId;
+
   useEffect(() => {
     if (!conversationId) {
       setMessages([]);
       return;
     }
 
+    const capturedConvId = conversationId;
+    const isCurrent = () => currentConvIdRef.current === capturedConvId;
+
+    // Warm-start: if we have a cached list, render instantly; skip loading flag
+    const cached = proxyMessageCache.get(capturedConvId);
+    if (cached) {
+      setMessages(cached);
+      setIsLoading(false);
+    } else {
+      // Clear old conversation's data so we don't flash it inside the new one
+      setMessages([]);
+      setIsLoading(true);
+    }
+
+    // If this conversation is still warming down from a recent unmount, tear
+    // down that old subscription so we don't end up with two live channels.
+    reclaimProxyWarmSub(capturedConvId);
+
     let cancelled = false;
-    setIsLoading(true);
 
     const fetchMessages = async (markLoading: boolean) => {
-      if (markLoading) setIsLoading(true);
+      if (markLoading && !cached && isCurrent()) setIsLoading(true);
       const { data, error } = await supabase
         .from('messages')
         .select('*')
-        .eq('conversation_id', conversationId)
+        .eq('conversation_id', capturedConvId)
         .order('channel_timestamp', { ascending: true })
         .limit(100);
       if (cancelled) return;
@@ -243,6 +303,10 @@ export function useProxyMessages(
         console.error('Failed to fetch proxy messages:', error);
       } else {
         const rows = (data ?? []) as ProxyMessage[];
+        // Always update cache so warm reclaim is accurate
+        proxyCacheSet(capturedConvId, rows);
+        // UI only if still viewing this conversation
+        if (!isCurrent()) return;
         setMessages((prev) => {
           // Avoid re-rendering if the row set is unchanged (same count and
           // last row id). Keeps the component stable between polls.
@@ -254,7 +318,7 @@ export function useProxyMessages(
           return rows;
         });
       }
-      if (markLoading) setIsLoading(false);
+      if (markLoading && isCurrent()) setIsLoading(false);
     };
 
     // Initial fetch
@@ -272,17 +336,24 @@ export function useProxyMessages(
     // Best-effort Realtime subscription. If the server accepts it we get
     // instant updates; if it silently errors, the polling loop above covers us.
     const channel = supabase
-      .channel(`proxy-messages-${conversationId}`)
+      .channel(`proxy-messages-${capturedConvId}`)
       .on(
         'postgres_changes',
         {
           event: 'INSERT',
           schema: 'public',
           table: 'messages',
-          filter: `conversation_id=eq.${conversationId}`,
+          filter: `conversation_id=eq.${capturedConvId}`,
         },
         (payload) => {
           const msg = payload.new as ProxyMessage;
+          // Keep cache in sync so warm reclaim stays accurate — always.
+          const cachedNow = proxyMessageCache.get(capturedConvId) ?? [];
+          if (!cachedNow.some((m) => m.id === msg.id)) {
+            proxyCacheSet(capturedConvId, [...cachedNow, msg]);
+          }
+          // UI only if this callback's conversation is still current.
+          if (!isCurrent()) return;
           setMessages((prev) =>
             prev.some((m) => m.id === msg.id) ? prev : [...prev, msg],
           );
@@ -290,11 +361,22 @@ export function useProxyMessages(
       )
       .subscribe();
 
-    return () => {
+    const teardown = () => {
       cancelled = true;
       clearInterval(interval);
       window.removeEventListener('focus', onFocus);
       channel.unsubscribe();
+    };
+
+    return () => {
+      // Defer teardown by 10s — parity with useFirestoreMessages warm window.
+      // If the user navigates back to this conversation, reclaimProxyWarmSub
+      // above will cancel the timer and tear down cleanly.
+      const timer = setTimeout(() => {
+        proxyWarmSubs.delete(capturedConvId);
+        teardown();
+      }, PROXY_WARM_MS);
+      proxyWarmSubs.set(capturedConvId, { teardown, timer });
     };
   }, [supabase, conversationId]);
 

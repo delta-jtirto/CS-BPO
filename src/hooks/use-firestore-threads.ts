@@ -51,12 +51,23 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
   return chunks;
 }
 
+/** Firestore error codes that mean the session has lost its authority. */
+function isAuthError(err: unknown): boolean {
+  const code = (err as { code?: string } | null)?.code;
+  return code === 'permission-denied' || code === 'unauthenticated';
+}
+
 export function useFirestoreThreads(
   connections: FirestoreConnection[],
   activeTicketId: string | null,
   bpoState?: BPOOverlayState,
   properties?: { hostId: string; name: string }[],
+  onAuthError?: (hostId: string) => void,
 ): UseFirestoreThreadsResult {
+  // Stable ref so changing the callback doesn't re-subscribe
+  const onAuthErrorRef = useRef(onAuthError);
+  onAuthErrorRef.current = onAuthError;
+
   // Per-host raw thread data
   const threadsByHost = useRef<Map<string, Ticket[]>>(new Map());
   const [threads, setThreads] = useState<Ticket[]>([]);
@@ -213,6 +224,7 @@ export function useFirestoreThreads(
               },
               (error) => {
                 console.error(`[Firestore] Threads query error for ${conn.hostId}:`, error);
+                if (isAuthError(error)) onAuthErrorRef.current?.(conn.hostId);
                 loadedHosts.current.add(conn.hostId);
                 if (loadedHosts.current.size >= connections.length) {
                   setIsLoading(false);
@@ -225,6 +237,7 @@ export function useFirestoreThreads(
         },
         (error) => {
           console.error(`[Firestore] User doc error for ${conn.hostId}:`, error);
+          if (isAuthError(error)) onAuthErrorRef.current?.(conn.hostId);
           loadedHosts.current.add(conn.hostId);
           if (loadedHosts.current.size >= connections.length) {
             setIsLoading(false);

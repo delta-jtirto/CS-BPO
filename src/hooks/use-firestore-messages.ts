@@ -49,12 +49,24 @@ export function useFirestoreMessages(
   threadId: string | null,
   db: Firestore | null,
   guestUserId?: string,
+  onAuthError?: () => void,
 ): UseFirestoreMessagesResult {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const spinnerTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const [showSpinner, setShowSpinner] = useState(false);
+
+  // Stable ref so callback identity changes don't re-subscribe
+  const onAuthErrorRef = useRef(onAuthError);
+  onAuthErrorRef.current = onAuthError;
+
+  // Ref to the currently-viewed threadId. Warm subscriptions capture their
+  // own threadId in the closure — they check against this ref before calling
+  // the shared setMessages, so a warm sub for thread B can't stomp the UI
+  // state while the user is viewing thread A.
+  const currentThreadIdRef = useRef<string | null>(threadId);
+  currentThreadIdRef.current = threadId;
 
   useEffect(() => {
     if (!threadId || !db) {
@@ -64,13 +76,21 @@ export function useFirestoreMessages(
       return;
     }
 
+    // Capture the threadId this effect was set up for. Every setMessages call
+    // below checks that we're still viewing this thread before applying.
+    const capturedThreadId = threadId;
+    const isCurrent = () => currentThreadIdRef.current === capturedThreadId;
+
     // Check cache first — instant display
-    const cached = messageCache.get(threadId);
+    const cached = messageCache.get(capturedThreadId);
     if (cached) {
       setMessages(cached);
       setIsLoading(false);
       setShowSpinner(false);
     } else {
+      // Clear old thread's data so we don't flash B's messages inside A's UI
+      // while the snapshot for A is still in flight.
+      setMessages([]);
       setIsLoading(true);
       setShowSpinner(false);
       // Only show spinner after 150ms delay
@@ -78,17 +98,17 @@ export function useFirestoreMessages(
     }
 
     // If there's a warm subscription for this thread, reclaim it
-    const warm = warmSubs.get(threadId);
+    const warm = warmSubs.get(capturedThreadId);
     if (warm) {
       clearTimeout(warm.timer);
-      warmSubs.delete(threadId);
+      warmSubs.delete(capturedThreadId);
       // The warm subscription is still firing into the cache — we just need to
       // re-establish the state setter. Let it fall through to create a new one
       // (the old one will be cleaned up by Firestore deduplication).
       warm.unsub();
     }
 
-    const messagesRef = collection(db, 'threads', threadId, 'messages');
+    const messagesRef = collection(db, 'threads', capturedThreadId, 'messages');
     const q = query(messagesRef, orderBy('timestamp'));
 
     const unsub = onSnapshot(
@@ -99,14 +119,26 @@ export function useFirestoreMessages(
           return mapFirestoreMessage(data, guestUserId);
         });
 
+        // Cache always — even for warm subs whose thread isn't visible now.
+        cacheSet(capturedThreadId, fetched);
+
+        // UI state only when this callback belongs to the visible thread.
+        // Without this guard, a warm subscription for a previously-viewed
+        // thread would stomp the current thread's rendered messages.
+        if (!isCurrent()) return;
+
         setMessages(fetched);
-        cacheSet(threadId, fetched);
         setIsLoading(false);
         setShowSpinner(false);
         if (spinnerTimerRef.current) clearTimeout(spinnerTimerRef.current);
       },
       (err) => {
-        console.error(`[Firestore] Messages error for thread ${threadId}:`, err);
+        console.error(`[Firestore] Messages error for thread ${capturedThreadId}:`, err);
+        const code = (err as { code?: string } | null)?.code;
+        if (code === 'permission-denied' || code === 'unauthenticated') {
+          onAuthErrorRef.current?.();
+        }
+        if (!isCurrent()) return;
         setError('Failed to load messages');
         setIsLoading(false);
         setShowSpinner(false);
@@ -120,10 +152,10 @@ export function useFirestoreMessages(
       // Keep subscription warm for 10s instead of immediate unsubscribe
       const timer = setTimeout(() => {
         unsub();
-        warmSubs.delete(threadId);
+        warmSubs.delete(capturedThreadId);
       }, 10_000);
 
-      warmSubs.set(threadId, { unsub, timer });
+      warmSubs.set(capturedThreadId, { unsub, timer });
     };
   }, [threadId, db]);
 

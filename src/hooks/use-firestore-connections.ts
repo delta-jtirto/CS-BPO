@@ -36,6 +36,10 @@ interface UseFirestoreConnectionsResult {
   reconnect: (hostId: string, newToken: string) => Promise<void>;
   /** Test a connection's token validity */
   testConnection: (hostId: string) => Promise<boolean>;
+  /** Manually mark a connection as expired — triggers the Reconnect UI.
+   *  Call this when a downstream API (e.g. PMS) returns 401 or Firestore
+   *  snapshot fires a permission-denied error. Idempotent. */
+  markExpired: (hostId: string, health?: ConnectionHealth) => void;
   /** Callback for saving connections externally (to Supabase KV) */
   savedConnections: SavedConnection[];
 }
@@ -261,6 +265,15 @@ export function useFirestoreConnections(
     };
   }, []);
 
+  const markExpired = useCallback(
+    (hostId: string, health: ConnectionHealth = 'expired') => {
+      const current = connectionsRef.current.find((c) => c.hostId === hostId);
+      if (!current || current.status !== 'connected') return; // idempotent
+      handleHealthChange(hostId, health);
+    },
+    [handleHealthChange],
+  );
+
   return {
     connections,
     isInitializing,
@@ -268,6 +281,7 @@ export function useFirestoreConnections(
     removeConnection,
     reconnect,
     testConnection,
+    markExpired,
     savedConnections,
   };
 }

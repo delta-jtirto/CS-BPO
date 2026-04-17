@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { memo, useState } from 'react';
 import {
   User, Users, ChevronDown, ChevronUp, Building, Moon,
   ArrowRight, ExternalLink, FileText, Copy,
@@ -61,7 +61,7 @@ function Skeleton({ className = '' }: { className?: string }) {
 
 const PMS_BASE = import.meta.env.VITE_PMS_API_BASE_URL || 'https://pms.beta.deltahq.com';
 
-export function BookingDetailsSection({
+function BookingDetailsSectionImpl({
   bookingDetails: bd,
   bookingLoading,
   activeTicket,
@@ -342,6 +342,8 @@ export function BookingDetailsSection({
     </div>
   );
 }
+
+export const BookingDetailsSection = memo(BookingDetailsSectionImpl);
 
 function IncidentLog({ notes, onUpdate }: { notes: string; onUpdate: (v: string) => void }) {
   return (

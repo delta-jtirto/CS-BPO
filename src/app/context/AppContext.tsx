@@ -117,6 +117,10 @@ interface AppState {
   addFirestoreConnection: (accessToken: string, host: Host) => Promise<void>;
   removeFirestoreConnection: (hostId: string) => Promise<void>;
   reconnectFirestore: (hostId: string, newToken: string) => Promise<void>;
+  /** Mark an inbox connection as expired — surfaces the Reconnect UI.
+   *  Call when a downstream API returns 401/403 or Firestore snapshot errors
+   *  with permission-denied / unauthenticated. */
+  markFirestoreConnectionExpired: (hostId: string) => void;
 
   // BPO overlay state (persisted in Supabase KV)
   escalationOverrides: Record<string, import('@/lib/compute-ticket-state').EscalationOverride>;
@@ -395,6 +399,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     addConnection: addFirestoreConnection,
     removeConnection: removeFirestoreConnection,
     reconnect: reconnectFirestore,
+    markExpired: markFirestoreConnectionExpired,
   } = useFirestoreConnections(
     initialSavedConnections,
     handleConnectionHealthChange,
@@ -456,6 +461,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     null,
     bpoOverlayState,
     properties,
+    markFirestoreConnectionExpired,
   );
 
   // Merge Firestore threads into the tickets state
@@ -2007,7 +2013,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       tickets, setTickets, activeMessages, setActiveMessages,
       isInitialLoad, proxyCompanyIds, setProxyTicketProperty,
       firestoreConnections, firestoreInitializing,
-      addFirestoreConnection, removeFirestoreConnection, reconnectFirestore,
+      addFirestoreConnection, removeFirestoreConnection, reconnectFirestore, markFirestoreConnectionExpired,
       escalationOverrides, handoverReasons, setHandoverReason,
       resolveTicket, addMessageToTicket, pendingProxyMessages, retryPendingProxyMessage, deletePendingProxyMessage, injectGuestMessage, addBotMessage, addSystemMessage, addMultipleMessages, escalateTicketStatus, escalateTicketWithUrgency, deescalateTicket, deleteMessageFromTicket, deleteThread,
       draftReplies, setDraftReply, clearDraftReply,

@@ -99,6 +99,7 @@ export function InboxView() {
     ticketNotes, updateTicketNotes,
     activeMessages, setActiveMessages,
     firestoreConnections, firestoreInitializing,
+    markFirestoreConnectionExpired,
   } = useAppContext();
 
   const filteredTickets = activeHostFilter === 'all' ? tickets : tickets.filter(t => t.host.id === activeHostFilter);
@@ -135,10 +136,15 @@ export function InboxView() {
     return conn?.db || null;
   }, [activeTicket?.firestoreHostId, firestoreConnections]);
 
+  const firestoreMessagesAuthError = useCallback(() => {
+    if (activeTicket?.firestoreHostId) markFirestoreConnectionExpired(activeTicket.firestoreHostId);
+  }, [activeTicket?.firestoreHostId, markFirestoreConnectionExpired]);
+
   const { messages: firestoreMessages, isLoading: messagesLoading } = useFirestoreMessages(
     activeTicket?.firestoreThreadId || null,
     activeTicketDb,
     activeTicket?.firestoreGuestUserId,
+    firestoreMessagesAuthError,
   );
 
   // Proxy message subscription (WhatsApp, Instagram, LINE, Email)
@@ -152,52 +158,66 @@ export function InboxView() {
     [rawProxyMessages],
   );
 
-  // Sync messages into context — branch on source
+  // Sync messages into context — branch on source.
+  //
+  // The hooks (useFirestoreMessages / useProxyMessages) are responsible for
+  // clearing their output when the underlying thread changes (cache miss →
+  // setMessages([])), and for dropping snapshot updates that belong to a
+  // previously-viewed thread. So here we can safely copy the current source's
+  // array straight across without a "length > 0" gate — if the source is
+  // loading, it's empty, and activeMessages should be empty too. Prior code
+  // skipped the update in that case, which left the *previous* thread's
+  // messages visible during rapid thread switching.
   useEffect(() => {
-    if (isProxyTicket) {
-      // Proxy ticket: use Supabase messages
-      if (proxyMessages.length > 0) {
-        setActiveMessages(proxyMessages);
-      } else {
-        setActiveMessages([]);
-      }
-    } else if (firestoreMessages.length > 0) {
-      // Firestore ticket
-      setActiveMessages(firestoreMessages);
-    } else if (!activeTicket?.firestoreThreadId) {
-      // Non-Firestore, non-proxy ticket — clear
-      setActiveMessages([]);
-    }
+    const target = isProxyTicket
+      ? proxyMessages
+      : activeTicket?.firestoreThreadId
+        ? firestoreMessages
+        : [];
+    setActiveMessages((prev) => {
+      if (prev === target) return prev;
+      if (prev.length === 0 && target.length === 0) return prev;
+      return target;
+    });
   }, [isProxyTicket, proxyMessages, firestoreMessages, activeTicket?.firestoreThreadId, setActiveMessages]);
 
   // Sync Firestore messages into ticket.messages so AI consumers (useAutoReply,
   // useSmartReply, AssistantPanel) can see the full conversation.
   // Merge strategy: Firestore supplies guest/host/agent messages; local state
   // supplies bot/system messages added by auto-reply. Sender types don't overlap.
+  //
+  // Perf: decide whether anything changed INSIDE the updater and bail with the
+  // same `prev` reference when nothing did. `prev.map(...)` always returns a
+  // fresh array, so without this guard React would re-render every consumer of
+  // `tickets` on every Firestore snapshot — even idempotent ones.
   useEffect(() => {
     if (!activeTicket?.firestoreThreadId || firestoreMessages.length === 0) return;
 
-    setTickets(prev => prev.map(t => {
-      if (t.id !== activeTicket.id) return t;
+    setTickets(prev => {
+      const ticket = prev.find(t => t.id === activeTicket.id);
+      if (!ticket) return prev;
 
       // Keep locally-created bot/system messages — they aren't in Firestore
-      const localMessages = (t.messages || []).filter(
+      const localMessages = (ticket.messages || []).filter(
         m => m.sender === 'bot' || m.sender === 'system'
       );
 
       const merged = [...firestoreMessages, ...localMessages]
         .sort((a, b) => a.createdAt - b.createdAt);
 
-      // Skip update if nothing actually changed (avoid unnecessary re-renders)
-      const existing = t.messages || [];
+      // Bail out if the merged list matches what the ticket already has —
+      // returning the same reference stops React from re-rendering consumers.
+      const existing = ticket.messages || [];
       if (existing.length === merged.length) {
         const last = existing[existing.length - 1];
         const lastM = merged[merged.length - 1];
-        if (last?.text === lastM?.text && last?.createdAt === lastM?.createdAt) return t;
+        if (last?.text === lastM?.text && last?.createdAt === lastM?.createdAt) {
+          return prev;
+        }
       }
 
-      return { ...t, messages: merged };
-    }));
+      return prev.map(t => (t.id === activeTicket.id ? { ...t, messages: merged } : t));
+    });
   }, [firestoreMessages, activeTicket?.id, activeTicket?.firestoreThreadId, setTickets]);
 
   // Helper: get messages for a ticket — from Firestore or Supabase (activeMessages)
@@ -283,16 +303,24 @@ export function InboxView() {
     return activeTicket.tags || [];
   }, [activeTicket?.id, activeMessages.length, getMessages, activeTicket]);
 
+  // Shared: compute detectInquiries once per thread switch; escalationGuidance
+  // derives cheaply from this. Previously ran twice on every render.
+  const activeInquiries = useMemo(() => {
+    if (!activeTicket) return [];
+    const msgs = getMessages(activeTicket);
+    if (msgs.length === 0) return [];
+    const guestMsgs = msgs.filter(m => m.sender === 'guest').map(m => m.text);
+    return detectInquiries(guestMsgs, activeTicket.tags, activeTicket.summary);
+  }, [activeTicket?.id, activeMessages.length, getMessages, activeTicket]);
+
   // BPO Step 3 — escalation guidance: map detected inquiry types to host contact strategy
   const escalationGuidance = useMemo(() => {
-    if (!activeTicket) return null;
-    const guestMsgs = getMessages(activeTicket).filter(m => m.sender === 'guest').map(m => m.text);
-    const inquiries = detectInquiries(guestMsgs, activeTicket.tags, activeTicket.summary);
-    const types = inquiries.map(i => i.type);
+    if (!activeTicket || activeInquiries.length === 0) return null;
+    const types = activeInquiries.map(i => i.type);
     if (types.some(t => ['maintenance', 'safety', 'billing'].includes(t))) return 'immediate' as const;
     if (types.some(t => ['checkin', 'wifi', 'amenities', 'directions'].includes(t))) return 'handle-first' as const;
     return null;
-  }, [activeTicket]);
+  }, [activeInquiries, activeTicket]);
 
   // Count paused/handed-off threads for bulk resume button
   const pausedOrHandedOffCount = filteredTickets.filter(t => {

@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import { Clock, Sparkles, User, ArrowDown, ArrowLeft, X } from 'lucide-react';
 import { toast } from 'sonner';
 import type { Ticket, InquiryResolutionMap, InquiryResolutionState } from '../../data/types';
@@ -44,7 +45,7 @@ interface ContextSidebarPaneProps {
   onClassifyingChange?: (isClassifying: boolean) => void;
 }
 
-export function ContextSidebarPane({
+function ContextSidebarPaneImpl({
   activeTicket,
   activeTags,
   isMobile,
@@ -170,3 +171,5 @@ export function ContextSidebarPane({
     </div>
   );
 }
+
+export const ContextSidebarPane = memo(ContextSidebarPaneImpl);

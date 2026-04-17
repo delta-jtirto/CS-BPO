@@ -1,3 +1,5 @@
+import convertKeysToCamelCase from './convertKeysToCamelCase';
+
 const PMS_API_BASE = import.meta.env.VITE_PMS_API_BASE_URL || 'https://pms.beta.deltahq.com/api/';
 
 export interface BookingDetails {
@@ -48,10 +50,15 @@ const cache = new Map<number, CacheEntry>();
 
 /**
  * Fetch booking details from PMS API. Cached with TTL.
+ *
+ * @param onAuthError - called with the HTTP status when the response is 401/403.
+ *   Wire this to a "Reconnect" flow; we still cache the failure so we don't spam
+ *   the endpoint with doomed retries in the same tick.
  */
 export async function fetchBookingDetails(
   bookingId: number,
   accessToken: string,
+  onAuthError?: (status: number) => void,
 ): Promise<BookingDetails | null> {
   const cached = cache.get(bookingId);
   if (cached) {
@@ -71,11 +78,14 @@ export async function fetchBookingDetails(
     });
 
     if (!response.ok) {
+      console.warn('[pms-api] bookings/:id non-ok', { bookingId, status: response.status });
+      if (response.status === 401 || response.status === 403) onAuthError?.(response.status);
       cache.set(bookingId, { data: null, fetchedAt: Date.now(), isError: true });
       return null;
     }
 
-    const json = await response.json();
+    const raw = await response.json();
+    const json = convertKeysToCamelCase(raw);
     const d = json.data || json;
 
     // Compute nights from dates
@@ -127,7 +137,8 @@ export async function fetchBookingDetails(
 
     cache.set(bookingId, { data: details, fetchedAt: Date.now(), isError: false });
     return details;
-  } catch {
+  } catch (err) {
+    console.warn('[pms-api] bookings/:id threw', { bookingId, err });
     cache.set(bookingId, { data: null, fetchedAt: Date.now(), isError: true });
     return null;
   }
@@ -145,6 +156,7 @@ export interface PaymentData {
 export async function fetchPaymentData(
   bookingId: number,
   accessToken: string,
+  onAuthError?: (status: number) => void,
 ): Promise<PaymentData | null> {
   try {
     const response = await fetch(`${PMS_API_BASE}v2/bookings/${bookingId}/payment-data`, {
@@ -155,9 +167,14 @@ export async function fetchPaymentData(
       },
     });
 
-    if (!response.ok) return null;
+    if (!response.ok) {
+      console.warn('[pms-api] payment-data non-ok', { bookingId, status: response.status });
+      if (response.status === 401 || response.status === 403) onAuthError?.(response.status);
+      return null;
+    }
 
-    const json = await response.json();
+    const raw = await response.json();
+    const json = convertKeysToCamelCase(raw);
     const d = json.data || json;
     const payments = d.payments;
 
@@ -171,7 +188,8 @@ export async function fetchPaymentData(
     }
 
     return null;
-  } catch {
+  } catch (err) {
+    console.warn('[pms-api] payment-data threw', { bookingId, err });
     return null;
   }
 }
