@@ -337,7 +337,13 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
       llmClassifyRef.current = classifyKey;
       handleClassifyResult(cr);
       if (cr.inquiries.length > 0 && classifySignature.lastMessageAt) {
-        void classifyCache.save(ticket.id, classifyCompanyId, classifySignature, cr);
+        const existing = classifyCache.entries[ticket.id]?.signature;
+        const isAtLeastAsComplete = !existing
+          || (classifySignature.messageCount >= existing.messageCount
+              && classifySignature.lastMessageAt >= existing.lastMessageAt);
+        if (isAtLeastAsComplete) {
+          void classifyCache.save(ticket.id, classifyCompanyId, classifySignature, cr);
+        }
       }
     }).catch(() => {
       llmClassifyRef.current = classifyKey;
@@ -399,11 +405,25 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
     ).then(cr => {
       console.log('[AssistantPanel] LLM classified %d inquiries for key %s', cr.inquiries.length, classifyKey);
       handleClassifyResult(cr);
-      // Persist for future sessions. Skip empty results — they usually mean a
-      // transient failure, not a real "nothing to classify" state, and we'd
-      // rather re-run on reload than cache an empty row.
+      // Persist for future sessions — but treat the cache as monotonic:
+      //   * Skip empty results (transient failures, not a real zero state)
+      //   * Skip writes that would overwrite a MORE-complete classification.
+      //     On cold reload, proxyMessages briefly lands in chunks — the first
+      //     render may fire classify at messageCount=2 before the full 12
+      //     arrives. Without this guard, that intermediate classify would
+      //     stomp the previously-saved count=12 row, and on the next reload
+      //     nothing would hit (see commit history for the race analysis).
       if (cr.inquiries.length > 0 && classifySignature.lastMessageAt) {
-        void classifyCache.save(ticket.id, classifyCompanyId, classifySignature, cr);
+        const existing = classifyCache.entries[ticket.id]?.signature;
+        const isAtLeastAsComplete = !existing
+          || (classifySignature.messageCount >= existing.messageCount
+              && classifySignature.lastMessageAt >= existing.lastMessageAt);
+        if (isAtLeastAsComplete) {
+          void classifyCache.save(ticket.id, classifyCompanyId, classifySignature, cr);
+        } else {
+          console.log('[AssistantPanel] skipping cache save — incoming sig',
+            classifySignature, 'is less complete than stored', existing);
+        }
       }
     }).catch(err => {
       console.error('[AssistantPanel] LLM classification failed, falling back to regex:', err);
