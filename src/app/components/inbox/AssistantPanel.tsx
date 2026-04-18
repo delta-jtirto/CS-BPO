@@ -349,6 +349,13 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
       return;
     }
 
+    // Wait for the persisted classify cache to hydrate from Supabase. Without
+    // this gate, a page refresh runs this effect before the cache fetch
+    // completes → getIfFresh returns null → we'd fire the LLM for threads
+    // that already have a cached result. llmClassifyRef would then latch the
+    // key, so the effect wouldn't re-check even after entries hydrate.
+    if (classifyCache.isLoading) return;
+
     if (llmClassifyRef.current === classifyKey) return;
     llmClassifyRef.current = classifyKey;
 
@@ -400,7 +407,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
       setIsRefreshing(false);
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [classifyKey, hasApiKey, aiModel, propContext]);
+  }, [classifyKey, hasApiKey, aiModel, propContext, classifyCache.isLoading]);
 
   // All inquiries come from LLM (or regex fallback when no API key)
   // Deduplicate: merge same-type inquiries, combining their details

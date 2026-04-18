@@ -68,7 +68,12 @@ export function useClassifyCache({
   companyIds,
 }: UseClassifyCacheOptions): UseClassifyCacheResult {
   const [entries, setEntries] = useState<Record<string, ClassifyCacheEntry>>({});
+  // Stays `true` until the first fetch with non-empty companyIds resolves.
+  // Consumers gate their "should I run the LLM?" decision on this so they
+  // don't fall through on the empty-companies render that happens between
+  // mount and Supabase auth resolving.
   const [isLoading, setIsLoading] = useState(true);
+  const didHydrateRef = useRef(false);
 
   // Ref mirror so getIfFresh (used inside effects/callbacks) always sees the
   // latest map without joining the closure deps of its consumers.
@@ -78,8 +83,12 @@ export function useClassifyCache({
   // Initial fetch — one round trip per company set change.
   useEffect(() => {
     if (companyIds.length === 0) {
+      // Only declare "done loading" once we've actually hydrated at least
+      // once. Otherwise, the brief empty-companies window between mount and
+      // Supabase session resolution would flip isLoading to false, tricking
+      // callers into treating an empty cache as authoritative.
       setEntries({});
-      setIsLoading(false);
+      if (didHydrateRef.current) setIsLoading(false);
       return;
     }
 
@@ -110,6 +119,7 @@ export function useClassifyCache({
           }
           setEntries(map);
         }
+        didHydrateRef.current = true;
         setIsLoading(false);
       });
 
