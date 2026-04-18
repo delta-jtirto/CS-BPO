@@ -299,6 +299,23 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
     messageCount: nonSystemMessages.length,
     modelVersion: CLASSIFY_MODEL_VERSION,
   };
+
+  // `activeMessages` in AppContext lags the `ticket` prop on rapid thread
+  // switches: when the user clicks from A → B, the first render has
+  // ticket=B but activeMessages still holding A's messages (the sub hook
+  // state updates on a subsequent render). Classifying A's data under B's
+  // cache key writes a polluted row, and on reload B always misses.
+  //
+  // We only trust the signature when activeMessages has caught up to this
+  // thread's authoritative last-message timestamp (Ticket.slaSetAt, which
+  // both proxy and Firestore mappers set from the source's real timestamp).
+  // Strict equality because proxy/Firestore both store ms precision; during
+  // rare drift (new message arrived but conversation row not yet updated),
+  // we simply defer classify until the next render.
+  const messagesMatchTicket =
+    lastNonSystem != null &&
+    typeof ticket.slaSetAt === 'number' &&
+    classifySignature.lastMessageAt === ticket.slaSetAt;
   // RLS-scoped company id. Proxy tickets carry their own; Firestore tickets
   // don't surface one (they're scoped by Unified Inbox host), so we fall back
   // to the agent's single-tenant company so the upsert passes RLS.
@@ -374,6 +391,16 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
     if (resolvedGuestMessages.length === 0) {
       updateAiInquiries([fallbackGeneralInquiry(ticket)]);
       setIsAnalyzing(false);
+      return;
+    }
+
+    // Skip until activeMessages have caught up to this ticket. Without this,
+    // a rapid thread switch fires classify with the *previous* ticket's
+    // messages under the *current* ticket's cache key, poisoning the row.
+    if (!messagesMatchTicket) {
+      // Unlatch the ref so the next render (with fresh messages) gets a
+      // fresh shot at the effect — otherwise we'd silently skip forever.
+      llmClassifyRef.current = null;
       return;
     }
 
