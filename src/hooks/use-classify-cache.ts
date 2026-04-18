@@ -5,10 +5,12 @@
  * RLS-scoped to the user's companies. Unlike that hook, thread_key is a text
  * ticket.id so it works for both Firestore threads and proxy conversations.
  *
- * Contract: caller supplies a signature (lastMessageId + messageCount +
+ * Contract: caller supplies a signature (lastMessageAt + messageCount +
  * modelVersion) together with the result. A future read returns the stored
  * result ONLY when all three signature components still match — otherwise the
- * caller should re-run the LLM and overwrite the row.
+ * caller should re-run the LLM and overwrite the row. lastMessageAt is the
+ * epoch-ms `createdAt` of the thread's last non-system message — stable
+ * across reloads (unlike Message.id, which is a synthetic per-session counter).
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -16,7 +18,9 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import type { ClassifyResult } from '@/app/components/inbox/InquiryDetector';
 
 export interface ClassifySignature {
-  lastMessageId: string;
+  /** Epoch ms of the last non-system message. Stable across reloads (unlike
+   *  Message.id, which is a synthetic mapper counter that resets on refresh). */
+  lastMessageAt: number;
   messageCount: number;
   modelVersion: string;
 }
@@ -56,7 +60,7 @@ export interface UseClassifyCacheResult {
 
 interface RowShape {
   thread_key: string;
-  last_message_id: string;
+  last_message_at: number;
   message_count: number;
   model_version: string;
   result: ClassifyResult;
@@ -97,7 +101,7 @@ export function useClassifyCache({
 
     supabase
       .from('thread_ai_classify')
-      .select('thread_key, last_message_id, message_count, model_version, result, classified_at')
+      .select('thread_key, last_message_at, message_count, model_version, result, classified_at')
       .in('company_id', companyIds)
       .then(({ data, error }) => {
         if (cancelled) return;
@@ -109,7 +113,7 @@ export function useClassifyCache({
           for (const row of (data ?? []) as RowShape[]) {
             map[row.thread_key] = {
               signature: {
-                lastMessageId: row.last_message_id,
+                lastMessageAt: Number(row.last_message_at),
                 messageCount: row.message_count,
                 modelVersion: row.model_version,
               },
@@ -134,7 +138,7 @@ export function useClassifyCache({
       const hit = entriesRef.current[threadKey];
       if (!hit) return null;
       if (
-        hit.signature.lastMessageId === signature.lastMessageId &&
+        hit.signature.lastMessageAt === signature.lastMessageAt &&
         hit.signature.messageCount === signature.messageCount &&
         hit.signature.modelVersion === signature.modelVersion
       ) {
@@ -160,7 +164,7 @@ export function useClassifyCache({
           {
             company_id: companyId,
             thread_key: threadKey,
-            last_message_id: signature.lastMessageId,
+            last_message_at: signature.lastMessageAt,
             message_count: signature.messageCount,
             model_version: signature.modelVersion,
             result,

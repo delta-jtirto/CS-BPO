@@ -282,14 +282,20 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
   const classifyKey = `${ticket.id}:${resolvedMessages.filter(m => m.sender !== 'system').length}:${ticket.property}`;
 
   // Persistence signature for the cross-session cache. Invariants:
-  //   - lastMessageId captures *what* the guest/agent last said
+  //   - lastMessageAt captures *when* the guest/agent last said something
   //   - messageCount captures the length of the thread at classification time
   //   - modelVersion captures the prompt/model tier
   // When any of these drift from the stored row, we re-classify.
+  //
+  // Note: we use `createdAt` (epoch ms) — NOT `Message.id`. The `id` field is
+  // a synthetic per-session counter assigned in proxy-mappers.ts and
+  // firestore-mappers.ts; it resets on page reload, so two identical
+  // conversations see different ids on each visit and the cache would always
+  // miss. `createdAt` comes from the source's real timestamp and is stable.
   const nonSystemMessages = resolvedMessages.filter(m => m.sender !== 'system');
   const lastNonSystem = nonSystemMessages[nonSystemMessages.length - 1];
   const classifySignature = {
-    lastMessageId: lastNonSystem ? String(lastNonSystem.id ?? '') : '',
+    lastMessageAt: lastNonSystem?.createdAt ?? 0,
     messageCount: nonSystemMessages.length,
     modelVersion: CLASSIFY_MODEL_VERSION,
   };
@@ -330,7 +336,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
     ).then(cr => {
       llmClassifyRef.current = classifyKey;
       handleClassifyResult(cr);
-      if (cr.inquiries.length > 0 && classifySignature.lastMessageId) {
+      if (cr.inquiries.length > 0 && classifySignature.lastMessageAt) {
         void classifyCache.save(ticket.id, classifyCompanyId, classifySignature, cr);
       }
     }).catch(() => {
@@ -366,9 +372,9 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
     }
 
     // Persisted cache short-circuit: if Supabase already has a classification
-    // for this exact (thread, lastMessageId, messageCount, modelVersion) tuple,
+    // for this exact (thread, lastMessageAt, messageCount, modelVersion) tuple,
     // reuse it. Skips the LLM call entirely across reloads and devices.
-    if (classifySignature.lastMessageId) {
+    if (classifySignature.lastMessageAt) {
       const persisted = classifyCache.getIfFresh(ticket.id, classifySignature);
       if (persisted) {
         console.log('[AssistantPanel] classify cache hit for %s (%d msgs)', ticket.id, classifySignature.messageCount);
@@ -396,7 +402,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
       // Persist for future sessions. Skip empty results — they usually mean a
       // transient failure, not a real "nothing to classify" state, and we'd
       // rather re-run on reload than cache an empty row.
-      if (cr.inquiries.length > 0 && classifySignature.lastMessageId) {
+      if (cr.inquiries.length > 0 && classifySignature.lastMessageAt) {
         void classifyCache.save(ticket.id, classifyCompanyId, classifySignature, cr);
       }
     }).catch(err => {
