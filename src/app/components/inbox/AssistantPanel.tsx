@@ -258,6 +258,23 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
   // Key = ticketId:guestMessageCount — allows re-classification when Firestore messages arrive
   const llmClassifyRef = useRef<string | null>(null);
 
+  // Latest-value refs for things that the classify call reads but which we
+  // DO NOT want to list in the classify useEffect's deps. If propContext /
+  // promptOverrides / aiModel were in the deps, a parent re-render that
+  // returns a fresh reference for any of them (kbEntries / onboardingData
+  // churn, AI Debug panel updates, etc.) would re-fire the effect whose
+  // cleanup cancels the pending 300ms debounce timer — so the timer never
+  // completes and isAnalyzing stays stuck at true, forever showing
+  // "Analyzing conversation…" with no LLM call actually in flight.
+  const propContextRef = useRef(propContext);
+  propContextRef.current = propContext;
+  const promptOverridesRef = useRef(promptOverrides);
+  promptOverridesRef.current = promptOverrides;
+  const aiModelRef = useRef(aiModel);
+  aiModelRef.current = aiModel;
+  const guestNeedsModeRef = useRef(guestNeedsMode);
+  guestNeedsModeRef.current = guestNeedsMode;
+
   // For Firestore tickets, activeMessages (updated directly by the subscription) is more
   // up-to-date than ticket.messages (which goes through a setTickets → re-render cycle).
   // Fall back to ticket.messages for non-Firestore / mock tickets.
@@ -393,8 +410,15 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
     // then "B:B's_count" once activeMessages catches up). Running classify on
     // the intermediate key would pollute the cache row for B with A's data.
     // The cleanup clears the pending timer on every re-render, so only the
-    // settled key actually reaches the cache check + LLM.
+    // settled key actually reaches the cache check + LLM. Inputs read from
+    // refs (propContext / promptOverrides / aiModel / guestNeedsMode) so
+    // parent re-renders don't re-fire this effect and cancel the timer.
     const debounceTimer = setTimeout(() => {
+      const propContext = propContextRef.current;
+      const promptOverrides = promptOverridesRef.current;
+      const aiModel = aiModelRef.current;
+      const guestNeedsMode = guestNeedsModeRef.current;
+      void aiModel;
       llmClassifyRef.current = classifyKey;
 
     // Persisted cache short-circuit: if Supabase already has a classification
@@ -456,7 +480,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
 
     return () => clearTimeout(debounceTimer);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [classifyKey, hasApiKey, aiModel, propContext, classifyCache.isLoading]);
+  }, [classifyKey, hasApiKey, classifyCache.isLoading]);
 
   // All inquiries come from LLM (or regex fallback when no API key)
   // Deduplicate: merge same-type inquiries, combining their details
