@@ -48,16 +48,26 @@ function sigKey(threadKey: string, text: string, minute: number): string {
  *
  * Returns the number of signatures loaded (for observability).
  */
+/** Only hydrate signatures from the last N days. Older bot messages
+ *  either belong to resolved threads (no longer rendered) or already
+ *  correctly display as 'agent' in the UI after any prior hydrate
+ *  completed. Windowing keeps the round-trip size bounded and
+ *  startup latency flat as the table grows. */
+const HYDRATE_WINDOW_DAYS = 7;
+
 export async function hydrateBotSignatures(
   supabase: SupabaseClient,
   companyIds: string[],
 ): Promise<number> {
   if (companyIds.length === 0) return 0;
 
+  const cutoffIso = new Date(Date.now() - HYDRATE_WINDOW_DAYS * 86_400_000).toISOString();
+
   const { data, error } = await supabase
     .from('bot_message_signatures')
     .select('thread_key, text_snippet, sent_at_min')
-    .in('company_id', companyIds);
+    .in('company_id', companyIds)
+    .gte('created_at', cutoffIso);
 
   if (error) {
     console.warn('[bot-signatures] hydrate failed:', error.message);
