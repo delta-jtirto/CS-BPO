@@ -120,14 +120,42 @@ export function useProxyConversations({
     };
 
     fetchConversations(true);
-    const interval = setInterval(() => fetchConversations(false), 6000);
+
+    // Visibility-gated polling: while the tab is hidden we drop the 6s
+    // poll entirely (Realtime still pushes updates if it's healthy). When
+    // the tab becomes visible again we fetch immediately and restart the
+    // interval, so the list is always fresh the instant the agent returns.
+    let interval: ReturnType<typeof setInterval> | null = null;
+    const startPolling = () => {
+      if (interval) return;
+      interval = setInterval(() => fetchConversations(false), 6000);
+    };
+    const stopPolling = () => {
+      if (!interval) return;
+      clearInterval(interval);
+      interval = null;
+    };
+    if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+      startPolling();
+    }
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        fetchConversations(false);
+        startPolling();
+      } else {
+        stopPolling();
+      }
+    };
     const onFocus = () => fetchConversations(false);
     window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibilityChange);
 
     return () => {
       cancelled = true;
-      clearInterval(interval);
+      stopPolling();
       window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
     };
   }, [supabase, companyIds.join(','), pageSize]);
 
@@ -324,14 +352,34 @@ export function useProxyMessages(
     // Initial fetch
     fetchMessages(true);
 
-    // Polling fallback — every 4 seconds
-    const interval = setInterval(() => {
-      fetchMessages(false);
-    }, 4000);
+    // Polling fallback — every 4 seconds, gated on tab visibility. While
+    // the tab is hidden we stop polling (Realtime still pushes if healthy);
+    // on revisibility we fetch once and restart the interval.
+    let interval: ReturnType<typeof setInterval> | null = null;
+    const startPolling = () => {
+      if (interval) return;
+      interval = setInterval(() => fetchMessages(false), 4000);
+    };
+    const stopPolling = () => {
+      if (!interval) return;
+      clearInterval(interval);
+      interval = null;
+    };
+    if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+      startPolling();
+    }
 
-    // Refetch on tab focus for faster recovery when the user switches back
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        fetchMessages(false);
+        startPolling();
+      } else {
+        stopPolling();
+      }
+    };
     const onFocus = () => fetchMessages(false);
     window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibilityChange);
 
     // Best-effort Realtime subscription. If the server accepts it we get
     // instant updates; if it silently errors, the polling loop above covers us.
@@ -363,8 +411,9 @@ export function useProxyMessages(
 
     const teardown = () => {
       cancelled = true;
-      clearInterval(interval);
+      stopPolling();
       window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
       channel.unsubscribe();
     };
 
