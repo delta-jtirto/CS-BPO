@@ -78,6 +78,21 @@ export function useFirestoreConnections(
     );
   }, []);
 
+  // Retry machinery for transient errors. Expired / permission-denied
+  // stay dead until the user reconnects (token must change). Only
+  // network-error gets auto-backoff.
+  const retryTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const retryAttemptsRef = useRef<Map<string, number>>(new Map());
+
+  const clearRetry = useCallback((hostId: string) => {
+    const t = retryTimersRef.current.get(hostId);
+    if (t) {
+      clearTimeout(t);
+      retryTimersRef.current.delete(hostId);
+    }
+    retryAttemptsRef.current.delete(hostId);
+  }, []);
+
   // Auth state change handler (passed to authenticateHost)
   // Uses ref to avoid re-creating on every connections change
   const handleHealthChange = useCallback(
@@ -88,12 +103,67 @@ export function useFirestoreConnections(
           ? 'Token expired — paste a new token to reconnect'
           : health === 'permission-denied'
             ? 'Access denied — check your Unified Inbox permissions'
-            : 'Connection lost — check your network';
+            : health === 'network-error'
+              ? `Connection lost — retrying…`
+              : 'Connection lost — check your network';
 
       updateConnection(hostId, { status: health, statusMessage: message, db: undefined, userId: undefined });
       onHealthChange?.(hostId, conn?.companyName || hostId, health, message);
+
+      if (health === 'connected') {
+        clearRetry(hostId);
+        return;
+      }
+
+      // Only auto-retry transient network failures; the other error
+      // classes require human action.
+      if (health !== 'network-error') {
+        clearRetry(hostId);
+        return;
+      }
+
+      // Schedule an exponential-backoff re-auth. 1s → 2s → 4s → 8s → 30s
+      // cap. Retries run in the background; on success handleHealthChange
+      // fires again with 'connected' and clears the state.
+      const prev = retryAttemptsRef.current.get(hostId) ?? 0;
+      const attempt = prev + 1;
+      retryAttemptsRef.current.set(hostId, attempt);
+      const backoffMs = Math.min(30_000, 1000 * Math.pow(2, Math.min(5, attempt - 1)));
+
+      const existingTimer = retryTimersRef.current.get(hostId);
+      if (existingTimer) clearTimeout(existingTimer);
+      const timer = setTimeout(async () => {
+        retryTimersRef.current.delete(hostId);
+        const saved = savedConnectionsRef.current.find((c) => c.hostId === hostId);
+        if (!saved) return;
+        updateConnection(hostId, {
+          statusMessage: `Reconnecting… (attempt ${attempt})`,
+        });
+        try {
+          const fresh = await authSingle(saved);
+          setConnections((prevList) => prevList.map((c) => (c.hostId === hostId ? fresh : c)));
+          // authSingle returns a populated InboxConnection; if its status
+          // is 'connected' the success branch above via handleHealthChange
+          // (called from inside onAuthStateChanged) clears the retry. If
+          // it came back with a non-connected status, schedule again.
+          if (fresh.status !== 'connected') {
+            handleHealthChange(hostId, fresh.status);
+          } else {
+            clearRetry(hostId);
+          }
+        } catch {
+          // authSingle catches internally, but belt-and-braces — schedule
+          // another retry so a raw throw doesn't stop the loop.
+          handleHealthChange(hostId, 'network-error');
+        }
+      }, backoffMs);
+      retryTimersRef.current.set(hostId, timer);
     },
-    [updateConnection, onHealthChange],
+    // authSingle is declared below but we use it via closure; disable the
+    // exhaustive-deps rule — retry is meant to re-reference the latest
+    // authSingle implicitly.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [updateConnection, onHealthChange, clearRetry],
   );
 
   // Authenticate a single connection
@@ -267,6 +337,9 @@ export function useFirestoreConnections(
       for (const [, ref] of authRefs.current) {
         ref.unsubAuthListener();
       }
+      for (const [, timer] of retryTimersRef.current) clearTimeout(timer);
+      retryTimersRef.current.clear();
+      retryAttemptsRef.current.clear();
     };
   }, []);
 

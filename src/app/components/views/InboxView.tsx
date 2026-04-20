@@ -171,6 +171,29 @@ export function InboxView() {
   const loadOlderMessages = isProxyTicket ? proxyLoadMore : firestoreLoadMore;
   const hasOlderMessages = isProxyTicket ? proxyHasMore : firestoreHasMore;
 
+  /** Composer health gate — disables the Send button when the inbox
+   *  connection behind the active ticket is degraded. Prevents phantom
+   *  sends that end up stuck in outbound_send_idempotency with no
+   *  channel dispatch. Proxy channels always pass (Supabase connection
+   *  health isn't currently tracked here); Firestore tickets require
+   *  the connection's status to be 'connected'. */
+  const composerHealth = useMemo(() => {
+    if (!activeTicket) return { healthy: true, reason: '' };
+    if (isProxyTicket) return { healthy: true, reason: '' };
+    if (!activeTicket.firestoreHostId) return { healthy: true, reason: '' };
+    const conn = firestoreConnections.find(c => c.hostId === activeTicket.firestoreHostId);
+    if (!conn) return { healthy: false, reason: 'Inbox not loaded yet — hold on.' };
+    if (conn.status === 'connected') return { healthy: true, reason: '' };
+    return {
+      healthy: false,
+      reason:
+        conn.status === 'expired' ? 'Token expired — reconnect this inbox in Settings.'
+          : conn.status === 'permission-denied' ? 'Access denied — check your Unified Inbox permissions.'
+          : conn.status === 'network-error' ? 'Connection lost — reconnecting…'
+          : 'Inbox connection degraded — reconnecting…',
+    };
+  }, [activeTicket, isProxyTicket, firestoreConnections]);
+
   /** Scroll container ref + IntersectionObserver sentinel for infinite-scroll
    *  of older history. Live window is capped at 100 messages in each hook;
    *  older pages are fetched on-demand when the sentinel at the top of the
@@ -2048,7 +2071,8 @@ export function InboxView() {
 
               <button
                 onClick={handleSendMessage}
-                disabled={!replyText.trim()}
+                disabled={!replyText.trim() || !composerHealth.healthy}
+                title={!composerHealth.healthy ? composerHealth.reason : undefined}
                 className={`px-2.5 py-1 rounded-md shadow-sm transition-all active:scale-95 disabled:opacity-30 disabled:cursor-not-allowed flex items-center gap-1 text-[10px] font-medium ${
                   guestMode
                     ? 'bg-emerald-600 text-white hover:bg-emerald-700'
