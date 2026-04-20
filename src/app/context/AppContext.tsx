@@ -22,6 +22,12 @@ import { useClassifyCache, type UseClassifyCacheResult } from '@/hooks/use-class
 import { mapProxyConversationToTicket } from '@/lib/proxy-mappers';
 import { hydrateBotSignatures, markBotSent } from '@/lib/bot-signatures';
 import { supabase as supabaseClient, getUserCompanyIds as fetchProxyCompanyIds, getAccessToken } from '@/lib/supabase-client';
+import {
+  claimOutboundSend,
+  markSendDelivered,
+  markSendFailed,
+  newClientMessageId,
+} from '@/lib/outbound-send-idempotency';
 import { toast } from 'sonner';
 
 // Lazy-load the API client so a module-level error in api-client.ts
@@ -1075,11 +1081,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   // Core optimistic send used by both initial send and retry. Transitions a
   // pending message through 'sending' → 'sent' | 'failed'.
+  //
+  // clientMessageId is the idempotency key for the outbound_send_idempotency
+  // table. We claim the row BEFORE dispatch; a re-entrant call with the
+  // same id (network retry, StrictMode re-render) loses the claim and
+  // skips the remote send instead of double-dispatching.
   const runProxySend = useCallback((
     conversationId: string,
     text: string,
     ticketId: string,
     localId: number,
+    clientMessageId: string,
     metadata?: Record<string, unknown>,
   ) => {
     const markStatus = (status: 'sending' | 'sent' | 'failed', error?: string) => {
@@ -1094,18 +1106,58 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       });
     };
 
-    getAccessToken().then(token => {
-      if (!token) {
-        markStatus('failed', 'Not authenticated — please sign in again');
-        return;
+    (async () => {
+      const companyId = proxyCompanyIds[0] ?? 'delta-hq';
+      try {
+        const claim = await claimOutboundSend(supabaseClient, {
+          companyId,
+          threadKey: ticketId,
+          clientMessageId,
+        });
+        if (!claim.won) {
+          // Another instance of this send is already in flight or done.
+          // Reflect its terminal state on the optimistic bubble so the
+          // user isn't stuck on "sending…" forever.
+          if (claim.existing?.status === 'delivered') {
+            markStatus('sent');
+          } else if (claim.existing?.status === 'failed') {
+            markStatus('failed', claim.existing.error_message ?? 'Failed to send message');
+          }
+          return;
+        }
+
+        const token = await getAccessToken();
+        if (!token) {
+          markStatus('failed', 'Not authenticated — please sign in again');
+          await markSendFailed(supabaseClient, {
+            companyId, threadKey: ticketId, clientMessageId,
+            errorMessage: 'Not authenticated',
+          });
+          return;
+        }
+
+        try {
+          await sendProxyMessage(
+            conversationId, text, token,
+            { ...(metadata ? { metadata } : {}), clientMessageId },
+          );
+          markStatus('sent');
+          await markSendDelivered(supabaseClient, {
+            companyId, threadKey: ticketId, clientMessageId,
+          });
+        } catch (err: any) {
+          const msg = err?.message ?? 'Failed to send message';
+          markStatus('failed', msg);
+          await markSendFailed(supabaseClient, {
+            companyId, threadKey: ticketId, clientMessageId,
+            errorMessage: msg,
+          });
+        }
+      } catch (err: any) {
+        markStatus('failed', err?.message ?? 'Failed to send message');
       }
-      sendProxyMessage(conversationId, text, token, metadata ? { metadata } : undefined)
-        .then(() => markStatus('sent'))
-        .catch(err => markStatus('failed', err?.message ?? 'Failed to send message'));
-    }).catch(err => {
-      markStatus('failed', err?.message ?? 'Failed to send message');
-    });
-  }, []);
+    })();
+  }, [proxyCompanyIds]);
 
   const addMessageToTicket = useCallback((ticketId: string, text: string) => {
     const ticket = tickets.find(t => t.id === ticketId);
@@ -1119,6 +1171,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // Local IDs live in a distinct numeric range from real proxy messages
       // (real ones start at 2_000_000 in proxy-mappers.ts); use a 3M offset.
       const localId = 3_000_000 + Math.floor(Math.random() * 1_000_000_000);
+      const clientMessageId = newClientMessageId();
       const pending: Message = {
         id: localId,
         sender: 'agent',
@@ -1126,12 +1179,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         time: new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         createdAt: now,
         deliveryStatus: 'sending',
+        clientMessageId,
       };
       setPendingProxyMessages(prev => ({
         ...prev,
         [ticketId]: [...(prev[ticketId] || []), pending],
       }));
-      runProxySend(ticket.proxyConversationId, text, ticketId, localId);
+      runProxySend(ticket.proxyConversationId, text, ticketId, localId, clientMessageId);
       setAutoReplyHandedOff(ticketId, false);
       return;
     }
@@ -1144,9 +1198,30 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
         const token = tokens[ticket.firestoreHostId];
         if (token) {
-          sendGuestMessage(ticket.firestoreThreadId, conn.userId, text, token).catch(err => {
-            toast.error('Failed to send message', { description: err.message });
-          });
+          // Claim a row in outbound_send_idempotency so that a duplicate
+          // dispatch (network retry, StrictMode re-render) collapses to a
+          // single Unibox POST. Firestore round-trip delivers the message
+          // to the UI; no optimistic bubble here (yet).
+          const clientMessageId = newClientMessageId();
+          const companyId = proxyCompanyIds[0] ?? 'delta-hq';
+          (async () => {
+            try {
+              const claim = await claimOutboundSend(supabaseClient, {
+                companyId, threadKey: ticketId, clientMessageId,
+              });
+              if (!claim.won) return;
+              await sendGuestMessage(ticket.firestoreThreadId!, conn.userId, text, token);
+              await markSendDelivered(supabaseClient, {
+                companyId, threadKey: ticketId, clientMessageId,
+              });
+            } catch (err: any) {
+              await markSendFailed(supabaseClient, {
+                companyId, threadKey: ticketId, clientMessageId,
+                errorMessage: err?.message ?? 'send failed',
+              });
+              toast.error('Failed to send message', { description: err?.message });
+            }
+          })();
           setAutoReplyHandedOff(ticketId, false);
           return;
         }
@@ -1180,16 +1255,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const pending = (pendingProxyMessages[ticketId] || []).find(m => m.id === localMessageId);
     if (!pending) return;
 
-    // Reset the pending message to 'sending' before firing the request.
+    // Retry needs a FRESH client_message_id — the previous one's row is in
+    // status='failed' and its PK is permanent. Mint a new UUID and update
+    // the pending bubble so any subsequent retry is idempotent on its own.
+    const retryClientMessageId = newClientMessageId();
     setPendingProxyMessages(prev => ({
       ...prev,
       [ticketId]: (prev[ticketId] || []).map(m =>
         m.id === localMessageId
-          ? { ...m, deliveryStatus: 'sending' as const, deliveryError: undefined }
+          ? {
+              ...m,
+              deliveryStatus: 'sending' as const,
+              deliveryError: undefined,
+              clientMessageId: retryClientMessageId,
+            }
           : m,
       ),
     }));
-    runProxySend(ticket.proxyConversationId, pending.text, ticketId, localMessageId);
+    runProxySend(ticket.proxyConversationId, pending.text, ticketId, localMessageId, retryClientMessageId);
   }, [tickets, pendingProxyMessages, runProxySend]);
 
   /** Drop a pending proxy message (after failure, or to dedupe post-delivery). */
@@ -1232,17 +1315,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (ticket?.proxyConversationId && ticket?.proxyChannel) {
       const now = Date.now();
       const localId = 3_000_000 + Math.floor(Math.random() * 1_000_000_000);
+      const clientMessageId = newClientMessageId();
       const pending: Message = {
         id: localId, sender: 'bot', text,
         time: new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        createdAt: now, deliveryStatus: 'sending',
+        createdAt: now, deliveryStatus: 'sending', clientMessageId,
       };
       setPendingProxyMessages(prev => ({
         ...prev,
         [ticketId]: [...(prev[ticketId] || []), pending],
       }));
       markBotSent(supabaseClient, ticket.proxyCompanyId ?? 'delta-hq', ticket.id, text, now);
-      runProxySend(ticket.proxyConversationId, text, ticketId, localId, { source: 'bot' });
+      runProxySend(ticket.proxyConversationId, text, ticketId, localId, clientMessageId, { source: 'bot' });
       return;
     }
 
@@ -1255,10 +1339,27 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         const token = tokens[ticket.firestoreHostId];
         if (token) {
           markBotSent(supabaseClient, proxyCompanyIds[0] ?? 'delta-hq', ticket.id, text, Date.now());
-          sendGuestMessage(ticket.firestoreThreadId, conn.userId, text, token).catch(err => {
-            console.error('[AutoReply] Failed to send bot reply via Unibox:', err);
-            toast.error('AI reply failed to send', { description: err.message });
-          });
+          const clientMessageId = newClientMessageId();
+          const companyId = proxyCompanyIds[0] ?? 'delta-hq';
+          (async () => {
+            try {
+              const claim = await claimOutboundSend(supabaseClient, {
+                companyId, threadKey: ticket.id, clientMessageId,
+              });
+              if (!claim.won) return;
+              await sendGuestMessage(ticket.firestoreThreadId!, conn.userId, text, token);
+              await markSendDelivered(supabaseClient, {
+                companyId, threadKey: ticket.id, clientMessageId,
+              });
+            } catch (err: any) {
+              console.error('[AutoReply] Failed to send bot reply via Unibox:', err);
+              toast.error('AI reply failed to send', { description: err?.message });
+              await markSendFailed(supabaseClient, {
+                companyId, threadKey: ticket.id, clientMessageId,
+                errorMessage: err?.message ?? 'send failed',
+              });
+            }
+          })();
           return; // Message appears in UI via Firestore onSnapshot
         }
       }
@@ -1303,17 +1404,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       for (const msg of messages) {
         if (msg.sender === 'bot') {
           const localId = 3_000_000 + Math.floor(Math.random() * 1_000_000_000);
+          const clientMessageId = newClientMessageId();
           const pending: Message = {
             id: localId, sender: 'bot', text: msg.text,
             time: new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-            createdAt: now, deliveryStatus: 'sending',
+            createdAt: now, deliveryStatus: 'sending', clientMessageId,
           };
           setPendingProxyMessages(prev => ({
             ...prev,
             [ticketId]: [...(prev[ticketId] || []), pending],
           }));
           markBotSent(supabaseClient, ticket.proxyCompanyId ?? 'delta-hq', ticket.id, msg.text, now);
-          runProxySend(ticket.proxyConversationId!, msg.text, ticketId, localId, { source: 'bot' });
+          runProxySend(ticket.proxyConversationId!, msg.text, ticketId, localId, clientMessageId, { source: 'bot' });
         }
       }
       const systemMsgs = messages.filter(m => m.sender === 'system');
@@ -1340,12 +1442,29 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         const tokens = (() => { try { return JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}'); } catch { return {}; } })();
         const token = tokens[ticket.firestoreHostId];
         if (token) {
+          const companyId = proxyCompanyIds[0] ?? 'delta-hq';
           for (const msg of messages) {
             if (msg.sender === 'bot') {
-              markBotSent(supabaseClient, proxyCompanyIds[0] ?? 'delta-hq', ticket.id, msg.text, Date.now());
-              sendGuestMessage(ticket.firestoreThreadId, conn.userId, msg.text, token).catch(err => {
-                console.error('[AutoReply] Failed to send bot reply via Unibox:', err);
-              });
+              markBotSent(supabaseClient, companyId, ticket.id, msg.text, Date.now());
+              const clientMessageId = newClientMessageId();
+              (async () => {
+                try {
+                  const claim = await claimOutboundSend(supabaseClient, {
+                    companyId, threadKey: ticket.id, clientMessageId,
+                  });
+                  if (!claim.won) return;
+                  await sendGuestMessage(ticket.firestoreThreadId!, conn.userId, msg.text, token);
+                  await markSendDelivered(supabaseClient, {
+                    companyId, threadKey: ticket.id, clientMessageId,
+                  });
+                } catch (err: any) {
+                  console.error('[AutoReply] Failed to send bot reply via Unibox:', err);
+                  await markSendFailed(supabaseClient, {
+                    companyId, threadKey: ticket.id, clientMessageId,
+                    errorMessage: err?.message ?? 'send failed',
+                  });
+                }
+              })();
             }
           }
         }

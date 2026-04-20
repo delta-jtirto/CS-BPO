@@ -42,6 +42,10 @@ export interface Message {
   // Delivery status (proxy channels)
   deliveryStatus?: 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
   deliveryError?: string; // e.g. "Outside 24-hour messaging window"
+  /** UUID assigned the moment the composer submits; persisted in
+   *  outbound_send_idempotency so duplicate-dispatch attempts (network
+   *  retry, React re-render, HMR) are collapsed to a single channel send. */
+  clientMessageId?: string;
 }
 
 /** @deprecated Use bookingId + bookingStatus on Ticket instead */

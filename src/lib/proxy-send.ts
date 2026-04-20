@@ -22,6 +22,11 @@ export function isProxyChannel(channel: string): boolean {
 /**
  * Send a message to a contact via the channel proxy.
  *
+ * clientMessageId is the same UUID recorded in the local
+ * outbound_send_idempotency table; we forward it as a header (for
+ * future backend-side dedup) and on the body metadata so the
+ * channel-proxy can persist it once it starts honoring it.
+ *
  * @throws Error with user-friendly message on failure
  */
 export async function sendProxyMessage(
@@ -32,24 +37,34 @@ export async function sendProxyMessage(
     contentType?: string;
     attachments?: { type: string; url: string }[];
     metadata?: Record<string, unknown>;
+    clientMessageId?: string;
   },
 ): Promise<void> {
   if (!PROXY_API_BASE) {
     throw new Error('Channel proxy URL not configured');
   }
 
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${accessToken}`,
+    'Content-Type': 'application/json',
+  };
+  if (options?.clientMessageId) {
+    headers['Idempotency-Key'] = options.clientMessageId;
+  }
+
+  const combinedMetadata = options?.clientMessageId
+    ? { ...(options?.metadata ?? {}), client_message_id: options.clientMessageId }
+    : options?.metadata;
+
   const response = await fetch(`${PROXY_API_BASE}/api/proxy/messages/send`, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-    },
+    headers,
     body: JSON.stringify({
       conversation_id: conversationId,
       text,
       content_type: options?.contentType ?? 'text',
       attachments: options?.attachments,
-      metadata: options?.metadata,
+      metadata: combinedMetadata,
     }),
   });
 
