@@ -142,7 +142,12 @@ export function InboxView() {
     if (activeTicket?.firestoreHostId) markFirestoreConnectionExpired(activeTicket.firestoreHostId);
   }, [activeTicket?.firestoreHostId, markFirestoreConnectionExpired]);
 
-  const { messages: firestoreMessages, isLoading: messagesLoading } = useFirestoreMessages(
+  const {
+    messages: firestoreMessages,
+    isLoading: messagesLoading,
+    loadMore: firestoreLoadMore,
+    hasMore: firestoreHasMore,
+  } = useFirestoreMessages(
     activeTicket?.firestoreThreadId || null,
     activeTicketDb,
     activeTicket?.firestoreGuestUserId,
@@ -151,10 +156,62 @@ export function InboxView() {
 
   // Proxy message subscription (WhatsApp, Instagram, LINE, Email)
   const isProxyTicket = !!activeTicket?.proxyConversationId;
-  const { messages: rawProxyMessages, isLoading: proxyMessagesLoading } = useProxyMessages(
+  const {
+    messages: rawProxyMessages,
+    isLoading: proxyMessagesLoading,
+    loadMore: proxyLoadMore,
+    hasMore: proxyHasMore,
+  } = useProxyMessages(
     isProxyTicket ? supabaseClient : null!,
     isProxyTicket ? activeTicket!.proxyConversationId! : null,
   );
+
+  /** Unified loadMore/hasMore so the scroll observer doesn't need to
+   *  branch on source. */
+  const loadOlderMessages = isProxyTicket ? proxyLoadMore : firestoreLoadMore;
+  const hasOlderMessages = isProxyTicket ? proxyHasMore : firestoreHasMore;
+
+  /** Scroll container ref + IntersectionObserver sentinel for infinite-scroll
+   *  of older history. Live window is capped at 100 messages in each hook;
+   *  older pages are fetched on-demand when the sentinel at the top of the
+   *  list enters the viewport. Scroll offset is preserved after the prepend
+   *  so the user doesn't jump. */
+  const messagesScrollRef = useRef<HTMLDivElement>(null);
+  const topSentinelRef = useRef<HTMLDivElement>(null);
+  const isLoadingOlderRef = useRef(false);
+  const [isLoadingOlder, setIsLoadingOlder] = useState(false);
+
+  useEffect(() => {
+    const sentinel = topSentinelRef.current;
+    const container = messagesScrollRef.current;
+    if (!sentinel || !container || !hasOlderMessages) return;
+
+    const obs = new IntersectionObserver(
+      async (entries) => {
+        if (!entries[0]?.isIntersecting) return;
+        if (isLoadingOlderRef.current) return;
+        isLoadingOlderRef.current = true;
+        setIsLoadingOlder(true);
+        const heightBefore = container.scrollHeight;
+        const topBefore = container.scrollTop;
+        try {
+          await loadOlderMessages();
+          // Restore scroll position after React paints the prepended rows.
+          requestAnimationFrame(() => {
+            if (!messagesScrollRef.current) return;
+            const delta = messagesScrollRef.current.scrollHeight - heightBefore;
+            messagesScrollRef.current.scrollTop = topBefore + delta;
+          });
+        } finally {
+          isLoadingOlderRef.current = false;
+          setIsLoadingOlder(false);
+        }
+      },
+      { root: container, rootMargin: '200px 0px 0px 0px', threshold: 0 },
+    );
+    obs.observe(sentinel);
+    return () => obs.disconnect();
+  }, [hasOlderMessages, loadOlderMessages, activeTicket?.id]);
   const proxyMessages = useMemo(
     () => rawProxyMessages.map(m => mapProxyMessageToMessage(m)),
     [rawProxyMessages],
@@ -1541,7 +1598,16 @@ export function InboxView() {
         )}
 
         {/* Chat messages */}
-        <div className={`flex-1 overflow-y-auto ${isMobile ? 'p-3 gap-3' : 'p-6 gap-4'} flex flex-col`}>
+        <div ref={messagesScrollRef} className={`flex-1 overflow-y-auto ${isMobile ? 'p-3 gap-3' : 'p-6 gap-4'} flex flex-col`}>
+          {/* IntersectionObserver sentinel — top-of-list triggers lazy
+              fetch of older messages via loadOlderMessages(). */}
+          {hasOlderMessages && (
+            <div ref={topSentinelRef} className="flex items-center justify-center py-2 shrink-0">
+              <span className="text-[10px] text-muted-foreground">
+                {isLoadingOlder ? 'Loading earlier messages…' : 'Scroll up for more'}
+              </span>
+            </div>
+          )}
           {getMessages(activeTicket).map((msg) => (
             <MessageErrorBoundary key={msg.id} messageId={msg.id}>
             <div className={`flex flex-col transition-all duration-300 ${

@@ -1,10 +1,15 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
 import {
-  collection, query, orderBy, onSnapshot,
+  collection, query, orderBy, onSnapshot, limitToLast, endBefore, getDocs,
   type Firestore, type Unsubscribe,
 } from 'firebase/firestore';
 import type { Message } from '@/app/data/types';
 import { mapFirestoreMessage, type FirestoreMessage } from '@/lib/firestore-mappers';
+
+/** Live window size. Threads with more messages are lazy-loaded via loadMore(). */
+const LIVE_WINDOW = 100;
+/** Page size for historical loadMore() calls. */
+const HISTORY_PAGE = 100;
 
 /** LRU-style message cache — keeps last N threads' messages in memory */
 const messageCache = new Map<string, Message[]>();
@@ -35,6 +40,14 @@ interface UseFirestoreMessagesResult {
   messages: Message[];
   isLoading: boolean;
   error: string | null;
+  /** Fetch the next page of older messages. Returns the number of rows
+   *  prepended; 0 means we've reached the start of history. Caller is
+   *  responsible for preserving scroll position after the prepend. */
+  loadMore: () => Promise<number>;
+  /** Signals whether earlier history is available to load. False when the
+   *  last loadMore() returned < HISTORY_PAGE, or when the live window
+   *  already covers the full thread. */
+  hasMore: boolean;
 }
 
 /**
@@ -56,6 +69,9 @@ export function useFirestoreMessages(
   const [error, setError] = useState<string | null>(null);
   const spinnerTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const [showSpinner, setShowSpinner] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
+  /** Oldest message currently rendered — drives loadMore's endBefore cursor. */
+  const oldestLoadedRef = useRef<Message | null>(null);
 
   // Stable ref so callback identity changes don't re-subscribe
   const onAuthErrorRef = useRef(onAuthError);
@@ -73,6 +89,8 @@ export function useFirestoreMessages(
       setMessages([]);
       setIsLoading(false);
       setShowSpinner(false);
+      setHasMore(true);
+      oldestLoadedRef.current = null;
       return;
     }
 
@@ -109,7 +127,12 @@ export function useFirestoreMessages(
     }
 
     const messagesRef = collection(db, 'threads', capturedThreadId, 'messages');
-    const q = query(messagesRef, orderBy('timestamp'));
+    // Live window capped at LIVE_WINDOW most-recent messages. Earlier
+    // history is available via loadMore() which prepends with endBefore().
+    // Unbounded onSnapshot on 1000+ message threads was the main render
+    // bottleneck — O(n) re-sort per tick in the mapper pipeline and a
+    // Realtime channel that ships every historical doc on reconnect.
+    const q = query(messagesRef, orderBy('timestamp'), limitToLast(LIVE_WINDOW));
 
     const unsub = onSnapshot(
       q,
@@ -126,6 +149,11 @@ export function useFirestoreMessages(
         // Without this guard, a warm subscription for a previously-viewed
         // thread would stomp the current thread's rendered messages.
         if (!isCurrent()) return;
+
+        // If the live window is saturated we can assume there's more
+        // history; when it arrives partial the thread is fully loaded.
+        setHasMore(fetched.length >= LIVE_WINDOW);
+        oldestLoadedRef.current = fetched[0] ?? null;
 
         setMessages(fetched);
         setIsLoading(false);
@@ -159,10 +187,54 @@ export function useFirestoreMessages(
     };
   }, [threadId, db]);
 
+  /** Prepend the next page of older messages. */
+  const loadMore = useCallback(async (): Promise<number> => {
+    if (!threadId || !db) return 0;
+    const oldest = oldestLoadedRef.current;
+    if (!oldest || oldest.createdAt === undefined) return 0;
+
+    try {
+      const messagesRef = collection(db, 'threads', threadId, 'messages');
+      // Firestore stores timestamps in seconds for some providers — mirror
+      // the normalization the mapper does. endBefore expects the RAW
+      // field value, so pass the DB-format number (div 1000 if we upconverted).
+      const oldestRaw = oldest.createdAt > 1e12 ? oldest.createdAt : Math.floor(oldest.createdAt / 1000);
+      const q = query(
+        messagesRef,
+        orderBy('timestamp'),
+        endBefore(oldestRaw),
+        limitToLast(HISTORY_PAGE),
+      );
+      const snap = await getDocs(q);
+      if (snap.empty) {
+        setHasMore(false);
+        return 0;
+      }
+      const older = snap.docs.map((doc) => {
+        const data = { message_id: doc.id, ...doc.data() } as FirestoreMessage;
+        return mapFirestoreMessage(data, guestUserId, threadId);
+      });
+      setMessages((prev) => {
+        // Dedup by message id — defensive against overlap at the boundary.
+        const existingIds = new Set(prev.map((m) => m.id));
+        const filtered = older.filter((m) => !existingIds.has(m.id));
+        return [...filtered, ...prev];
+      });
+      oldestLoadedRef.current = older[0] ?? oldestLoadedRef.current;
+      if (older.length < HISTORY_PAGE) setHasMore(false);
+      return older.length;
+    } catch (err) {
+      console.warn('[Firestore] loadMore failed:', err);
+      return 0;
+    }
+  }, [threadId, db, guestUserId]);
+
   return {
     messages,
     isLoading: isLoading && showSpinner, // Only report loading after 150ms delay
     error,
+    loadMore,
+    hasMore,
   };
 }
 

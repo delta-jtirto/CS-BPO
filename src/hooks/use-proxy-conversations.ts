@@ -278,12 +278,15 @@ function reclaimProxyWarmSub(conversationId: string): boolean {
  * for 10s and caches its last message list, so rapid back-and-forth navigation
  * is instant and doesn't churn Realtime channels.
  */
+const PROXY_MESSAGE_PAGE = 100;
+
 export function useProxyMessages(
   supabase: SupabaseClient,
   conversationId: string | null,
 ) {
   const [messages, setMessages] = useState<ProxyMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
 
   // Current visible conversationId. Warm poll loops and Realtime subscriptions
   // capture their own conversationId at setup time and only update UI state
@@ -320,17 +323,22 @@ export function useProxyMessages(
 
     const fetchMessages = async (markLoading: boolean) => {
       if (markLoading && !cached && isCurrent()) setIsLoading(true);
+      // Fetch the LATEST N messages: descending + take(N) + reverse in app.
+      // Keeps the live window bounded so a 5k-message thread doesn't do a
+      // full-history fetch on every poll tick.
       const { data, error } = await supabase
         .from('messages')
         .select('*')
         .eq('conversation_id', capturedConvId)
-        .order('channel_timestamp', { ascending: true })
-        .limit(100);
+        .order('channel_timestamp', { ascending: false })
+        .limit(PROXY_MESSAGE_PAGE);
       if (cancelled) return;
       if (error) {
         console.error('Failed to fetch proxy messages:', error);
       } else {
-        const rows = (data ?? []) as ProxyMessage[];
+        // Server returned newest-first; reverse so the UI gets oldest-first.
+        const rows = ((data ?? []) as ProxyMessage[]).slice().reverse();
+        setHasMore(rows.length >= PROXY_MESSAGE_PAGE);
         // Always update cache so warm reclaim is accurate
         proxyCacheSet(capturedConvId, rows);
         // UI only if still viewing this conversation
@@ -429,5 +437,34 @@ export function useProxyMessages(
     };
   }, [supabase, conversationId]);
 
-  return { messages, isLoading };
+  /** Prepend the next page of older messages. Returns rows added. */
+  const loadMore = useCallback(async (): Promise<number> => {
+    if (!conversationId || messages.length === 0) return 0;
+    const oldest = messages[0];
+    if (!oldest) return 0;
+    const { data, error } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('conversation_id', conversationId)
+      .lt('channel_timestamp', oldest.channel_timestamp)
+      .order('channel_timestamp', { ascending: false })
+      .limit(PROXY_MESSAGE_PAGE);
+    if (error) {
+      console.warn('[useProxyMessages] loadMore failed:', error.message);
+      return 0;
+    }
+    const older = ((data ?? []) as ProxyMessage[]).slice().reverse();
+    if (older.length === 0) {
+      setHasMore(false);
+      return 0;
+    }
+    setMessages((prev) => {
+      const ids = new Set(prev.map((m) => m.id));
+      return [...older.filter((m) => !ids.has(m.id)), ...prev];
+    });
+    if (older.length < PROXY_MESSAGE_PAGE) setHasMore(false);
+    return older.length;
+  }, [supabase, conversationId, messages]);
+
+  return { messages, isLoading, loadMore, hasMore };
 }
