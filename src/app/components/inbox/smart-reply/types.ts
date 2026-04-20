@@ -47,6 +47,13 @@ export interface SmartReplyState {
   handleRecompose: () => void;
   composeTriggered: React.MutableRefObject<boolean>;
   cacheKey: string;
+  /** True when the persisted draft was saved against an older message
+   *  list than the thread now has. UI should show a "new messages since
+   *  this draft" banner and offer Regenerate. Never auto-wipe. */
+  isStaleDraft: boolean;
+  /** Dismiss the staleness banner without regenerating — the agent can
+   *  choose to keep editing against the stale draft. */
+  acknowledgeStaleDraft: () => void;
 }
 
 /** Turn a detected inquiry into a concise agent-facing Yes/No question. */

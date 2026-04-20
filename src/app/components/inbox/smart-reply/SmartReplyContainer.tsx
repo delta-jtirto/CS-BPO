@@ -1,4 +1,5 @@
 import React from 'react';
+import { AlertCircle, X } from 'lucide-react';
 import { cn } from '@/app/components/ui/utils';
 import { SmartReplyDraftDetected } from './SmartReplyDraftDetected';
 import { SmartReplyAnalyzing } from './SmartReplyAnalyzing';
@@ -10,7 +11,7 @@ import type { SmartReplyState, SmartReplyPanelProps } from './types';
 type Props = SmartReplyPanelProps & SmartReplyState;
 
 export function SmartReplyContainer(props: Props) {
-  const { phase, allUncovered } = props;
+  const { phase, allUncovered, isStaleDraft, acknowledgeStaleDraft, handleRecompose } = props;
 
   return (
     <div
@@ -20,6 +21,29 @@ export function SmartReplyContainer(props: Props) {
         'shrink-0 animate-in fade-in slide-in-from-bottom-2 duration-200',
       )}
     >
+      {isStaleDraft && (
+        <div className="flex items-center gap-2 px-3 py-2 bg-amber-50 border-b border-amber-200 text-[11px] text-amber-900">
+          <AlertCircle size={12} className="shrink-0 text-amber-600" />
+          <span className="flex-1 min-w-0">
+            New messages since this draft — review or regenerate before sending.
+          </span>
+          <button
+            type="button"
+            onClick={() => { acknowledgeStaleDraft(); handleRecompose(); }}
+            className="px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-600 text-white hover:bg-amber-700"
+          >
+            Regenerate
+          </button>
+          <button
+            type="button"
+            onClick={acknowledgeStaleDraft}
+            className="text-amber-600 hover:text-amber-800"
+            aria-label="Dismiss stale draft notice"
+          >
+            <X size={12} />
+          </button>
+        </div>
+      )}
       {phase === 'draft-detected' && (
         <SmartReplyDraftDetected
           existingDraft={props.existingDraft}

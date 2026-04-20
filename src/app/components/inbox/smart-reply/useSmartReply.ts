@@ -19,6 +19,8 @@ import {
   resolveMaxTokens,
 } from '../../../ai/prompts';
 import type { Phase, SmartReplyPanelProps, SmartReplyState } from './types';
+import { supabase as supabaseClient } from '../../../../lib/supabase-client';
+import { computeMessagesHash, loadDraft, saveDraft } from '../../../../lib/ai-draft-cache';
 
 /**
  * Serialise ContextItem[] from the Guest Needs Panel into a compact
@@ -44,9 +46,19 @@ function buildGuestInsights(inquiries: DetectedInquiry[]): string {
 }
 
 export function useSmartReply({ ticket, existingDraft, cacheRef, aiInquiries }: SmartReplyPanelProps): SmartReplyState {
-  const { kbEntries, agentName, hasApiKey, aiModel, promptOverrides, properties } = useAppContext();
+  const { kbEntries, agentName, hasApiKey, aiModel, promptOverrides, properties, proxyCompanyIds } = useAppContext();
 
-  const cacheKey = `${ticket.id}-${(ticket.messages || []).length}`;
+  // Thread-keyed cache so a new guest message arriving mid-edit doesn't
+  // silently wipe the agent's in-progress draft (the old
+  // `${ticket.id}-${messages.length}` key did exactly that — hash mismatch
+  // = cache miss = draft re-composed from scratch). messagesHash is
+  // stored separately as a staleness signal.
+  const cacheKey = ticket.id;
+  const currentHash = useMemo(
+    () => computeMessagesHash(ticket.messages ?? []),
+    [ticket.messages],
+  );
+  const companyId = proxyCompanyIds[0] ?? 'delta-hq';
   const hasDraft = existingDraft.trim().length > 10;
 
   const [phase, setPhase] = useState<Phase>(() => {
@@ -67,6 +79,19 @@ export function useSmartReply({ ticket, existingDraft, cacheRef, aiInquiries }: 
   });
   // Read from cache so switching away and back doesn't re-trigger auto-compose
   const composeTriggered = useRef(cacheRef.current[cacheKey]?.triggered ?? false);
+
+  // Staleness: true when the persisted draft was saved against fewer /
+  // different messages than the thread now has. Banner in the panel
+  // offers Regenerate; agent can also acknowledge and keep editing.
+  const [storedDraftHash, setStoredDraftHash] = useState<string | null>(null);
+  const [staleAcknowledged, setStaleAcknowledged] = useState(false);
+  const isStaleDraft =
+    !staleAcknowledged &&
+    storedDraftHash !== null &&
+    storedDraftHash !== '' &&
+    storedDraftHash !== currentHash &&
+    (composedMessage?.trim().length ?? 0) > 0;
+  const acknowledgeStaleDraft = useCallback(() => setStaleAcknowledged(true), []);
 
   const activeProp = properties.find(p => p.name === ticket.property);
   const ticketRoom = ticket.room.replace(/[^0-9]/g, '');
@@ -278,16 +303,62 @@ export function useSmartReply({ ticket, existingDraft, cacheRef, aiInquiries }: 
     return () => clearTimeout(timer);
   }, [inquiries, doCompose, hasDraft, allUncovered, cacheKey, cacheRef]);
 
-  // ─── Write to cache ───────────────────────────────────────────
+  // ─── Hydrate persisted draft on mount ─────────────────────────
+  // One fetch per ticket. If a draft is found, populate local state and
+  // compare stored hash to current hash — divergence sets isStaleDraft.
+  const hydratedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (hydratedRef.current === cacheKey) return;
+    hydratedRef.current = cacheKey;
+    let cancelled = false;
+    void loadDraft(supabaseClient, { companyId, threadKey: cacheKey }).then((row) => {
+      if (cancelled || !row) return;
+      // Don't clobber an in-memory cache that's already richer than the
+      // persisted one (same session, no reload needed).
+      if (cacheRef.current[cacheKey]?.composedMessage) return;
+      cacheRef.current[cacheKey] = row.draft;
+      if (row.draft.composedMessage) setComposedMessage(row.draft.composedMessage);
+      if (row.draft.decisions) setDecisions(row.draft.decisions);
+      if (row.draft.customTexts) setCustomTexts(row.draft.customTexts);
+      if (row.draft.triggered) composeTriggered.current = true;
+      setStoredDraftHash(row.messagesHash);
+      if (row.draft.composedMessage && phase === 'analyzing') setPhase('preview');
+    });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cacheKey]);
+
+  // ─── Write to cache + debounced Supabase persist ─────────────
+  const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     if (composedMessage && (phase === 'preview' || phase === 'configure')) {
-      cacheRef.current[cacheKey] = {
+      const entry = {
         composedMessage,
         decisions,
         customTexts,
+        triggered: composeTriggered.current,
       };
+      cacheRef.current[cacheKey] = entry;
+
+      // Debounce Supabase write — agent edits fire this per keystroke
+      // via the recompose path. 800ms is imperceptible to the user and
+      // collapses a burst of edits into a single upsert.
+      if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
+      persistTimerRef.current = setTimeout(() => {
+        void saveDraft(supabaseClient, {
+          companyId,
+          threadKey: cacheKey,
+          draft: entry,
+          messagesHash: currentHash,
+          source: 'ai',
+        });
+        setStoredDraftHash(currentHash);
+      }, 800);
     }
-  }, [composedMessage, decisions, customTexts, phase, cacheKey, cacheRef]);
+    return () => {
+      if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
+    };
+  }, [composedMessage, decisions, customTexts, phase, cacheKey, cacheRef, companyId, currentHash]);
 
   // ─── Manual recompose from configure phase ────────────────────
   const handleRecompose = useCallback(() => {
@@ -329,5 +400,7 @@ export function useSmartReply({ ticket, existingDraft, cacheRef, aiInquiries }: 
     handleRecompose,
     composeTriggered,
     cacheKey,
+    isStaleDraft,
+    acknowledgeStaleDraft,
   };
 }
