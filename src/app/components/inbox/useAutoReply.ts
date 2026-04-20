@@ -35,6 +35,14 @@ import { buildPropertyContext } from '../../ai/kb-context';
 import type { Ticket } from '../../data/types';
 import { collection, getDocs, query, orderBy } from 'firebase/firestore';
 import { mapFirestoreMessage, type FirestoreMessage } from '../../../lib/firestore-mappers';
+import {
+  claimAIReply,
+  finalizeAIReply,
+  deriveGuestMsgId,
+  isTailClean,
+  type AttemptOutcome,
+} from '../../../lib/ai-reply-idempotency';
+import { COMPANY_ID } from '../../../lib/supabase-client';
 
 // ─── Debounce presets (ms) — configurable per host ───────────────
 const DEBOUNCE_PRESETS: Record<string, number> = {
@@ -510,6 +518,11 @@ export function useGlobalAutoReply() {
     autoReplyAbortControllers.current[ticketId] = abortController;
     const signal = abortController.signal;
 
+    // Server-side idempotency state — shared across try/catch so an LLM
+    // failure can still finalize the attempt row with outcome='error'.
+    let attemptWon = false;
+    let idempotencyGuestMsgId: string | null = null;
+
     try {
       // ─── Safety keyword check (P0) ─────────────────────────
       const safetyKeywords = hostConfig.safetyKeywords || [];
@@ -591,6 +604,41 @@ export function useGlobalAutoReply() {
       const lastGuestMsg = [...(ticket.messages || [])].reverse().find(m => m.sender === 'guest');
       if (!lastGuestMsg) return;
 
+      // ─── Server-side idempotency claim ────────────────────────
+      // Every tab/browser that sees the same guest message derives the
+      // same guest_msg_id (createdAt|text[:100]). The DB's UNIQUE PK on
+      // (company_id, thread_key, guest_msg_id) picks exactly one winner.
+      // Losers skip — the winner's reply reaches them via the channel's
+      // round-trip (Firestore onSnapshot / Supabase Realtime messages
+      // table), so there's nothing to render locally. sessionStorage
+      // fingerprints upstream are now only a fast-path to avoid
+      // unnecessary claim attempts on reload.
+      idempotencyGuestMsgId = deriveGuestMsgId({
+        createdAt: lastGuestMsg.createdAt ?? 0,
+        text: lastGuestMsg.text ?? '',
+      });
+      try {
+        const claim = await claimAIReply({
+          companyId: COMPANY_ID,
+          threadKey: ticketId,
+          guestMsgId: idempotencyGuestMsgId,
+          model: resolveModel('auto_reply', promptOverrides),
+        });
+        attemptWon = claim.won;
+        if (!claim.won) {
+          console.log(
+            '[AutoReply] %s: claim lost to sibling tab/browser — winner will propagate via channel (existing.outcome=%s)',
+            ticketId, claim.existing?.outcome,
+          );
+          return;
+        }
+      } catch (err) {
+        // Fail-open: if the idempotency endpoint is unreachable, fall back
+        // to the legacy client-only path so a flaky edge function doesn't
+        // block auto-replies entirely. Duplicate risk reverts to prior behavior.
+        console.warn('[AutoReply] idempotency claim failed, falling back:', err);
+      }
+
       const kbContext = buildKBContext(ticket);
       const channelHint = CHANNEL_TONE[ticket.channel] || CHANNEL_TONE['Direct']!;
       const conversationHistory = buildConversationHistory(ticket);
@@ -637,6 +685,36 @@ export function useGlobalAutoReply() {
       if (output.risk_score >= 8) {
         console.log('[AutoReply] RISK GATE: score=%d — overriding outcome to escalate for %s', output.risk_score, ticketId);
         output.outcome = 'escalate';
+      }
+
+      // ─── [STEP 5c] Commit-time tail check ──────────────────────────
+      // If a human agent (or another bot tab's round-tripped reply) landed
+      // while the LLM was thinking, abort. This closes the "AI replies
+      // after the agent already typed" race structurally — no cooldown
+      // heuristic required.
+      {
+        const liveTicket = ticketsRef.current.find(t => t.id === ticketId);
+        const liveMsgs = liveTicket?.messages || ticket.messages || [];
+        if (!isTailClean({ messages: liveMsgs, guestMsgCreatedAt: lastGuestMsg.createdAt ?? 0 })) {
+          console.log('[AutoReply] %s: commit-time tail check FAILED — marking superseded', ticketId);
+          if (attemptWon && idempotencyGuestMsgId) {
+            try {
+              await finalizeAIReply({
+                companyId: COMPANY_ID,
+                threadKey: ticketId,
+                guestMsgId: idempotencyGuestMsgId,
+                outcome: 'superseded',
+              });
+            } catch (e) {
+              console.warn('[AutoReply] finalize superseded failed:', e);
+            }
+          }
+          toast.info('AI held back', {
+            description: 'You replied first — the AI skipped its response to avoid talking over you.',
+            duration: 4000,
+          });
+          return;
+        }
       }
 
       // ─── [STEP 6] Route by Outcome + Host Settings ─────────────
@@ -778,6 +856,27 @@ export function useGlobalAutoReply() {
         });
       }
 
+      // ─── [STEP 8] Finalize idempotency attempt ─────────────────
+      // Fire-and-forget — we already applied the reply locally and
+      // dispatched to the channel. Loser tabs read this row via Realtime
+      // for observability; the channel round-trip delivers the visible
+      // message.
+      if (attemptWon && idempotencyGuestMsgId) {
+        const finalOutcome: Exclude<AttemptOutcome, 'pending' | 'superseded'> =
+          output.safetyFlagged ? 'safety'
+            : outcomeForRouting === 'answered' ? 'answered'
+            : outcomeForRouting === 'partial'  ? 'partial'
+            : 'escalate';
+        finalizeAIReply({
+          companyId: COMPANY_ID,
+          threadKey: ticketId,
+          guestMsgId: idempotencyGuestMsgId,
+          outcome: finalOutcome,
+          replyText: output.reply,
+          riskScore: output.risk_score,
+        }).catch(err => console.warn('[AutoReply] finalize failed:', err));
+      }
+
     } catch (err) {
       // AbortError is expected when the user cancels — don't show error toast
       if ((err as any)?.name === 'AbortError') {
@@ -787,6 +886,18 @@ export function useGlobalAutoReply() {
         toast.error('Auto-reply failed', {
           description: `Could not process ${tickets.find(t => t.id === ticketId)?.guestName}'s message. Reply manually.`,
         });
+      }
+      // Mark the attempt row as error so sibling tabs don't hang on a
+      // 'pending' Realtime subscription. Cancellation is still terminal
+      // for the attempt — we don't want a second tab to take over and
+      // re-ask the LLM after the user explicitly cancelled.
+      if (attemptWon && idempotencyGuestMsgId) {
+        finalizeAIReply({
+          companyId: COMPANY_ID,
+          threadKey: ticketId,
+          guestMsgId: idempotencyGuestMsgId,
+          outcome: 'error',
+        }).catch(e => console.warn('[AutoReply] finalize error failed:', e));
       }
     } finally {
       pendingRef.current[ticketId] = false;
