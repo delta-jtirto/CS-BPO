@@ -38,10 +38,13 @@ import { mapFirestoreMessage, type FirestoreMessage } from '../../../lib/firesto
 import {
   claimAIReply,
   finalizeAIReply,
+  waitForAttemptFinalized,
   deriveGuestMsgId,
   isTailClean,
   type AttemptOutcome,
+  type AttemptRow,
 } from '../../../lib/ai-reply-idempotency';
+import { supabase as supabaseClient } from '../../../lib/supabase-client';
 
 // ─── Debounce presets (ms) — configurable per host ───────────────
 const DEBOUNCE_PRESETS: Record<string, number> = {
@@ -631,9 +634,51 @@ export function useGlobalAutoReply() {
         attemptWon = claim.won;
         if (!claim.won) {
           console.log(
-            '[AutoReply] %s: claim lost to sibling tab/browser — winner will propagate via channel (existing.outcome=%s)',
+            '[AutoReply] %s: claim lost to sibling tab/browser — observing attempt row (existing.outcome=%s)',
             ticketId, claim.existing?.outcome,
           );
+          // Loser-path UX: if the winner has already finalized, reflect
+          // the outcome right now; otherwise subscribe to Realtime until
+          // they do. The visible message itself reaches us through the
+          // channel's own round-trip (Firestore / Supabase Realtime on
+          // messages table), so we don't inject anything locally — we
+          // only surface operator-visible signals that wouldn't otherwise
+          // appear (superseded notice, error silence).
+          const showOutcomeToast = (row: AttemptRow | null) => {
+            const g = ticket.guestName;
+            if (!row) {
+              // Timed out waiting — could be an unreachable finalizer or
+              // a stale pending row. Log and move on; next guest message
+              // triggers a fresh attempt.
+              console.warn('[AutoReply] %s: loser wait timed out', ticketId);
+              return;
+            }
+            if (row.outcome === 'superseded') {
+              toast.info('AI held back', {
+                description: `Another reply landed first on ${g}'s thread — AI skipped.`,
+                duration: 4000,
+              });
+            } else if (row.outcome === 'error') {
+              toast.error('AI reply failed elsewhere', {
+                description: `Another tab couldn't complete the reply for ${g}. Check their thread.`,
+                duration: 5000,
+              });
+            }
+            // answered / partial / escalate / safety — the winning tab
+            // already dispatched to the channel; round-trip delivers the
+            // bubble here. No extra toast.
+          };
+          if (claim.existing && claim.existing.outcome !== 'pending') {
+            showOutcomeToast(claim.existing);
+          } else {
+            // Fire-and-forget: wait for Realtime terminal state. If it
+            // doesn't arrive within 90s we stop listening and log.
+            void waitForAttemptFinalized(supabaseClient, {
+              companyId,
+              threadKey: ticketId,
+              guestMsgId: idempotencyGuestMsgId,
+            }).then(showOutcomeToast);
+          }
           return;
         }
       } catch (err) {
