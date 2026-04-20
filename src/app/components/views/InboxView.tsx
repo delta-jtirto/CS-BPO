@@ -31,6 +31,7 @@ import { useMessageContextMenu } from '../inbox/hooks/useMessageContextMenu';
 import { useBookingDetails } from '../inbox/hooks/useBookingDetails';
 import { ContextSidebarPane } from '../inbox/ContextSidebarPane';
 import { InboxDialogs } from '../inbox/InboxDialogs';
+import { MessageErrorBoundary } from '../shared/MessageErrorBoundary';
 
 /** Linkify plain-text email bodies: converts <URL> and bare https:// to anchor tags,
  *  preserving the rest as plain text. Returns React nodes (no dangerouslySetInnerHTML). */
@@ -1539,7 +1540,8 @@ export function InboxView() {
         {/* Chat messages */}
         <div className={`flex-1 overflow-y-auto ${isMobile ? 'p-3 gap-3' : 'p-6 gap-4'} flex flex-col`}>
           {getMessages(activeTicket).map((msg) => (
-            <div key={msg.id} className={`flex flex-col transition-all duration-300 ${
+            <MessageErrorBoundary key={msg.id} messageId={msg.id}>
+            <div className={`flex flex-col transition-all duration-300 ${
               pendingDeletes.has(msg.id) ? 'opacity-20 scale-95 pointer-events-none' : ''
             } ${
               msg.sender === 'guest' ? `self-start ${isMobile ? 'max-w-[90%]' : 'max-w-[80%]'}` :
@@ -1722,6 +1724,7 @@ export function InboxView() {
                 </>
               )}
             </div>
+            </MessageErrorBoundary>
           ))}
           {/* AI processing typing indicator in chat */}
           <AnimatePresence>
