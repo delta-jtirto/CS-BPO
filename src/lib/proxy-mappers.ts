@@ -96,8 +96,11 @@ export function mapProxyMessageToMessage(
   // Validate at the source boundary — a payload missing id / conversation_id
   // / direction / channel_timestamp throws MappingError and the per-row
   // ErrorBoundary renders <MalformedMessageFallback /> instead of letting
-  // bad data poison downstream sort/render/cache logic.
-  msg = validateProxyMessage(msg) as ProxyMessage;
+  // bad data poison downstream sort/render/cache logic. We DON'T reassign
+  // msg from the validator's narrowed return; the downstream mapper reads
+  // fields (like error_message) that aren't in the validated schema yet,
+  // and the raw payload remains trustworthy once validation passes.
+  validateProxyMessage(msg);
   const tsMs = msg.channel_timestamp
     ? new Date(msg.channel_timestamp).getTime()
     : new Date(msg.received_at).getTime();

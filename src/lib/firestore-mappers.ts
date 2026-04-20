@@ -244,7 +244,9 @@ export function mapFirestoreMessage(
   // now fails fast with a structured MappingError instead of silently
   // producing a corrupt Message that flows into SLA / cache / render code.
   // The per-row ErrorBoundary catches the throw and renders the fallback.
-  msg = validateFirestoreMessage(msg) as FirestoreMessage;
+  // Don't rebind msg — the validator's return type is narrower and would
+  // hide fields the downstream mapper expects.
+  validateFirestoreMessage(msg);
   // Normalize: Firestore timestamps may be in seconds
   const tsMs = msg.timestamp > 1e12 ? msg.timestamp : msg.timestamp * 1000;
   // Determine sender: compare sender_id against thread's guest ID (same approach as
