@@ -608,21 +608,12 @@ export function InboxView() {
               <button
                 onClick={async () => {
                   try {
-                    const { getAccessToken } = await import('@/lib/supabase-client');
-                    const token = await getAccessToken();
-                    const PROXY_URL = import.meta.env.VITE_CHANNEL_PROXY_URL || '';
                     const companyId = proxyCompanyIds[0];
-                    if (!token || !PROXY_URL || !companyId) return;
-                    const res = await fetch(`${PROXY_URL}/api/proxy/email/fetch`, {
-                      method: 'POST',
-                      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ company_id: companyId }),
-                    });
-                    if (res.ok) {
-                      const data = await res.json();
-                      if (data.stored > 0) toast.success(`${data.stored} new email(s) fetched`);
-                      else toast('No new emails');
-                    }
+                    if (!companyId) return;
+                    const { fetchEmails } = await import('@/lib/channel-proxy-client');
+                    const { stored } = await fetchEmails(companyId);
+                    if (stored > 0) toast.success(`${stored} new email(s) fetched`);
+                    else toast('No new emails');
                   } catch { toast.error('Failed to fetch emails'); }
                 }}
                 className="w-6 h-6 rounded-md flex items-center justify-center bg-slate-200 text-slate-500 hover:bg-indigo-100 hover:text-indigo-600 transition-colors"
@@ -863,24 +854,12 @@ export function InboxView() {
                     onClick={async () => {
                       setSyncingEmail(true);
                       try {
-                        const { getAccessToken } = await import('@/lib/supabase-client');
-                        const token = await getAccessToken();
-                        const PROXY_URL = import.meta.env.VITE_CHANNEL_PROXY_URL || '';
                         const companyId = proxyCompanyIds[0];
-                        if (!token || !PROXY_URL || !companyId) return;
-                        const res = await fetch(`${PROXY_URL}/api/proxy/email/fetch`, {
-                          method: 'POST',
-                          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-                          body: JSON.stringify({ company_id: companyId }),
-                        });
-                        if (res.ok) {
-                          const data = await res.json();
-                          if (data.stored > 0) {
-                            toast.success(`${data.stored} new email(s) fetched`);
-                          } else {
-                            toast('No new emails');
-                          }
-                        }
+                        if (!companyId) return;
+                        const { fetchEmails } = await import('@/lib/channel-proxy-client');
+                        const { stored } = await fetchEmails(companyId);
+                        if (stored > 0) toast.success(`${stored} new email(s) fetched`);
+                        else toast('No new emails');
                       } catch {} finally {
                         setSyncingEmail(false);
                         setInboxMenuOpen(false);
@@ -1888,21 +1867,14 @@ export function InboxView() {
                 if (syncingEmail) return;
                 setSyncingEmail(true);
                 try {
-                  const { getAccessToken } = await import('@/lib/supabase-client');
-                  const token = await getAccessToken();
-                  const PROXY_URL = import.meta.env.VITE_CHANNEL_PROXY_URL || '';
                   const companyId = proxyCompanyIds[0];
-                  if (!token || !PROXY_URL || !companyId) return;
-                  const res = await fetch(`${PROXY_URL}/api/proxy/email/fetch`, {
-                    method: 'POST',
-                    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ company_id: companyId }),
-                  });
-                  if (res.ok) {
-                    const data = await res.json();
-                    if (data.stored > 0) toast.success(`${data.stored} new email(s) fetched`);
+                  if (!companyId) return;
+                  const { fetchEmails } = await import('@/lib/channel-proxy-client');
+                  try {
+                    const { stored } = await fetchEmails(companyId);
+                    if (stored > 0) toast.success(`${stored} new email(s) fetched`);
                     else toast('No new emails');
-                  } else {
+                  } catch {
                     toast.error('Sync failed');
                   }
                 } catch {
