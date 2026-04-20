@@ -34,11 +34,18 @@ import { toast } from 'sonner';
 // cannot crash the entire AppProvider during initialization.
 const getApiClient = () => import('../ai/api-client');
 
-// Auth headers for Supabase Functions
-const getSupabaseHeaders = () => ({
-  'Content-Type': 'application/json',
-  'Authorization': `Bearer ${publicAnonKey}`,
-});
+// Auth headers for Supabase Functions. Prefers the authenticated user's
+// access_token so edge endpoints can reject anonymous callers via
+// auth.getUser(). Falls back to the anon key only while the session is
+// loading — those calls hit routes that still permit anon (currently
+// only /health; other anon calls are rejected server-side).
+const getSupabaseHeaders = async () => {
+  const token = (await getAccessToken()) ?? publicAnonKey;
+  return {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${token}`,
+  };
+};
 
 export interface Notification {
   id: string;
@@ -1819,7 +1826,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       try {
         const res = await fetch(
           `https://${projectId}.supabase.co/functions/v1/make-server-ab702ee0/onboarding/load?propIds=${encodeURIComponent(propIds)}`,
-          { headers: { 'Authorization': `Bearer ${publicAnonKey}`, 'Content-Type': 'application/json' } }
+          { headers: await getSupabaseHeaders() }
         );
         if (!res.ok) return;
         const { data } = await res.json();
@@ -1878,10 +1885,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         `https://${projectId}.supabase.co/functions/v1/make-server-ab702ee0/onboarding/save`,
         {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${publicAnonKey}`,
-          },
+          headers: await getSupabaseHeaders(),
           body: JSON.stringify(data),
         }
       );

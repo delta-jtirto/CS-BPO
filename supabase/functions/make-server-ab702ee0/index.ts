@@ -78,6 +78,40 @@ async function requireCompanyId(c: any, requested: string): Promise<{ ok: true }
   return { ok: true };
 }
 
+/**
+ * Gate every non-public endpoint. Rejects callers who send only the
+ * anon key (embedded in every frontend bundle → effectively public)
+ * or a tampered / expired user JWT. Sets c.var.userId for handlers
+ * that want it.
+ *
+ * Previously most endpoints accepted the anon-key bearer as "auth",
+ * which meant any internet client with the Supabase anon key could
+ * exfiltrate inbox tokens, burn OpenRouter credits, rewrite AI
+ * settings, etc. This closes the hole.
+ */
+async function requireAuthenticatedUser(
+  c: any,
+): Promise<{ ok: true; userId: string } | { ok: false; status: number; body: unknown }> {
+  const authHeader = c.req.header("Authorization");
+  if (!authHeader) {
+    return { ok: false, status: 401, body: { error: "Unauthorized: missing Authorization header" } };
+  }
+  const token = authHeader.replace(/^Bearer\s+/i, "").trim();
+  if (!token) {
+    return { ok: false, status: 401, body: { error: "Unauthorized: empty bearer" } };
+  }
+  const verifyClient = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_ANON_KEY")!,
+    { global: { headers: { Authorization: `Bearer ${token}` } } },
+  );
+  const { data: { user }, error } = await verifyClient.auth.getUser();
+  if (error || !user) {
+    return { ok: false, status: 401, body: { error: "Unauthorized: invalid session" } };
+  }
+  return { ok: true, userId: user.id };
+}
+
 // Enable logger
 app.use('*', logger(console.log));
 
@@ -92,6 +126,25 @@ app.use(
     maxAge: 600,
   }),
 );
+
+/**
+ * Auth middleware on every path except the health check. Rejects
+ * requests without a valid Supabase user JWT. Handlers that need
+ * the user id read it via c.req.header("Authorization") + their
+ * own resolveCompanyIds() / requireCompanyId() (unchanged).
+ *
+ * This is the single choke-point that closes the "anon-key → full
+ * read/write on every endpoint" hole. Skipping `/health` because
+ * it's the one route that should respond without a session (for
+ * uptime monitoring from outside the app).
+ */
+app.use("/make-server-ab702ee0/*", async (c, next) => {
+  const path = new URL(c.req.url).pathname;
+  if (path === "/make-server-ab702ee0/health") return next();
+  const auth = await requireAuthenticatedUser(c);
+  if (!auth.ok) return c.json(auth.body as any, auth.status as any);
+  return next();
+});
 
 // ─── KV Key Constants ────────────────────────────────────
 const KV_AI_API_KEY = "ai_config:api_key";

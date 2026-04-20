@@ -7,21 +7,38 @@
 
 import { projectId, publicAnonKey } from '/utils/supabase/info';
 import { startDebugEntry, updateDebugEntry, type AIDebugEntry } from './debug-store';
+import { getAccessToken } from '@/lib/supabase-client';
 
 const BASE_URL = `https://${projectId}.supabase.co/functions/v1/make-server-ab702ee0`;
 const SUPABASE_REST_URL = `https://${projectId}.supabase.co/rest/v1`;
 
-// Edge Function uses anon key (not user JWT) — it has its own auth via service_role internally
-const headers = () => ({
-  'Content-Type': 'application/json',
-  'Authorization': `Bearer ${publicAnonKey}`,
-});
+/**
+ * Headers for edge function calls. Previously this used the public
+ * anon key as the bearer, which meant the edge function could not
+ * distinguish an authenticated user from a random caller with the
+ * anon key (which is embedded in every frontend bundle and thus
+ * public). We now prefer the user's access_token from the Supabase
+ * session — the edge function verifies it via auth.getUser() and
+ * can reject anonymous callers. Falls back to the anon key only for
+ * the `/health` endpoint and during the brief pre-session startup
+ * window; both cases are no-op on the server.
+ */
+const headers = async () => {
+  const token = (await getAccessToken()) ?? publicAnonKey;
+  return {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${token}`,
+  };
+};
 
-const getPrefsHeaders = () => ({
-  'Content-Type': 'application/json',
-  'Authorization': `Bearer ${publicAnonKey}`,
-  'Prefer': 'return=representation',
-});
+const getPrefsHeaders = async () => {
+  const token = (await getAccessToken()) ?? publicAnonKey;
+  return {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${token}`,
+    'Prefer': 'return=representation',
+  };
+};
 
 // ─── Types ──────────────────────────────────────────────
 
@@ -42,7 +59,7 @@ export interface AIProxyResult {
 // ─── Settings ───────────────────────────────────────────
 
 export async function getAISettings(): Promise<AISettings> {
-  const res = await fetch(`${BASE_URL}/ai/settings`, { headers: headers() });
+  const res = await fetch(`${BASE_URL}/ai/settings`, { headers: await headers() });
   const json = await res.json();
   if (!res.ok) {
     console.error('Failed to fetch AI settings:', json);
@@ -54,7 +71,7 @@ export async function getAISettings(): Promise<AISettings> {
 export async function saveAISettings(updates: { apiKey?: string; model?: string; importModel?: string }): Promise<AISettings> {
   const res = await fetch(`${BASE_URL}/ai/settings`, {
     method: 'PUT',
-    headers: headers(),
+    headers: await headers(),
     body: JSON.stringify(updates),
   });
   const json = await res.json();
@@ -68,7 +85,7 @@ export async function saveAISettings(updates: { apiKey?: string; model?: string;
 export async function clearAIKey(): Promise<AISettings> {
   const res = await fetch(`${BASE_URL}/ai/settings/key`, {
     method: 'DELETE',
-    headers: headers(),
+    headers: await headers(),
   });
   const json = await res.json();
   if (!res.ok) {
@@ -81,7 +98,7 @@ export async function clearAIKey(): Promise<AISettings> {
 // ─── Agent Preferences ──────────────────────────────────
 
 export async function getPreferences(): Promise<Record<string, any>> {
-  const res = await fetch(`${BASE_URL}/preferences`, { headers: headers() });
+  const res = await fetch(`${BASE_URL}/preferences`, { headers: await headers() });
   const json = await res.json();
   if (!res.ok) {
     console.error('Failed to fetch preferences:', json);
@@ -93,7 +110,7 @@ export async function getPreferences(): Promise<Record<string, any>> {
 export async function savePreferences(prefs: Record<string, any>): Promise<{ saved: string[] }> {
   const res = await fetch(`${BASE_URL}/preferences`, {
     method: 'PUT',
-    headers: headers(),
+    headers: await headers(),
     body: JSON.stringify(prefs),
   });
   const json = await res.json();
@@ -116,7 +133,7 @@ export interface InboxEntry {
 /** Fetch saved inbox connections (metadata only, no raw tokens). */
 export async function getInboxes(): Promise<InboxEntry[]> {
   try {
-    const res = await fetch(`${BASE_URL}/inboxes`, { headers: headers() });
+    const res = await fetch(`${BASE_URL}/inboxes`, { headers: await headers() });
     const json = await res.json();
     if (!res.ok) throw new Error(json.error || 'Failed to load inboxes');
     return json.inboxes ?? [];
@@ -132,7 +149,7 @@ export async function getInboxTokens(hostIds: string[]): Promise<Record<string, 
   try {
     const res = await fetch(`${BASE_URL}/inboxes/tokens`, {
       method: 'POST',
-      headers: headers(),
+      headers: await headers(),
       body: JSON.stringify({ hostIds }),
     });
     const json = await res.json();
@@ -147,7 +164,7 @@ export async function getInboxTokens(hostIds: string[]): Promise<Record<string, 
 /** Fetch the token for a single host. Returns null if not found. */
 export async function getInboxToken(hostId: string): Promise<string | null> {
   try {
-    const res = await fetch(`${BASE_URL}/inboxes/${encodeURIComponent(hostId)}/token`, { headers: headers() });
+    const res = await fetch(`${BASE_URL}/inboxes/${encodeURIComponent(hostId)}/token`, { headers: await headers() });
     if (res.status === 404) return null;
     const json = await res.json();
     if (!res.ok) throw new Error(json.error || 'Failed to load token');
@@ -167,7 +184,7 @@ export async function saveInbox(hostId: string, data: {
 }): Promise<void> {
   const res = await fetch(`${BASE_URL}/inboxes/${encodeURIComponent(hostId)}`, {
     method: 'PUT',
-    headers: headers(),
+    headers: await headers(),
     body: JSON.stringify(data),
   });
   const json = await res.json();
@@ -178,7 +195,7 @@ export async function saveInbox(hostId: string, data: {
 export async function deleteInbox(hostId: string): Promise<void> {
   const res = await fetch(`${BASE_URL}/inboxes/${encodeURIComponent(hostId)}`, {
     method: 'DELETE',
-    headers: headers(),
+    headers: await headers(),
   });
   const json = await res.json();
   if (!res.ok) throw new Error(json.error || 'Failed to delete inbox');
@@ -329,7 +346,7 @@ async function proxyAICall(opts: ProxyCallOptions): Promise<AIProxyResult> {
   try {
     const res = await fetch(`${BASE_URL}/ai/${opts.endpoint}`, {
       method: 'POST',
-      headers: headers(),
+      headers: await headers(),
       body: JSON.stringify({
         systemPrompt: opts.systemPrompt,
         userPrompt: opts.userPrompt,
@@ -485,7 +502,7 @@ const CHAT_LS_PREFIX = 'askAiChat_';
 export async function getChatHistory(ticketId: string): Promise<ChatMessage[]> {
   // Try backend first
   try {
-    const res = await fetch(`${BASE_URL}/ai/chat/${encodeURIComponent(ticketId)}`, { headers: headers() });
+    const res = await fetch(`${BASE_URL}/ai/chat/${encodeURIComponent(ticketId)}`, { headers: await headers() });
     const json = await res.json();
     if (res.ok && json.messages?.length) {
       // Sync to localStorage as cache
@@ -510,7 +527,7 @@ export async function saveChatHistory(ticketId: string, messages: ChatMessage[])
   try {
     await fetch(`${BASE_URL}/ai/chat/${encodeURIComponent(ticketId)}`, {
       method: 'PUT',
-      headers: headers(),
+      headers: await headers(),
       body: JSON.stringify({ messages }),
     });
   } catch {
@@ -524,7 +541,7 @@ export async function clearChatHistory(ticketId: string): Promise<void> {
   try {
     await fetch(`${BASE_URL}/ai/chat/${encodeURIComponent(ticketId)}`, {
       method: 'DELETE',
-      headers: headers(),
+      headers: await headers(),
     });
   } catch {
     // Silently swallow
