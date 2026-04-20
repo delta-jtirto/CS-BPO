@@ -686,8 +686,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setAiKillSwitchRaw(enabled);
     try { localStorage.setItem('aiKillSwitch', String(enabled)); } catch {}
     if (enabled) {
+      // Abort every in-flight LLM call so tokens stop burning immediately.
+      // The main useAutoReply effect short-circuits on the next tick, but
+      // claims already dispatched won't cancel themselves. Mark them
+      // cancelled + abort their fetch. Finalize-as-error fires via the
+      // catch block in processTicket so loser tabs don't hang on pending.
+      const controllers = autoReplyAbortControllers.current;
+      const cancelRef = autoReplyCancelledRef.current;
+      let aborted = 0;
+      for (const ticketId of Object.keys(controllers)) {
+        cancelRef[ticketId] = true;
+        try { controllers[ticketId].abort(); aborted++; } catch { /* ignore */ }
+        delete controllers[ticketId];
+      }
+      setAutoReplyProcessingState({});
       toast.warning('AI auto-reply disabled globally', {
-        description: 'No AI replies will be sent across any ticket until re-enabled.',
+        description: aborted > 0
+          ? `No AI replies will be sent across any ticket. ${aborted} in-flight call${aborted === 1 ? '' : 's'} aborted.`
+          : 'No AI replies will be sent across any ticket until re-enabled.',
         duration: 5000,
       });
     }
