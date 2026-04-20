@@ -42,7 +42,6 @@ import {
   isTailClean,
   type AttemptOutcome,
 } from '../../../lib/ai-reply-idempotency';
-import { COMPANY_ID } from '../../../lib/supabase-client';
 
 // ─── Debounce presets (ms) — configurable per host ───────────────
 const DEBOUNCE_PRESETS: Record<string, number> = {
@@ -321,6 +320,10 @@ export function useGlobalAutoReply() {
   const cancelAutoReply = ctx?.cancelAutoReply ?? (() => {});
   const firestoreConnections = ctx?.firestoreConnections ?? [];
   const agentPresence = ctx?.agentPresence ?? 'away'; // default 'away' so existing behavior is preserved if context unavailable
+  // Resolved via RPC from the user's JWT / user_companies row. First element
+  // is the active scope for single-tenant deployments; multi-tenant UIs will
+  // expose a picker that updates the head of this array.
+  const companyId = ctx?.proxyCompanyIds?.[0] ?? 'delta-hq';
 
   // Track last processed guest message fingerprint per ticket.
   // Fingerprint = `${createdAt}|${text.slice(0,100)}` of the last guest message.
@@ -619,7 +622,7 @@ export function useGlobalAutoReply() {
       });
       try {
         const claim = await claimAIReply({
-          companyId: COMPANY_ID,
+          companyId,
           threadKey: ticketId,
           guestMsgId: idempotencyGuestMsgId,
           model: resolveModel('auto_reply', promptOverrides),
@@ -700,7 +703,7 @@ export function useGlobalAutoReply() {
           if (attemptWon && idempotencyGuestMsgId) {
             try {
               await finalizeAIReply({
-                companyId: COMPANY_ID,
+                companyId,
                 threadKey: ticketId,
                 guestMsgId: idempotencyGuestMsgId,
                 outcome: 'superseded',
@@ -868,7 +871,7 @@ export function useGlobalAutoReply() {
             : outcomeForRouting === 'partial'  ? 'partial'
             : 'escalate';
         finalizeAIReply({
-          companyId: COMPANY_ID,
+          companyId,
           threadKey: ticketId,
           guestMsgId: idempotencyGuestMsgId,
           outcome: finalOutcome,
@@ -893,7 +896,7 @@ export function useGlobalAutoReply() {
       // re-ask the LLM after the user explicitly cancelled.
       if (attemptWon && idempotencyGuestMsgId) {
         finalizeAIReply({
-          companyId: COMPANY_ID,
+          companyId,
           threadKey: ticketId,
           guestMsgId: idempotencyGuestMsgId,
           outcome: 'error',

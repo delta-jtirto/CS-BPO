@@ -30,12 +30,43 @@ export async function getSession(): Promise<Session | null> {
 }
 
 /**
- * Get the current user's company IDs.
- * Hardcoded for single-company setup — avoids RLS complexity.
- * To support multiple companies later, query user_companies table.
+ * Single-tenant prototype fallback. Use only as a last-resort default when
+ * every other resolution path (JWT claim, user_companies table, RPC) has
+ * failed. New code should prefer `proxyCompanyIds` from AppContext or
+ * `getUserCompanyIds()` below so multi-tenant isolation actually holds.
+ *
+ * @deprecated Will be removed once every caller reads from context / RPC.
  */
 export const COMPANY_ID = 'delta-hq';
 
+/**
+ * Resolve the authenticated user's company scope server-side.
+ *
+ * Calls the SECURITY DEFINER function `public.get_user_company_ids()`
+ * (migration 20260421000001). Resolution order inside the function:
+ *   1. JWT claim `app_metadata.companies` (array of text).
+ *   2. `public.user_companies` rows for `auth.uid()`.
+ *   3. `['delta-hq']` prototype fallback when a row exists but neither
+ *      of the above is populated.
+ *
+ * Returns `[]` when no session is active. Callers should treat an empty
+ * array as "not signed in" and avoid issuing company-scoped queries.
+ */
 export async function getUserCompanyIds(): Promise<string[]> {
-  return [COMPANY_ID];
+  const { data: { session } } = await supabase.auth.getSession();
+  if (!session) return [];
+
+  const { data, error } = await supabase.rpc('get_user_company_ids');
+  if (error) {
+    console.warn('[supabase] get_user_company_ids RPC failed:', error.message);
+    // Do NOT silently substitute a default here — a stale fallback is
+    // exactly the kind of tenant-crossing bug this RPC is meant to
+    // prevent. An empty array tells the caller to fail closed.
+    return [];
+  }
+
+  const ids = Array.isArray(data)
+    ? (data as unknown[]).filter((x): x is string => typeof x === 'string')
+    : [];
+  return ids;
 }
