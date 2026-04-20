@@ -320,6 +320,7 @@ export function useGlobalAutoReply() {
   const cancelAutoReply = ctx?.cancelAutoReply ?? (() => {});
   const firestoreConnections = ctx?.firestoreConnections ?? [];
   const agentPresence = ctx?.agentPresence ?? 'away'; // default 'away' so existing behavior is preserved if context unavailable
+  const aiKillSwitchEnabled = ctx?.aiKillSwitchEnabled ?? false;
   // Resolved via RPC from the user's JWT / user_companies row. First element
   // is the active scope for single-tenant deployments; multi-tenant UIs will
   // expose a picker that updates the head of this array.
@@ -919,6 +920,10 @@ export function useGlobalAutoReply() {
   // ─── Main effect: watch all tickets for new guest messages ─────
   useEffect(() => {
     if (!hasApiKey) return;
+    // Global kill-switch: a single operator flip halts every auto-reply
+    // across every host for this session. Checked before agentPresence so
+    // even an Away agent gets the panic-button behavior during an outage.
+    if (aiKillSwitchEnabled) return;
     // When the agent is Online, AI auto-actions are suppressed — the agent handles
     // responses manually. Manual AI tools (compose, Ask AI) remain fully available.
     // When Away, AI acts autonomously per autoReplyMode.
@@ -1050,7 +1055,7 @@ export function useGlobalAutoReply() {
       // lastGuestMsgRef is updated inline above when hasNewGuestMsg is true
       prevUnreadCountsRef.current[ticket.id] = currentUnread;
     }
-  }, [tickets, hasApiKey, agentPresence, hostSettings, processTicket, autoReplyPausedTickets, setAutoReplyProcessing, autoReplyCancelledRef]);
+  }, [tickets, hasApiKey, agentPresence, aiKillSwitchEnabled, hostSettings, processTicket, autoReplyPausedTickets, setAutoReplyProcessing, autoReplyCancelledRef]);
 
   // Cleanup timers on unmount
   useEffect(() => {

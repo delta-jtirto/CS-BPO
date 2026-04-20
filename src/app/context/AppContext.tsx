@@ -245,6 +245,12 @@ interface AppState {
   /** Minutes of inactivity before auto-away triggers (0 = disabled) */
   autoAwayMinutes: number;
   setAutoAwayMinutes: (minutes: number) => void;
+  /** Global AI kill-switch. When true, useAutoReply bails before claiming
+   *  so zero LLM calls, zero outbound sends, zero attempt rows. Use for
+   *  emergency triage when a provider misbehaves or a prompt regresses.
+   *  Per-agent — a flip on one agent's device does not affect others. */
+  aiKillSwitchEnabled: boolean;
+  setAiKillSwitchEnabled: (enabled: boolean) => void;
 
   // Agent preferences
   darkMode: boolean;
@@ -667,6 +673,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const setAgentPresence = useCallback((presence: 'online' | 'away') => {
     setAgentPresenceRaw(presence);
     try { localStorage.setItem('agentPresence', presence); } catch {}
+  }, []);
+  // ─── Global AI kill-switch ────────────────────────────────
+  // Hard cut-off that suppresses every auto-reply attempt across every
+  // host and every ticket. Per-agent (stored in localStorage); during a
+  // provider outage / model misbehavior an operator can flip this and
+  // stop all outbound AI traffic instantly while triaging.
+  const [aiKillSwitchEnabled, setAiKillSwitchRaw] = useState<boolean>(() => {
+    try { return localStorage.getItem('aiKillSwitch') === 'true'; } catch { return false; }
+  });
+  const setAiKillSwitchEnabled = useCallback((enabled: boolean) => {
+    setAiKillSwitchRaw(enabled);
+    try { localStorage.setItem('aiKillSwitch', String(enabled)); } catch {}
+    if (enabled) {
+      toast.warning('AI auto-reply disabled globally', {
+        description: 'No AI replies will be sent across any ticket until re-enabled.',
+        duration: 5000,
+      });
+    }
   }, []);
   const [autoAwayMinutes, setAutoAwayMinutesRaw] = useState<number>(() => {
     try { return parseInt(localStorage.getItem('autoAwayMinutes') || '5', 10) || 5; } catch { return 5; }
@@ -2172,6 +2196,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       notifications, markNotificationRead, markAllNotificationsRead, unreadCount,
       hostSettings, updateHostSettings,
       agentPresence, setAgentPresence,
+      aiKillSwitchEnabled, setAiKillSwitchEnabled,
       autoAwayMinutes, setAutoAwayMinutes,
       darkMode, setDarkMode,
       devMode: devModeRaw, setDevMode,
