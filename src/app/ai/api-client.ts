@@ -184,13 +184,15 @@ export async function deleteInbox(hostId: string): Promise<void> {
   if (!res.ok) throw new Error(json.error || 'Failed to delete inbox');
 }
 
-// Supabase client for direct table access (properties)
-let supabaseClient: any = null;
+// Supabase client for direct table access (properties). Re-uses the
+// singleton from src/lib/supabase-client.ts — previously this file
+// built its own createClient() instance, which caused the console
+// warning "Multiple GoTrueClient instances detected in the same
+// browser context". One client per tab, one auth storage key, one
+// token-refresh loop.
 const getSupabaseClient = async () => {
-  if (supabaseClient) return supabaseClient;
-  const { createClient } = await import('@supabase/supabase-js');
-  supabaseClient = createClient(`https://${projectId}.supabase.co`, publicAnonKey);
-  return supabaseClient;
+  const { supabase } = await import('@/lib/supabase-client');
+  return supabase;
 };
 
 // ─── Properties ─────────────────────────────────────────
