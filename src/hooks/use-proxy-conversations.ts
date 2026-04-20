@@ -12,6 +12,48 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import type { SupabaseClient, RealtimeChannel } from '@supabase/supabase-js';
 
+/**
+ * Proxy channel Realtime health.
+ *   'connected'      — subscribed, receiving updates.
+ *   'connecting'     — subscription negotiated, awaiting SUBSCRIBED state.
+ *   'polling-only'   — Realtime errored/closed; polling fallback is the
+ *                      sole delivery mechanism. Not a failure per se —
+ *                      polling still delivers new messages — but surfaces
+ *                      the degradation to the composer for Send gating.
+ */
+export type ProxyRealtimeHealth = 'connected' | 'connecting' | 'polling-only';
+
+/** Module-level, hostId-less — proxy is one Supabase client for all
+ *  companies. InboxView / composer gate reads the latest value. */
+let _proxyRealtimeHealth: ProxyRealtimeHealth = 'connecting';
+const _healthSubscribers = new Set<(h: ProxyRealtimeHealth) => void>();
+
+function setProxyRealtimeHealth(h: ProxyRealtimeHealth) {
+  if (_proxyRealtimeHealth === h) return;
+  _proxyRealtimeHealth = h;
+  for (const cb of _healthSubscribers) cb(h);
+}
+
+export function getProxyRealtimeHealth(): ProxyRealtimeHealth {
+  return _proxyRealtimeHealth;
+}
+
+export function subscribeProxyRealtimeHealth(
+  cb: (h: ProxyRealtimeHealth) => void,
+): () => void {
+  _healthSubscribers.add(cb);
+  cb(_proxyRealtimeHealth);
+  return () => { _healthSubscribers.delete(cb); };
+}
+
+/** React hook wrapper. Reads the module-level state via a small
+ *  subscription so components re-render on health changes. */
+export function useProxyRealtimeHealth(): ProxyRealtimeHealth {
+  const [h, setH] = useState<ProxyRealtimeHealth>(_proxyRealtimeHealth);
+  useEffect(() => subscribeProxyRealtimeHealth(setH), []);
+  return h;
+}
+
 export interface ProxyConversation {
   id: string;
   company_id: string;
@@ -159,9 +201,13 @@ export function useProxyConversations({
     };
   }, [supabase, companyIds.join(','), pageSize]);
 
-  // Realtime subscription for new/updated conversations
+  // Realtime subscription for new/updated conversations + module-level
+  // health tracking so the composer can gate Send when Realtime is down
+  // (polling still delivers but the feedback loop becomes slower).
   useEffect(() => {
     if (companyIds.length === 0) return;
+
+    setProxyRealtimeHealth('connecting');
 
     const channel = supabase
       .channel('proxy-conversations')
@@ -191,12 +237,23 @@ export function useProxyConversations({
           }
         },
       )
-      .subscribe();
+      .subscribe((status) => {
+        // Supabase Realtime status callback fires with one of:
+        //   'SUBSCRIBED'      — connected, ready to receive.
+        //   'CLOSED'          — channel closed.
+        //   'CHANNEL_ERROR'   — server-side error.
+        //   'TIMED_OUT'       — handshake / heartbeat timeout.
+        if (status === 'SUBSCRIBED') setProxyRealtimeHealth('connected');
+        else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+          setProxyRealtimeHealth('polling-only');
+        }
+      });
 
     channelRef.current = channel;
 
     return () => {
       channel.unsubscribe();
+      setProxyRealtimeHealth('connecting');
     };
   }, [supabase, companyIds.join(',')]);
 

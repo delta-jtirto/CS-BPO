@@ -19,7 +19,7 @@ import { parseThreadStatus, type Message } from '../../data/types';
 import { SmartReplyPanel, type SmartReplyCache } from '../inbox/SmartReplyPanel';
 import { useIsMobile } from '../ui/use-mobile';
 import { useFirestoreMessages } from '@/hooks/use-firestore-messages';
-import { useProxyMessages } from '@/hooks/use-proxy-conversations';
+import { useProxyMessages, useProxyRealtimeHealth } from '@/hooks/use-proxy-conversations';
 import { mapProxyMessageToMessage } from '@/lib/proxy-mappers';
 import { supabase as supabaseClient } from '@/lib/supabase-client';
 import { ConnectionStatusBar } from '../ConnectionStatusBar';
@@ -171,15 +171,29 @@ export function InboxView() {
   const loadOlderMessages = isProxyTicket ? proxyLoadMore : firestoreLoadMore;
   const hasOlderMessages = isProxyTicket ? proxyHasMore : firestoreHasMore;
 
+  const proxyRealtimeHealth = useProxyRealtimeHealth();
+
   /** Composer health gate — disables the Send button when the inbox
    *  connection behind the active ticket is degraded. Prevents phantom
    *  sends that end up stuck in outbound_send_idempotency with no
-   *  channel dispatch. Proxy channels always pass (Supabase connection
-   *  health isn't currently tracked here); Firestore tickets require
-   *  the connection's status to be 'connected'. */
+   *  channel dispatch. Proxy channels now track Supabase Realtime
+   *  health too — polling-only still allows sending but surfaces
+   *  degraded feedback via the tooltip. */
   const composerHealth = useMemo(() => {
     if (!activeTicket) return { healthy: true, reason: '' };
-    if (isProxyTicket) return { healthy: true, reason: '' };
+    if (isProxyTicket) {
+      // Polling-only isn't fatal for sends — the backend still accepts
+      // outbound POSTs. But we warn the operator so they don't wonder
+      // why the bubble takes longer than usual to flip to delivered.
+      if (proxyRealtimeHealth === 'polling-only') {
+        return {
+          healthy: true,
+          reason: 'Live updates unavailable — delivery confirmation may be delayed.',
+          degraded: true,
+        };
+      }
+      return { healthy: true, reason: '' };
+    }
     if (!activeTicket.firestoreHostId) return { healthy: true, reason: '' };
     const conn = firestoreConnections.find(c => c.hostId === activeTicket.firestoreHostId);
     if (!conn) return { healthy: false, reason: 'Inbox not loaded yet — hold on.' };
@@ -192,7 +206,7 @@ export function InboxView() {
           : conn.status === 'network-error' ? 'Connection lost — reconnecting…'
           : 'Inbox connection degraded — reconnecting…',
     };
-  }, [activeTicket, isProxyTicket, firestoreConnections]);
+  }, [activeTicket, isProxyTicket, firestoreConnections, proxyRealtimeHealth]);
 
   /** Scroll container ref + IntersectionObserver sentinel for infinite-scroll
    *  of older history. Live window is capped at 100 messages in each hook;
