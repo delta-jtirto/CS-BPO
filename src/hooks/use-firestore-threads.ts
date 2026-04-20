@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import {
-  collection, query, onSnapshot, where, doc, getDocs,
+  collection, query, onSnapshot, where, doc,
   type Firestore, type Unsubscribe,
 } from 'firebase/firestore';
 import type { Ticket, Host } from '@/app/data/types';
@@ -109,27 +109,39 @@ export function useFirestoreThreads(
       return;
     }
 
-    const allUnsubscribes: Unsubscribe[] = [];
+    // Per-host teardown registries. The old pattern stashed child
+    // unsubscribes on a magic __threadSubs_${hostId} property of an
+    // array — type-unsafe and easy to leak on fast navigation. Proper
+    // Maps keyed by hostId instead.
+    const userUnsubs = new Map<string, Unsubscribe>();
+    const junctionUnsubs = new Map<string, Map<string, Unsubscribe>>(); // hostId → chunkKey → unsub
+    const threadUnsubs = new Map<string, Map<string, Unsubscribe>>();   // hostId → chunkKey → unsub
+    // Short-circuit signal: if user_to_threads array is unchanged from
+    // the last snapshot, we skip the junction+thread re-subscription.
+    const lastThreadIdSig = new Map<string, string>();
     loadedHosts.current.clear();
 
+    const clearHostSubs = (hostId: string, which: 'junction' | 'threads' | 'both') => {
+      if (which === 'junction' || which === 'both') {
+        const m = junctionUnsubs.get(hostId);
+        if (m) { for (const u of m.values()) u(); m.clear(); }
+      }
+      if (which === 'threads' || which === 'both') {
+        const m = threadUnsubs.get(hostId);
+        if (m) { for (const u of m.values()) u(); m.clear(); }
+      }
+    };
+
     for (const conn of connections) {
-      // V1 Step 1: Subscribe to user doc → get user_to_threads array
+      // V1 Step 1: Subscribe to user doc → get user_to_threads array.
       const userDocRef = doc(conn.db, 'users', conn.userId);
 
       const unsubUser = onSnapshot(
         userDocRef,
-        async (userSnapshot) => {
-          // Clean up any previous thread subscriptions for this host
-          const hostSubKey = `__threadSubs_${conn.hostId}`;
-          const prevSubs = (allUnsubscribes as any)[hostSubKey] as Unsubscribe[] | undefined;
-          if (prevSubs) {
-            prevSubs.forEach((u) => u());
-            prevSubs.length = 0;
-          }
-          const threadSubs: Unsubscribe[] = [];
-          (allUnsubscribes as any)[hostSubKey] = threadSubs;
-
+        (userSnapshot) => {
           if (!userSnapshot.exists()) {
+            clearHostSubs(conn.hostId, 'both');
+            lastThreadIdSig.set(conn.hostId, '');
             threadsByHost.current.set(conn.hostId, []);
             loadedHosts.current.add(conn.hostId);
             updateThreadState(conn.hostId, []);
@@ -139,100 +151,149 @@ export function useFirestoreThreads(
           const userData = userSnapshot.data();
           const threadIds: string[] = userData?.user_to_threads || [];
 
+          // Short-circuit: user doc snapshots can fire without any change
+          // to the thread list (unread badge tick, last-read marker, etc.).
+          // Skip re-subscription if the ID set is identical.
+          const sig = [...threadIds].sort().join('|');
+          if (sig === lastThreadIdSig.get(conn.hostId)) {
+            return;
+          }
+          lastThreadIdSig.set(conn.hostId, sig);
+
           if (threadIds.length === 0) {
+            clearHostSubs(conn.hostId, 'both');
             threadsByHost.current.set(conn.hostId, []);
             loadedHosts.current.add(conn.hostId);
             updateThreadState(conn.hostId, []);
             return;
           }
 
-          // V1 Step 2: Batch-query user_to_thread junction → filter is_connected
-          const BATCH_SIZE = 15;
-          const chunks = chunkArray(threadIds, BATCH_SIZE);
-          const validThreadIds: string[] = [];
+          // Replace previous junction + thread subscriptions for this host.
+          clearHostSubs(conn.hostId, 'both');
+          const hostJunctionSubs = new Map<string, Unsubscribe>();
+          const hostThreadSubs = new Map<string, Unsubscribe>();
+          junctionUnsubs.set(conn.hostId, hostJunctionSubs);
+          threadUnsubs.set(conn.hostId, hostThreadSubs);
 
-          try {
-            for (const chunk of chunks) {
-              const junctionQuery = query(
-                collection(conn.db, 'user_to_thread'),
+          const BATCH_SIZE = 15;
+
+          // Chunk-indexed valid-thread-id sets. When a junction chunk
+          // re-fires (is_connected toggled on any of its docs), we
+          // rebuild the chunk's threads subscription.
+          const validByJunctionChunk = new Map<number, Set<string>>();
+          // Chunk-indexed thread tickets so the UI update merges them.
+          const chunkResults = new Map<string, Ticket[]>();
+
+          const recomputeValid = () => {
+            const all = new Set<string>();
+            for (const set of validByJunctionChunk.values()) {
+              for (const id of set) all.add(id);
+            }
+            return all;
+          };
+
+          const resubscribeThreadsForHost = () => {
+            // Rebuild threads subscriptions to match the current union
+            // of valid thread ids. Over-tearing-down is fine — Firestore
+            // dedups cache reads and the UI picks up the first snapshot.
+            const validIds = Array.from(recomputeValid());
+            // Tear down any old thread subs first.
+            for (const u of hostThreadSubs.values()) u();
+            hostThreadSubs.clear();
+            chunkResults.clear();
+
+            if (validIds.length === 0) {
+              threadsByHost.current.set(conn.hostId, []);
+              loadedHosts.current.add(conn.hostId);
+              updateThreadState(conn.hostId, []);
+              return;
+            }
+
+            const threadChunks = chunkArray(validIds, BATCH_SIZE);
+            for (let ci = 0; ci < threadChunks.length; ci++) {
+              const chunk = threadChunks[ci];
+              const threadsQuery = query(
+                collection(conn.db, 'threads'),
                 where('__name__', 'in', chunk),
               );
-              const junctionSnapshot = await getDocs(junctionQuery);
-              for (const jDoc of junctionSnapshot.docs) {
-                if (jDoc.data().is_connected) {
-                  validThreadIds.push(jDoc.data().thread_id);
-                }
-              }
+              const chunkKey = `t:${ci}`;
+              const unsub = onSnapshot(
+                threadsQuery,
+                (threadsSnapshot) => {
+                  const state = bpoStateRef.current;
+                  const chunkTickets = threadsSnapshot.docs
+                    .map((tDoc) => {
+                      const thread = { thread_id: tDoc.id, ...tDoc.data() } as FirestoreThread;
+                      if (thread.is_archived) return null;
+                      const propName = propertiesRef.current?.find(p => p.hostId === conn.hostId)?.name || conn.companyName;
+                      return mapV1ThreadToTicket(
+                        thread,
+                        conn.hostId,
+                        conn.host,
+                        conn.companyName,
+                        state?.resolvedIds[thread.thread_id] || null,
+                        state?.escalationOverrides[thread.thread_id] || null,
+                        state?.handoverReasons[thread.thread_id] || '',
+                        propName,
+                      );
+                    })
+                    .filter((t): t is Ticket => t !== null);
+                  chunkResults.set(chunkKey, chunkTickets);
+
+                  const allHostTickets: Ticket[] = [];
+                  for (const tickets of chunkResults.values()) allHostTickets.push(...tickets);
+                  threadsByHost.current.set(conn.hostId, allHostTickets);
+                  loadedHosts.current.add(conn.hostId);
+                  updateThreadState(conn.hostId, allHostTickets);
+                },
+                (error) => {
+                  console.error(`[Firestore] Threads query error for ${conn.hostId}:`, error);
+                  if (isAuthError(error)) onAuthErrorRef.current?.(conn.hostId);
+                  loadedHosts.current.add(conn.hostId);
+                  if (loadedHosts.current.size >= connections.length) setIsLoading(false);
+                },
+              );
+              hostThreadSubs.set(chunkKey, unsub);
             }
-          } catch (err) {
-            console.error(`[Firestore] Junction query error for ${conn.hostId}:`, err);
-          }
+          };
 
-          if (validThreadIds.length === 0) {
-            threadsByHost.current.set(conn.hostId, []);
-            loadedHosts.current.add(conn.hostId);
-            updateThreadState(conn.hostId, []);
-            return;
-          }
-
-          // V1 Step 3: Subscribe to threads collection with valid IDs
-          const threadChunks = chunkArray(validThreadIds, BATCH_SIZE);
-          // Accumulate thread docs from all chunks
-          const chunkResults = new Map<number, Ticket[]>();
-
-          for (let ci = 0; ci < threadChunks.length; ci++) {
-            const chunk = threadChunks[ci];
-            const threadsQuery = query(
-              collection(conn.db, 'threads'),
+          // V1 Step 2: Subscribe (not getDocs) to user_to_thread junction
+          // chunks. Now a revoked connection (is_connected → false)
+          // propagates to the UI immediately instead of sitting stale
+          // until the page reloads.
+          const junctionChunks = chunkArray(threadIds, BATCH_SIZE);
+          for (let jci = 0; jci < junctionChunks.length; jci++) {
+            const chunk = junctionChunks[jci];
+            const junctionQuery = query(
+              collection(conn.db, 'user_to_thread'),
               where('__name__', 'in', chunk),
             );
-
-            const unsubThreads = onSnapshot(
-              threadsQuery,
-              (threadsSnapshot) => {
-                const state = bpoStateRef.current;
-                const chunkTickets = threadsSnapshot.docs
-                  .map((tDoc) => {
-                    const thread = { thread_id: tDoc.id, ...tDoc.data() } as FirestoreThread;
-                    // Filter archived threads client-side
-                    if (thread.is_archived) return null;
-                    // Resolve property name from the properties list using the connection's hostId
-                    const propName = propertiesRef.current?.find(p => p.hostId === conn.hostId)?.name || conn.companyName;
-                    return mapV1ThreadToTicket(
-                      thread,
-                      conn.hostId,
-                      conn.host,
-                      conn.companyName,
-                      state?.resolvedIds[thread.thread_id] || null,
-                      state?.escalationOverrides[thread.thread_id] || null,
-                      state?.handoverReasons[thread.thread_id] || '',
-                      propName,
-                    );
-                  })
-                  .filter((t): t is Ticket => t !== null);
-
-                chunkResults.set(ci, chunkTickets);
-
-                // Merge all chunks for this host
-                const allHostTickets: Ticket[] = [];
-                for (const tickets of chunkResults.values()) {
-                  allHostTickets.push(...tickets);
+            const junctionKey = `j:${jci}`;
+            const unsub = onSnapshot(
+              junctionQuery,
+              (snap) => {
+                const connected = new Set<string>();
+                for (const jDoc of snap.docs) {
+                  const d = jDoc.data();
+                  if (d.is_connected) connected.add(d.thread_id);
                 }
-                threadsByHost.current.set(conn.hostId, allHostTickets);
-                loadedHosts.current.add(conn.hostId);
-                updateThreadState(conn.hostId, allHostTickets);
+                const prev = validByJunctionChunk.get(jci);
+                // Only re-subscribe threads if the set actually changed —
+                // avoids thrash on noisy junction updates.
+                const sameSet = prev && prev.size === connected.size &&
+                  [...connected].every((id) => prev.has(id));
+                if (sameSet) return;
+                validByJunctionChunk.set(jci, connected);
+                resubscribeThreadsForHost();
               },
               (error) => {
-                console.error(`[Firestore] Threads query error for ${conn.hostId}:`, error);
+                console.error(`[Firestore] Junction query error for ${conn.hostId}:`, error);
                 if (isAuthError(error)) onAuthErrorRef.current?.(conn.hostId);
                 loadedHosts.current.add(conn.hostId);
-                if (loadedHosts.current.size >= connections.length) {
-                  setIsLoading(false);
-                }
+                if (loadedHosts.current.size >= connections.length) setIsLoading(false);
               },
             );
-
-            threadSubs.push(unsubThreads);
+            hostJunctionSubs.set(junctionKey, unsub);
           }
         },
         (error) => {
@@ -245,16 +306,18 @@ export function useFirestoreThreads(
         },
       );
 
-      allUnsubscribes.push(unsubUser);
+      userUnsubs.set(conn.hostId, unsubUser);
     }
 
     function updateThreadState(hostId: string, _tickets: Ticket[]) {
       if (activeTicketIdRef.current) {
         setThreads((prev) => {
-          const otherHosts = prev.filter((t) => t.firestoreHostId !== hostId);
-          const merged = [...otherHosts, ..._tickets];
-          const deduped = Array.from(new Map(merged.map((t) => [t.id, t])).values());
-          return deduped;
+          // O(n) Map-based merge — replaces prior host's tickets without
+          // scanning-and-filtering, then adds the new host's.
+          const merged = new Map<string, Ticket>();
+          for (const t of prev) if (t.firestoreHostId !== hostId) merged.set(t.id, t);
+          for (const t of _tickets) merged.set(t.id, t);
+          return Array.from(merged.values());
         });
         setHasPendingSort(true);
       } else {
@@ -266,16 +329,13 @@ export function useFirestoreThreads(
     }
 
     return () => {
-      allUnsubscribes.forEach((u) => {
-        if (typeof u === 'function') u();
-      });
-      // Clean up thread subs stored on the array
-      for (const key of Object.keys(allUnsubscribes)) {
-        if (key.startsWith('__threadSubs_')) {
-          const subs = (allUnsubscribes as any)[key] as Unsubscribe[];
-          subs?.forEach((u) => u());
-        }
-      }
+      for (const u of userUnsubs.values()) u();
+      userUnsubs.clear();
+      for (const m of junctionUnsubs.values()) { for (const u of m.values()) u(); m.clear(); }
+      junctionUnsubs.clear();
+      for (const m of threadUnsubs.values()) { for (const u of m.values()) u(); m.clear(); }
+      threadUnsubs.clear();
+      lastThreadIdSig.clear();
     };
   // Re-subscribe when connections change
   // eslint-disable-next-line react-hooks/exhaustive-deps
