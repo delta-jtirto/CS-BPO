@@ -2,8 +2,76 @@ import { Hono } from "npm:hono";
 import { cors } from "npm:hono/cors";
 import { logger } from "npm:hono/logger";
 import * as kv from "./kv_store.ts";
+import { createClient } from "jsr:@supabase/supabase-js@2.49.8";
 
 const app = new Hono();
+
+// ─── Service-role Supabase client ────────────────────────
+// Bypasses RLS for idempotency writes; scoping is enforced by explicit
+// company_id checks in each handler (see resolveCompanyIds).
+function dbClient() {
+  return createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+  );
+}
+
+// ─── Auth / company-id resolution ────────────────────────
+// Supabase Functions pre-validate the JWT when verify_jwt is on, so we can
+// trust the token's payload without re-verifying the signature. We decode
+// the base64url payload, pull `app_metadata.companies` if present, and
+// fall back to the `user_companies` table. Single-tenant prototype keeps
+// the `delta-hq` fallback so existing deploys keep working.
+async function resolveCompanyIds(authHeader: string | undefined): Promise<string[]> {
+  if (!authHeader) return [];
+  const token = authHeader.replace(/^Bearer\s+/i, "").trim();
+  if (!token) return [];
+
+  let payload: any = null;
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return [];
+    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    payload = JSON.parse(atob(padded));
+  } catch {
+    return [];
+  }
+
+  const jwtCompanies = payload?.app_metadata?.companies;
+  if (Array.isArray(jwtCompanies) && jwtCompanies.length > 0) {
+    return jwtCompanies.filter((c: unknown): c is string => typeof c === "string");
+  }
+
+  const sub: string | undefined = payload?.sub;
+  if (!sub) return [];
+
+  try {
+    const { data } = await dbClient()
+      .from("user_companies")
+      .select("company_id")
+      .eq("user_id", sub);
+    if (data && data.length > 0) {
+      return data.map((r: { company_id: string }) => r.company_id);
+    }
+  } catch {
+    // table may not exist in older deploys — fall through to prototype default
+  }
+
+  // Single-tenant prototype default — matches the SQL fallback.
+  return ["delta-hq"];
+}
+
+async function requireCompanyId(c: any, requested: string): Promise<{ ok: true } | { ok: false; status: number; body: unknown }> {
+  const allowed = await resolveCompanyIds(c.req.header("Authorization"));
+  if (allowed.length === 0) {
+    return { ok: false, status: 401, body: { error: "Unauthorized: no valid session" } };
+  }
+  if (!allowed.includes(requested)) {
+    return { ok: false, status: 403, body: { error: "company_id not in caller's scope" } };
+  }
+  return { ok: true };
+}
 
 // Enable logger
 app.use('*', logger(console.log));
@@ -314,6 +382,139 @@ app.post("/make-server-ab702ee0/ai/ask", async (c) => {
   } catch (err: any) {
     console.log(`Network error in ask-ai proxy: ${err.message}`);
     return c.json({ error: `Network error: ${err.message}` }, 502);
+  }
+});
+
+// ─── AI Auto-Reply: Claim idempotency row ────────────────
+// Server-side gate for AI auto-replies. Every tab that sees a new guest
+// message calls this; the UNIQUE PK on (company_id, thread_key,
+// guest_msg_id) ensures exactly one client wins.
+//
+// Winners proceed to call /ai/compose-reply and then /ai/auto-reply/finalize.
+// Losers receive { won: false, existing: {...} } and render the winner's
+// result from Realtime once the finalize lands.
+app.post("/make-server-ab702ee0/ai/auto-reply/claim", async (c) => {
+  try {
+    const body = await c.req.json();
+    const { company_id, thread_key, guest_msg_id, prompt_version, model } = body;
+
+    if (!company_id || !thread_key || !guest_msg_id || !prompt_version || !model) {
+      return c.json({ error: "Missing required fields: company_id, thread_key, guest_msg_id, prompt_version, model" }, 400);
+    }
+
+    const auth = await requireCompanyId(c, company_id);
+    if (!auth.ok) return c.json(auth.body as any, auth.status as any);
+
+    const db = dbClient();
+
+    // Try to claim the attempt. PK collision = someone else won.
+    const insert = await db
+      .from("ai_reply_attempts")
+      .insert({
+        company_id,
+        thread_key,
+        guest_msg_id,
+        prompt_version,
+        model,
+        outcome: "pending",
+      })
+      .select("trace_id")
+      .maybeSingle();
+
+    if (!insert.error && insert.data) {
+      return c.json({ won: true, trace_id: insert.data.trace_id, existing: null });
+    }
+
+    // 23505 = unique_violation. Anything else is a real error.
+    const code = (insert.error as { code?: string } | null)?.code;
+    if (code !== "23505") {
+      console.log(`[auto-reply/claim] insert failed:`, insert.error);
+      return c.json({ error: insert.error?.message || "insert failed" }, 500);
+    }
+
+    // Lost the race — return the winner's current state so the loser can
+    // either render it immediately (if finalized) or wait on Realtime.
+    const { data: existing, error: selErr } = await db
+      .from("ai_reply_attempts")
+      .select("trace_id, outcome, reply_text, risk_score, model, prompt_version, created_at, completed_at")
+      .eq("company_id", company_id)
+      .eq("thread_key", thread_key)
+      .eq("guest_msg_id", guest_msg_id)
+      .maybeSingle();
+
+    if (selErr || !existing) {
+      return c.json({ error: "claim conflict but row not readable" }, 500);
+    }
+
+    return c.json({ won: false, trace_id: existing.trace_id, existing });
+  } catch (err: any) {
+    console.log(`[auto-reply/claim] error: ${err.message}`);
+    return c.json({ error: err.message }, 500);
+  }
+});
+
+// ─── AI Auto-Reply: Finalize with outcome ────────────────
+// Called by the winning tab after the LLM returns. Client is expected to
+// do a commit-time tail check BEFORE calling this — if a non-guest
+// message landed while the LLM was thinking, the client sends
+// outcome='superseded' and omits reply_text.
+app.post("/make-server-ab702ee0/ai/auto-reply/finalize", async (c) => {
+  try {
+    const body = await c.req.json();
+    const { company_id, thread_key, guest_msg_id, outcome, reply_text, risk_score } = body;
+
+    if (!company_id || !thread_key || !guest_msg_id || !outcome) {
+      return c.json({ error: "Missing required fields: company_id, thread_key, guest_msg_id, outcome" }, 400);
+    }
+
+    const VALID_OUTCOMES = ["answered", "partial", "escalate", "safety", "superseded", "error"];
+    if (!VALID_OUTCOMES.includes(outcome)) {
+      return c.json({ error: `Invalid outcome. Must be one of: ${VALID_OUTCOMES.join(", ")}` }, 400);
+    }
+
+    const auth = await requireCompanyId(c, company_id);
+    if (!auth.ok) return c.json(auth.body as any, auth.status as any);
+
+    const db = dbClient();
+
+    const { data, error } = await db
+      .from("ai_reply_attempts")
+      .update({
+        outcome,
+        reply_text: reply_text ?? null,
+        risk_score: typeof risk_score === "number" ? risk_score : null,
+        completed_at: new Date().toISOString(),
+      })
+      .eq("company_id", company_id)
+      .eq("thread_key", thread_key)
+      .eq("guest_msg_id", guest_msg_id)
+      .eq("outcome", "pending")  // only finalize from pending → terminal
+      .select("trace_id, outcome, reply_text, risk_score")
+      .maybeSingle();
+
+    if (error) {
+      console.log(`[auto-reply/finalize] update failed:`, error);
+      return c.json({ error: error.message }, 500);
+    }
+
+    // If data is null, the row was already finalized by someone else or
+    // never claimed. Return 200 with `already_finalized: true` so the
+    // client can safely treat it as a no-op.
+    if (!data) {
+      const { data: current } = await db
+        .from("ai_reply_attempts")
+        .select("trace_id, outcome, reply_text, risk_score")
+        .eq("company_id", company_id)
+        .eq("thread_key", thread_key)
+        .eq("guest_msg_id", guest_msg_id)
+        .maybeSingle();
+      return c.json({ already_finalized: true, current });
+    }
+
+    return c.json({ already_finalized: false, current: data });
+  } catch (err: any) {
+    console.log(`[auto-reply/finalize] error: ${err.message}`);
+    return c.json({ error: err.message }, 500);
   }
 });
 
