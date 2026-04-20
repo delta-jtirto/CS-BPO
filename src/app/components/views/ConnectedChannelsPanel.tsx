@@ -5,7 +5,7 @@ import {
   MessageSquare, Globe, Phone, Mail, AlertCircle, HelpCircle, ExternalLink,
   ChevronDown, ChevronUp, ArrowRight,
 } from 'lucide-react';
-import { getAccessToken, getUserCompanyIds, COMPANY_ID } from '@/lib/supabase-client';
+import { getAccessToken, getUserCompanyIds } from '@/lib/supabase-client';
 import { channelDisplayName } from '@/lib/channel-config';
 import { MOCK_HOSTS } from '@/app/data/mock-data';
 import {
@@ -215,10 +215,17 @@ export default function ConnectedChannelsPanel() {
   const [disconnectTarget, setDisconnectTarget] = useState<ChannelAccount | null>(null);
   const [disconnecting, setDisconnecting] = useState(false);
 
-  // Single-company setup — use constant
+  // Resolve the signed-in user's company scope via the JWT-aware RPC.
+  // Single-tenant deployments get ['delta-hq']; multi-tenant users will
+  // see all their companies and can switch via the picker.
   useEffect(() => {
-    setCompanyIds([COMPANY_ID]);
-    setSelectedCompanyId(COMPANY_ID);
+    let cancelled = false;
+    getUserCompanyIds().then(ids => {
+      if (cancelled || ids.length === 0) return;
+      setCompanyIds(ids);
+      setSelectedCompanyId(ids[0]);
+    }).catch(() => {});
+    return () => { cancelled = true; };
   }, []);
 
   // Load accounts when company changes

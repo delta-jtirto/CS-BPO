@@ -17,48 +17,53 @@ function dbClient() {
 }
 
 // ─── Auth / company-id resolution ────────────────────────
-// Supabase Functions pre-validate the JWT when verify_jwt is on, so we can
-// trust the token's payload without re-verifying the signature. We decode
-// the base64url payload, pull `app_metadata.companies` if present, and
-// fall back to the `user_companies` table. Single-tenant prototype keeps
-// the `delta-hq` fallback so existing deploys keep working.
+// JWT is verified via auth.getUser() — an HTTP call to the gotrue auth
+// service which checks signature + expiry + revocation. We cannot rely
+// on Supabase Functions to have verify_jwt=true (no config.toml in this
+// repo, and the default for older Figma Make functions is uncertain),
+// so we verify explicitly on every request. The extra round-trip is
+// worth it — silently trusting a decoded-but-unverified payload would
+// be a tenant-crossing security hole.
 async function resolveCompanyIds(authHeader: string | undefined): Promise<string[]> {
   if (!authHeader) return [];
   const token = authHeader.replace(/^Bearer\s+/i, "").trim();
   if (!token) return [];
 
-  let payload: any = null;
-  try {
-    const parts = token.split(".");
-    if (parts.length !== 3) return [];
-    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
-    payload = JSON.parse(atob(padded));
-  } catch {
-    return [];
-  }
+  // Verify the JWT by asking the auth service to resolve the user. Any
+  // tampered or expired token yields `error` / `user === null` and we
+  // treat it as unauthenticated.
+  const verifyClient = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_ANON_KEY")!,
+    { global: { headers: { Authorization: `Bearer ${token}` } } },
+  );
+  const { data: { user }, error } = await verifyClient.auth.getUser();
+  if (error || !user) return [];
 
-  const jwtCompanies = payload?.app_metadata?.companies;
+  // Preferred scope: JWT claim `app_metadata.companies`. Admins set this
+  // when provisioning a user so downstream services can avoid the
+  // user_companies round-trip entirely.
+  const jwtCompanies = (user.app_metadata as { companies?: unknown })?.companies;
   if (Array.isArray(jwtCompanies) && jwtCompanies.length > 0) {
     return jwtCompanies.filter((c: unknown): c is string => typeof c === "string");
   }
 
-  const sub: string | undefined = payload?.sub;
-  if (!sub) return [];
-
+  // Secondary scope: user_companies table.
   try {
     const { data } = await dbClient()
       .from("user_companies")
       .select("company_id")
-      .eq("user_id", sub);
+      .eq("user_id", user.id);
     if (data && data.length > 0) {
       return data.map((r: { company_id: string }) => r.company_id);
     }
   } catch {
-    // table may not exist in older deploys — fall through to prototype default
+    // Table may not exist on older deploys — fall through to prototype default.
   }
 
-  // Single-tenant prototype default — matches the SQL fallback.
+  // Single-tenant prototype default — matches the SQL fallback. Remove
+  // once every authenticated user has either an app_metadata.companies
+  // claim or a user_companies row.
   return ["delta-hq"];
 }
 
@@ -444,6 +449,38 @@ app.post("/make-server-ab702ee0/ai/auto-reply/claim", async (c) => {
 
     if (selErr || !existing) {
       return c.json({ error: "claim conflict but row not readable" }, 500);
+    }
+
+    // Stale-pending reclaim: if the existing row is still 'pending' but
+    // its owning tab hasn't finalized within the LLM-call budget (5 min),
+    // the tab probably crashed / lost network / was force-closed. Take
+    // it over by transitioning pending→pending with a fresh prompt_version
+    // + model stamp (represents "new claimant"). Conditional UPDATE
+    // ensures we only win if nobody else finalized first.
+    const STALE_PENDING_MS = 5 * 60 * 1000;
+    const createdAtMs = Date.parse(existing.created_at as unknown as string);
+    if (existing.outcome === "pending" && Number.isFinite(createdAtMs) && Date.now() - createdAtMs > STALE_PENDING_MS) {
+      const reclaim = await db
+        .from("ai_reply_attempts")
+        .update({
+          prompt_version,
+          model,
+          // Reset created_at so the TTL check restarts for the new claimant.
+          created_at: new Date().toISOString(),
+        })
+        .eq("company_id", company_id)
+        .eq("thread_key", thread_key)
+        .eq("guest_msg_id", guest_msg_id)
+        .eq("outcome", "pending")
+        .select("trace_id")
+        .maybeSingle();
+
+      if (!reclaim.error && reclaim.data) {
+        console.log(`[auto-reply/claim] reclaimed stale pending row for ${thread_key}:${guest_msg_id}`);
+        return c.json({ won: true, trace_id: reclaim.data.trace_id, existing: null, reclaimed: true });
+      }
+      // If reclaim failed because someone finalized between our SELECT
+      // and UPDATE, fall through to returning existing normally.
     }
 
     return c.json({ won: false, trace_id: existing.trace_id, existing });

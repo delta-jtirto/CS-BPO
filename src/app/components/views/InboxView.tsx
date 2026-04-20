@@ -101,6 +101,7 @@ export function InboxView() {
     activeMessages, setActiveMessages,
     firestoreConnections, firestoreInitializing,
     markFirestoreConnectionExpired,
+    proxyCompanyIds,
   } = useAppContext();
 
   const filteredTickets = activeHostFilter === 'all' ? tickets : tickets.filter(t => t.host.id === activeHostFilter);
@@ -527,14 +528,15 @@ export function InboxView() {
               <button
                 onClick={async () => {
                   try {
-                    const { getAccessToken, COMPANY_ID } = await import('@/lib/supabase-client');
+                    const { getAccessToken } = await import('@/lib/supabase-client');
                     const token = await getAccessToken();
                     const PROXY_URL = import.meta.env.VITE_CHANNEL_PROXY_URL || '';
-                    if (!token || !PROXY_URL) return;
+                    const companyId = proxyCompanyIds[0];
+                    if (!token || !PROXY_URL || !companyId) return;
                     const res = await fetch(`${PROXY_URL}/api/proxy/email/fetch`, {
                       method: 'POST',
                       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ company_id: COMPANY_ID }),
+                      body: JSON.stringify({ company_id: companyId }),
                     });
                     if (res.ok) {
                       const data = await res.json();
@@ -781,14 +783,15 @@ export function InboxView() {
                     onClick={async () => {
                       setSyncingEmail(true);
                       try {
-                        const { getAccessToken, COMPANY_ID } = await import('@/lib/supabase-client');
+                        const { getAccessToken } = await import('@/lib/supabase-client');
                         const token = await getAccessToken();
                         const PROXY_URL = import.meta.env.VITE_CHANNEL_PROXY_URL || '';
-                        if (!token || !PROXY_URL) return;
+                        const companyId = proxyCompanyIds[0];
+                        if (!token || !PROXY_URL || !companyId) return;
                         const res = await fetch(`${PROXY_URL}/api/proxy/email/fetch`, {
                           method: 'POST',
                           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-                          body: JSON.stringify({ company_id: COMPANY_ID }),
+                          body: JSON.stringify({ company_id: companyId }),
                         });
                         if (res.ok) {
                           const data = await res.json();
@@ -1796,14 +1799,15 @@ export function InboxView() {
                 if (syncingEmail) return;
                 setSyncingEmail(true);
                 try {
-                  const { getAccessToken, COMPANY_ID } = await import('@/lib/supabase-client');
+                  const { getAccessToken } = await import('@/lib/supabase-client');
                   const token = await getAccessToken();
                   const PROXY_URL = import.meta.env.VITE_CHANNEL_PROXY_URL || '';
-                  if (!token || !PROXY_URL) return;
+                  const companyId = proxyCompanyIds[0];
+                  if (!token || !PROXY_URL || !companyId) return;
                   const res = await fetch(`${PROXY_URL}/api/proxy/email/fetch`, {
                     method: 'POST',
                     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ company_id: COMPANY_ID }),
+                    body: JSON.stringify({ company_id: companyId }),
                   });
                   if (res.ok) {
                     const data = await res.json();
