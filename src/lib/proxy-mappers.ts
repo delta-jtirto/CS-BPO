@@ -77,52 +77,9 @@ export function mapProxyConversationToTicket(
 // ProxyMessage → Message
 // ---------------------------------------------------------------------------
 
+import { isBotSent } from './bot-signatures';
+
 let _proxyMessageIdCounter = 2_000_000; // Offset from Firestore counter (1M) to avoid collision
-
-// Persistent registry of bot-sent message signatures.
-// When addBotMessage sends a reply via proxy, it registers the text+timestamp here.
-// When the real message arrives via Realtime (always as direction='outbound', sender_id=agent),
-// the mapper checks this registry to assign sender='bot' for the violet AI bubble.
-// Persisted to localStorage so signatures survive page refresh and HMR.
-// The channel-proxy backend currently strips our metadata.source='bot' hint on
-// send, so this client-side registry is the only surviving bot marker — without
-// localStorage persistence, every prior AI reply reverts to a regular agent
-// bubble after reload.
-const STORAGE_KEY = 'ar:bot-sigs';
-const MAX_SIGS = 200;
-
-const _botSentSignatures: Set<string> = new Set(
-  (() => { try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch { return []; } })()
-);
-
-function botSig(text: string, tsMinute: number): string {
-  return `${text.slice(0, 120)}|${tsMinute}`;
-}
-
-function persistSigs() {
-  try {
-    const arr = [..._botSentSignatures];
-    // Keep only most recent entries if over limit
-    const trimmed = arr.length > MAX_SIGS ? arr.slice(arr.length - MAX_SIGS) : arr;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(trimmed));
-  } catch { /* localStorage full or unavailable */ }
-}
-
-/** Register a message as bot-sent so Realtime arrivals render as AI Auto-Reply. */
-export function markBotSent(text: string, timestamp: number) {
-  const minute = Math.floor(timestamp / 60_000);
-  _botSentSignatures.add(botSig(text, minute));
-  persistSigs();
-}
-
-export { isBotSent as isBotSentMessage };
-
-function isBotSent(text: string, tsMs: number): boolean {
-  const minute = Math.floor(tsMs / 60_000);
-  return _botSentSignatures.has(botSig(text, minute))
-    || _botSentSignatures.has(botSig(text, minute - 1))
-    || _botSentSignatures.has(botSig(text, minute + 1));
-}
 
 function timestampToTimeString(epoch: number): string {
   const d = new Date(epoch);
@@ -144,10 +101,15 @@ export function mapProxyMessageToMessage(
   if (msg.direction === 'inbound') {
     sender = 'guest';
   } else {
-    // Outbound: check if it was a bot reply or human agent.
-    // sender_id prefix 'bot:' = legacy indicator; metadata.source = 'bot'
-    // is set by addBotMessage/addMultipleMessages for AI auto-replies.
-    if (msg.sender_id?.startsWith('bot:') || msg.metadata?.source === 'bot' || isBotSent(msg.text_body || '', tsMs)) {
+    // Outbound: was this one of ours (AI auto-reply) or a manual agent reply?
+    // `sender_id` / `metadata.source` would be authoritative if the channel-proxy
+    // backend persisted our hint, but it strips it — so we consult the shared
+    // Supabase-backed signature registry. Thread-scoped so the same canned
+    // reply sent to two different threads doesn't collide.
+    const threadKey = `proxy_${msg.conversation_id}`;
+    if (msg.sender_id?.startsWith('bot:')
+        || msg.metadata?.source === 'bot'
+        || isBotSent(threadKey, msg.text_body || '', tsMs)) {
       sender = 'bot';
     } else {
       sender = 'agent';

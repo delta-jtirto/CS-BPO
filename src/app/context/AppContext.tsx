@@ -19,7 +19,8 @@ import { sendProxyMessage, isProxyChannel } from '@/lib/proxy-send';
 import { useProxyConversations } from '@/hooks/use-proxy-conversations';
 import { useConversationOverrides } from '@/hooks/use-conversation-overrides';
 import { useClassifyCache, type UseClassifyCacheResult } from '@/hooks/use-classify-cache';
-import { mapProxyConversationToTicket, markBotSent } from '@/lib/proxy-mappers';
+import { mapProxyConversationToTicket } from '@/lib/proxy-mappers';
+import { hydrateBotSignatures, markBotSent } from '@/lib/bot-signatures';
 import { supabase as supabaseClient, getUserCompanyIds as fetchProxyCompanyIds, getAccessToken } from '@/lib/supabase-client';
 import { toast } from 'sonner';
 
@@ -519,6 +520,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     supabase: supabaseClient,
     companyIds: proxyCompanyIds,
   });
+
+  // ─── Persisted bot-reply marker registry (Supabase-backed) ───────────
+  // Hydrates the in-memory signature Set so proxy/Firestore mappers can
+  // correctly classify round-tripped AI auto-replies as sender='bot' after
+  // refresh and across devices. Fires once per unique companyIds set.
+  useEffect(() => {
+    if (proxyCompanyIds.length === 0) return;
+    void hydrateBotSignatures(supabaseClient, proxyCompanyIds);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [proxyCompanyIds.join(',')]);
 
   // Public API: unchanged callsite shape — ticketId is the `proxy_<uuid>` id,
   // we strip the prefix before persisting and look up company_id from the
@@ -1230,7 +1241,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         ...prev,
         [ticketId]: [...(prev[ticketId] || []), pending],
       }));
-      markBotSent(text, now);
+      markBotSent(supabaseClient, ticket.proxyCompanyId ?? 'delta-hq', ticket.id, text, now);
       runProxySend(ticket.proxyConversationId, text, ticketId, localId, { source: 'bot' });
       return;
     }
@@ -1243,7 +1254,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         const tokens = (() => { try { return JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}'); } catch { return {}; } })();
         const token = tokens[ticket.firestoreHostId];
         if (token) {
-          markBotSent(text, Date.now());
+          markBotSent(supabaseClient, proxyCompanyIds[0] ?? 'delta-hq', ticket.id, text, Date.now());
           sendGuestMessage(ticket.firestoreThreadId, conn.userId, text, token).catch(err => {
             console.error('[AutoReply] Failed to send bot reply via Unibox:', err);
             toast.error('AI reply failed to send', { description: err.message });
@@ -1301,7 +1312,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             ...prev,
             [ticketId]: [...(prev[ticketId] || []), pending],
           }));
-          markBotSent(msg.text, now);
+          markBotSent(supabaseClient, ticket.proxyCompanyId ?? 'delta-hq', ticket.id, msg.text, now);
           runProxySend(ticket.proxyConversationId!, msg.text, ticketId, localId, { source: 'bot' });
         }
       }
@@ -1331,7 +1342,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (token) {
           for (const msg of messages) {
             if (msg.sender === 'bot') {
-              markBotSent(msg.text, Date.now());
+              markBotSent(supabaseClient, proxyCompanyIds[0] ?? 'delta-hq', ticket.id, msg.text, Date.now());
               sendGuestMessage(ticket.firestoreThreadId, conn.userId, msg.text, token).catch(err => {
                 console.error('[AutoReply] Failed to send bot reply via Unibox:', err);
               });

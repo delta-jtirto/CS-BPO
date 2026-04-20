@@ -428,6 +428,7 @@ export function useGlobalAutoReply() {
             mapFirestoreMessage(
               { message_id: d.id, ...d.data() } as FirestoreMessage,
               ticket!.firestoreGuestUserId,
+              ticket!.firestoreThreadId,
             )
           );
           if (fetchedMsgs.length > 0) {

@@ -116,7 +116,7 @@ export function useFirestoreMessages(
       (snapshot) => {
         const fetched = snapshot.docs.map((doc) => {
           const data = { message_id: doc.id, ...doc.data() } as FirestoreMessage;
-          return mapFirestoreMessage(data, guestUserId);
+          return mapFirestoreMessage(data, guestUserId, capturedThreadId);
         });
 
         // Cache always — even for warm subs whose thread isn't visible now.
@@ -182,7 +182,7 @@ export function prefetchMessages(threadId: string, db: Firestore, guestUserId?: 
   const unsub = onSnapshot(q, (snapshot) => {
     const fetched = snapshot.docs.map((doc) => {
       const data = { message_id: doc.id, ...doc.data() } as FirestoreMessage;
-      return mapFirestoreMessage(data, guestUserId);
+      return mapFirestoreMessage(data, guestUserId, threadId);
     });
     cacheSet(threadId, fetched);
     // Unsubscribe after first snapshot — prefetch is one-shot

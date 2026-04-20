@@ -1,6 +1,6 @@
 import type { Host, Message, Ticket } from '@/app/data/types';
 import { computeSLA, formatSLARelative, type EscalationOverride } from './compute-ticket-state';
-import { isBotSentMessage } from './proxy-mappers';
+import { isBotSent } from './bot-signatures';
 
 // ---------------------------------------------------------------------------
 // Firestore types (matching Unified Inbox's data model)
@@ -233,7 +233,11 @@ function timestampToTimeString(epoch: number): string {
   return `${h}:${m}`;
 }
 
-export function mapFirestoreMessage(msg: FirestoreMessage, guestUserId?: string): Message {
+export function mapFirestoreMessage(
+  msg: FirestoreMessage,
+  guestUserId?: string,
+  threadKey?: string,
+): Message {
   // Normalize: Firestore timestamps may be in seconds
   const tsMs = msg.timestamp > 1e12 ? msg.timestamp : msg.timestamp * 1000;
   // Determine sender: compare sender_id against thread's guest ID (same approach as
@@ -245,9 +249,12 @@ export function mapFirestoreMessage(msg: FirestoreMessage, guestUserId?: string)
   } else {
     sender = senderRoleToSender(msg.sender_role);
     // Auto-reply messages are sent as the authenticated user (admin/staff role),
-    // so sender_role won't be 'bot'. Check the session-scoped registry to
-    // correctly render them as AI Auto-Reply bubbles.
-    if (sender === 'agent' && isBotSentMessage(msg.text || '', tsMs)) {
+    // so sender_role won't be 'bot'. Consult the shared bot-signature registry
+    // (Supabase-backed, hydrated on app mount) to re-stamp them as AI Auto-
+    // Reply bubbles. Skipped if threadKey is missing — callers that don't yet
+    // pass it get the pre-migration behavior (always 'agent' for outbound),
+    // which is safe but degrades UI fidelity.
+    if (sender === 'agent' && threadKey && isBotSent(threadKey, msg.text || '', tsMs)) {
       sender = 'bot';
     }
   }
