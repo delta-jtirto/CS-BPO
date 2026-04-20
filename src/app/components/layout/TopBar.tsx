@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Bell, Check, Keyboard, LogOut, Settings, User, Sparkles, TestTube2 } from 'lucide-react';
+import { Bell, Check, Keyboard, LogOut, Settings, User, Sparkles, TestTube2, Zap, ZapOff } from 'lucide-react';
 import { useNavigate } from 'react-router';
 import { MOCK_HOSTS } from '../../data/mock-data';
 import { useAppContext } from '../../context/AppContext';
@@ -16,6 +16,8 @@ const CONTEXT_DEFAULTS = {
   unreadCount: 0,
   agentName: 'Agent',
   hostSettings: [] as any[],
+  aiKillSwitchEnabled: false,
+  setAiKillSwitchEnabled: (_v: boolean) => {},
 };
 
 export function TopBar({ onShowShortcuts }: { onShowShortcuts?: () => void }) {
@@ -29,6 +31,7 @@ export function TopBar({ onShowShortcuts }: { onShowShortcuts?: () => void }) {
     activeHostFilter, setActiveHostFilter,
     notifications, markNotificationRead, markAllNotificationsRead,
     unreadCount, agentName, hostSettings,
+    aiKillSwitchEnabled, setAiKillSwitchEnabled,
   } = ctx ?? CONTEXT_DEFAULTS;
   const navigate = useNavigate();
   const [showNotifications, setShowNotifications] = useState(false);
@@ -81,6 +84,31 @@ export function TopBar({ onShowShortcuts }: { onShowShortcuts?: () => void }) {
 
       <div className="flex items-center gap-3">
         {(hostSettings?.[0]?.demoFeatures?.showZoomOverride ?? true) && <ZoomControl />}
+
+        {/* AI Kill Switch — global halt for auto-replies. Enabled path
+            flips the button red so operators see the degraded state at
+            a glance; clicking either way shows a confirmation toast
+            (the toast itself lives in setAiKillSwitchEnabled). */}
+        <button
+          type="button"
+          onClick={() => setAiKillSwitchEnabled(!aiKillSwitchEnabled)}
+          aria-pressed={aiKillSwitchEnabled}
+          title={
+            aiKillSwitchEnabled
+              ? 'AI auto-reply is DISABLED globally. Click to re-enable.'
+              : 'Disable AI auto-reply globally (emergency stop)'
+          }
+          className={`flex items-center gap-1 text-[10px] font-semibold px-2 py-1 rounded-md transition-colors ${
+            aiKillSwitchEnabled
+              ? 'bg-red-500/20 text-red-300 border border-red-500/40 hover:bg-red-500/30'
+              : 'text-slate-400 hover:text-white hover:bg-slate-800'
+          }`}
+        >
+          {aiKillSwitchEnabled ? <ZapOff size={13} /> : <Zap size={13} />}
+          <span className="hidden md:inline">
+            {aiKillSwitchEnabled ? 'AI Off' : 'AI On'}
+          </span>
+        </button>
 
         {/* Notifications Dropdown */}
         <div className="relative" ref={notifRef}>
