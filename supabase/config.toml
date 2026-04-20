@@ -1,0 +1,17 @@
+# Supabase CLI / Dashboard function configuration.
+#
+# verify_jwt = false for make-server-ab702ee0 so the Supabase edge gateway
+# passes every request through without checking the bearer. We do JWT
+# verification INSIDE the function via auth.getUser() (see the
+# requireAuthenticatedUser middleware), which supports the ES256-signed
+# tokens newer Supabase projects issue for end users. With gateway-level
+# verify_jwt=true the gateway would 401 ES256 tokens before our code runs
+# (error: UNSUPPORTED_TOKEN_ALGORITHM), while simultaneously letting the
+# anon key pass (anon key is HS256-signed) — which silently defeated our
+# "reject anon callers" middleware.
+#
+# /health remains reachable anonymously; all other paths are gated by the
+# in-function auth middleware.
+
+[functions.make-server-ab702ee0]
+verify_jwt = false
