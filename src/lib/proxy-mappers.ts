@@ -83,12 +83,16 @@ let _proxyMessageIdCounter = 2_000_000; // Offset from Firestore counter (1M) to
 // When addBotMessage sends a reply via proxy, it registers the text+timestamp here.
 // When the real message arrives via Realtime (always as direction='outbound', sender_id=agent),
 // the mapper checks this registry to assign sender='bot' for the violet AI bubble.
-// Persisted to sessionStorage so signatures survive page refresh and HMR.
+// Persisted to localStorage so signatures survive page refresh and HMR.
+// The channel-proxy backend currently strips our metadata.source='bot' hint on
+// send, so this client-side registry is the only surviving bot marker — without
+// localStorage persistence, every prior AI reply reverts to a regular agent
+// bubble after reload.
 const STORAGE_KEY = 'ar:bot-sigs';
 const MAX_SIGS = 200;
 
 const _botSentSignatures: Set<string> = new Set(
-  (() => { try { return JSON.parse(sessionStorage.getItem(STORAGE_KEY) || '[]'); } catch { return []; } })()
+  (() => { try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch { return []; } })()
 );
 
 function botSig(text: string, tsMinute: number): string {
@@ -100,8 +104,8 @@ function persistSigs() {
     const arr = [..._botSentSignatures];
     // Keep only most recent entries if over limit
     const trimmed = arr.length > MAX_SIGS ? arr.slice(arr.length - MAX_SIGS) : arr;
-    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(trimmed));
-  } catch { /* sessionStorage full or unavailable */ }
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(trimmed));
+  } catch { /* localStorage full or unavailable */ }
 }
 
 /** Register a message as bot-sent so Realtime arrivals render as AI Auto-Reply. */

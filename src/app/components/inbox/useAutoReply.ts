@@ -441,6 +441,30 @@ export function useGlobalAutoReply() {
       }
     }
 
+    // ─── Idempotency: already-replied check ──────────────────────────
+    // Skip if ANY outbound message (bot / agent / host) has been sent after
+    // the most recent guest message. Handles every duplicate-fire path:
+    //   * Page refresh — sessionStorage fingerprints cleared, but the prior
+    //     reply is still in ticket.messages / Supabase
+    //   * Realtime re-subscription or polling tick
+    //   * A manual agent reply landing between guest msg and AI debounce
+    // Runs AFTER the fresh Supabase/Firestore fetch above so we're checking
+    // the canonical conversation state, not stale local data.
+    const allMsgs = ticket.messages || [];
+    const latestGuestMsg = [...allMsgs].reverse().find(m => m.sender === 'guest');
+    if (latestGuestMsg) {
+      const replyExists = allMsgs.some(m =>
+        (m.sender === 'bot' || m.sender === 'agent' || m.sender === 'host') &&
+        (m.createdAt ?? 0) > (latestGuestMsg.createdAt ?? 0)
+      );
+      if (replyExists) {
+        console.log('[AutoReply] %s: already replied to latest guest msg — skipping', ticketId);
+        setAutoReplyProcessing(ticketId, false);
+        pendingRef.current[ticketId] = false;
+        return;
+      }
+    }
+
     const hostConfig = hostSettings.find(s => s.hostId === ticket.host.id);
     // Per-ticket explicit enable (autoReplyPausedTickets[id] === false) overrides host-level off.
     // This allows one thread to run AI even when the host's global switch is off.
