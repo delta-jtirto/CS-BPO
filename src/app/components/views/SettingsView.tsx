@@ -1421,15 +1421,14 @@ function ConnectedInboxesPanel() {
       } catch (err) {
         console.error('Failed to persist inbox to Supabase:', err);
       }
-      // Keep localStorage in sync as cache
+      // Keep the non-secret inbox metadata cache in sync for faster cold
+      // boot. Tokens are intentionally NOT written to localStorage — they
+      // live only in Supabase KV and in-memory via useFirestoreConnections.
       try {
         const raw = localStorage.getItem('settings_connected_inboxes');
         const list = raw ? JSON.parse(raw) : [];
         list.push(entry);
         localStorage.setItem('settings_connected_inboxes', JSON.stringify(list));
-        const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
-        tokens[selectedHostId] = tokenInput.trim();
-        localStorage.setItem('settings_inbox_tokens', JSON.stringify(tokens));
       } catch { /* ignore */ }
     })();
 
@@ -1464,9 +1463,9 @@ function ConnectedInboxesPanel() {
         const raw = localStorage.getItem('settings_connected_inboxes');
         const list = raw ? JSON.parse(raw) : [];
         localStorage.setItem('settings_connected_inboxes', JSON.stringify(list.filter((i: any) => i.hostId !== hostId)));
-        const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
-        delete tokens[hostId];
-        localStorage.setItem('settings_inbox_tokens', JSON.stringify(tokens));
+        // Belt-and-braces: scrub any legacy token from the pre-Supabase-KV
+        // cache if a user is disconnecting after upgrading.
+        localStorage.removeItem('settings_inbox_tokens');
       } catch { /* ignore */ }
     })();
     // Tear down Firebase app + unsubscribe from Firestore
@@ -1515,12 +1514,9 @@ function ConnectedInboxesPanel() {
         connectedAt: new Date().toISOString(),
         accessToken: updateTokenInput.trim(),
       });
-      // Update localStorage cache
-      try {
-        const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
-        tokens[hostId] = updateTokenInput.trim();
-        localStorage.setItem('settings_inbox_tokens', JSON.stringify(tokens));
-      } catch { /* ignore */ }
+      // No localStorage write — Supabase KV (set via saveInbox above) is
+      // the only persistent store for tokens; reconnect() updates the
+      // in-memory mirror inside useFirestoreConnections.
       // Reconnect with new token
       const host = MOCK_HOSTS.find(h => h.id === hostId);
       if (host) {

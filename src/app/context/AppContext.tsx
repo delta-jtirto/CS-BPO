@@ -129,6 +129,10 @@ interface AppState {
    *  Call when a downstream API returns 401/403 or Firestore snapshot errors
    *  with permission-denied / unauthenticated. */
   markFirestoreConnectionExpired: (hostId: string) => void;
+  /** Synchronous read of the in-memory access token for a host, hydrated
+   *  from Supabase KV on boot. Returns null if no connection is active.
+   *  Never touches localStorage — tokens are stored server-side only. */
+  getFirestoreToken: (hostId: string) => string | null;
 
   /** Persisted classify-inquiry cache. Consumers call getIfFresh(threadKey,
    *  signature) before running the LLM, and save(...) after a successful
@@ -372,29 +376,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           .filter(c => c.accessToken);
         if (connections.length > 0) {
           setInitialSavedConnections(connections);
-          // Keep localStorage in sync as a cache for faster subsequent loads
-          try {
-            localStorage.setItem('settings_connected_inboxes', JSON.stringify(inboxes));
-            localStorage.setItem('settings_inbox_tokens', JSON.stringify(tokens));
-          } catch { /* ignore */ }
         }
       } catch (err) {
-        // Fallback to localStorage if Supabase is unreachable
-        console.warn('Failed to load inboxes from Supabase, falling back to localStorage:', err);
-        try {
-          const raw = localStorage.getItem('settings_connected_inboxes');
-          const inboxes = raw ? JSON.parse(raw) : [];
-          const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
-          const fallback: SavedConnection[] = inboxes.map((inbox: any) => ({
-            hostId: inbox.hostId,
-            companyName: inbox.companyName,
-            host: MOCK_HOSTS.find(h => h.id === inbox.hostId) || MOCK_HOSTS[0],
-            accessToken: tokens[inbox.hostId] || '',
-            maskedToken: inbox.maskedToken || '',
-          })).filter((c: SavedConnection) => c.accessToken);
-          if (fallback.length > 0) setInitialSavedConnections(fallback);
-        } catch { /* ignore */ }
+        // Supabase KV is the only token store. If unreachable, we surface
+        // the connection as disconnected rather than silently loading a
+        // stale localStorage copy. Legacy entries from prior builds are
+        // wiped below so they can't leak.
+        console.error('Failed to load inboxes from Supabase KV:', err);
+        toast.error('Could not load connected inboxes', {
+          description: 'Check your connection and reload. Tokens are stored server-side.',
+        });
       }
+
+      // One-time cleanup of legacy localStorage token caches written by
+      // earlier builds. Safe to run unconditionally — the source of truth
+      // is now Supabase KV.
+      try {
+        localStorage.removeItem('settings_inbox_tokens');
+      } catch { /* ignore */ }
     })();
   }, []);
 
@@ -413,6 +412,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     removeConnection: removeFirestoreConnection,
     reconnect: reconnectFirestore,
     markExpired: markFirestoreConnectionExpired,
+    getTokenForHost: getFirestoreToken,
   } = useFirestoreConnections(
     initialSavedConnections,
     handleConnectionHealthChange,
@@ -1194,9 +1194,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (ticket?.firestoreThreadId && ticket?.firestoreHostId) {
       const conn = firestoreConnections.find(c => c.hostId === ticket.firestoreHostId && c.status === 'connected');
       if (conn?.userId) {
-        // Get the access token from localStorage
-        const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
-        const token = tokens[ticket.firestoreHostId];
+        // Read the in-memory token held by useFirestoreConnections (hydrated
+        // from Supabase KV at app boot). Never touch localStorage — tokens
+        // are server-stored to survive logout and avoid XSS exfiltration.
+        const token = getFirestoreToken(ticket.firestoreHostId);
         if (token) {
           // Claim a row in outbound_send_idempotency so that a duplicate
           // dispatch (network retry, StrictMode re-render) collapses to a
@@ -1335,8 +1336,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (ticket?.firestoreThreadId && ticket?.firestoreHostId) {
       const conn = firestoreConnections.find(c => c.hostId === ticket.firestoreHostId && c.status === 'connected');
       if (conn?.userId) {
-        const tokens = (() => { try { return JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}'); } catch { return {}; } })();
-        const token = tokens[ticket.firestoreHostId];
+        const token = getFirestoreToken(ticket.firestoreHostId);
         if (token) {
           markBotSent(supabaseClient, proxyCompanyIds[0] ?? 'delta-hq', ticket.id, text, Date.now());
           const clientMessageId = newClientMessageId();
@@ -1439,8 +1439,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (ticket?.firestoreThreadId && ticket?.firestoreHostId) {
       const conn = firestoreConnections.find(c => c.hostId === ticket.firestoreHostId && c.status === 'connected');
       if (conn?.userId) {
-        const tokens = (() => { try { return JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}'); } catch { return {}; } })();
-        const token = tokens[ticket.firestoreHostId];
+        const token = getFirestoreToken(ticket.firestoreHostId);
         if (token) {
           const companyId = proxyCompanyIds[0] ?? 'delta-hq';
           for (const msg of messages) {
@@ -2159,6 +2158,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       isInitialLoad, proxyCompanyIds, setProxyTicketProperty,
       firestoreConnections, firestoreInitializing,
       addFirestoreConnection, removeFirestoreConnection, reconnectFirestore, markFirestoreConnectionExpired,
+      getFirestoreToken,
       classifyCache,
       escalationOverrides, handoverReasons, setHandoverReason,
       resolveTicket, addMessageToTicket, pendingProxyMessages, retryPendingProxyMessage, deletePendingProxyMessage, injectGuestMessage, addBotMessage, addSystemMessage, addMultipleMessages, escalateTicketStatus, escalateTicketWithUrgency, deescalateTicket, deleteMessageFromTicket, deleteThread,

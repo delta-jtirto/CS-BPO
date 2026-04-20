@@ -3,7 +3,7 @@ import { fetchBookingDetails, fetchPaymentData, type BookingDetails } from '@/li
 import { useAppContext } from '@/app/context/AppContext';
 
 export function useBookingDetails(bookingId: number | undefined, firestoreHostId: string | undefined) {
-  const { markFirestoreConnectionExpired } = useAppContext();
+  const { markFirestoreConnectionExpired, getFirestoreToken } = useAppContext();
   const [bookingDetails, setBookingDetails] = useState<BookingDetails | null>(null);
   const [bookingLoading, setBookingLoading] = useState(false);
 
@@ -12,8 +12,9 @@ export function useBookingDetails(bookingId: number | undefined, firestoreHostId
       setBookingDetails(null);
       return;
     }
-    const tokens = JSON.parse(localStorage.getItem('settings_inbox_tokens') || '{}');
-    const token = tokens[firestoreHostId];
+    // Supabase KV is the only token store; useFirestoreConnections mirrors
+    // it in memory. Never read localStorage for tokens.
+    const token = getFirestoreToken(firestoreHostId);
     if (!token) return;
 
     setBookingLoading(true);
@@ -35,7 +36,7 @@ export function useBookingDetails(bookingId: number | undefined, firestoreHostId
         setBookingDetails(details);
       })
       .finally(() => setBookingLoading(false));
-  }, [bookingId, firestoreHostId, markFirestoreConnectionExpired]);
+  }, [bookingId, firestoreHostId, markFirestoreConnectionExpired, getFirestoreToken]);
 
   return { bookingDetails, bookingLoading };
 }

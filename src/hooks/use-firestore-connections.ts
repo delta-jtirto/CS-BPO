@@ -42,6 +42,11 @@ interface UseFirestoreConnectionsResult {
   markExpired: (hostId: string, health?: ConnectionHealth) => void;
   /** Callback for saving connections externally (to Supabase KV) */
   savedConnections: SavedConnection[];
+  /** Synchronous lookup of the in-memory access token for a host.
+   *  Tokens are loaded from Supabase KV on mount and held in component
+   *  state — never touching localStorage in production. Returns null if
+   *  the connection isn't loaded or the token is missing. */
+  getTokenForHost: (hostId: string) => string | null;
 }
 
 /**
@@ -274,6 +279,14 @@ export function useFirestoreConnections(
     [handleHealthChange],
   );
 
+  const getTokenForHost = useCallback(
+    (hostId: string): string | null => {
+      const saved = savedConnectionsRef.current.find((c) => c.hostId === hostId);
+      return saved?.accessToken ?? null;
+    },
+    [],
+  );
+
   return {
     connections,
     isInitializing,
@@ -283,5 +296,6 @@ export function useFirestoreConnections(
     testConnection,
     markExpired,
     savedConnections,
+    getTokenForHost,
   };
 }
