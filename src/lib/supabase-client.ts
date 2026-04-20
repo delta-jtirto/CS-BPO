@@ -30,16 +30,6 @@ export async function getSession(): Promise<Session | null> {
 }
 
 /**
- * Single-tenant prototype fallback. Use only as a last-resort default when
- * every other resolution path (JWT claim, user_companies table, RPC) has
- * failed. New code should prefer `proxyCompanyIds` from AppContext or
- * `getUserCompanyIds()` below so multi-tenant isolation actually holds.
- *
- * @deprecated Will be removed once every caller reads from context / RPC.
- */
-export const COMPANY_ID = 'delta-hq';
-
-/**
  * Resolve the authenticated user's company scope server-side.
  *
  * Calls the SECURITY DEFINER function `public.get_user_company_ids()`
