@@ -1,6 +1,7 @@
 import type { Host, Message, Ticket } from '@/app/data/types';
 import { computeSLA, formatSLARelative, type EscalationOverride } from './compute-ticket-state';
 import { isBotSent } from './bot-signatures';
+import { validateFirestoreMessage } from './source-validators';
 
 // ---------------------------------------------------------------------------
 // Firestore types (matching Unified Inbox's data model)
@@ -238,6 +239,12 @@ export function mapFirestoreMessage(
   guestUserId?: string,
   threadKey?: string,
 ): Message {
+  // Validate the raw payload at the source boundary. Schema drift from
+  // Unified Inbox backend (missing message_id, non-numeric timestamp, etc)
+  // now fails fast with a structured MappingError instead of silently
+  // producing a corrupt Message that flows into SLA / cache / render code.
+  // The per-row ErrorBoundary catches the throw and renders the fallback.
+  msg = validateFirestoreMessage(msg) as FirestoreMessage;
   // Normalize: Firestore timestamps may be in seconds
   const tsMs = msg.timestamp > 1e12 ? msg.timestamp : msg.timestamp * 1000;
   // Determine sender: compare sender_id against thread's guest ID (same approach as

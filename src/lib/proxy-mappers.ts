@@ -78,6 +78,7 @@ export function mapProxyConversationToTicket(
 // ---------------------------------------------------------------------------
 
 import { isBotSent } from './bot-signatures';
+import { validateProxyMessage } from './source-validators';
 
 let _proxyMessageIdCounter = 2_000_000; // Offset from Firestore counter (1M) to avoid collision
 
@@ -92,6 +93,11 @@ export function mapProxyMessageToMessage(
   msg: ProxyMessage,
   guestContactId?: string,
 ): Message {
+  // Validate at the source boundary — a payload missing id / conversation_id
+  // / direction / channel_timestamp throws MappingError and the per-row
+  // ErrorBoundary renders <MalformedMessageFallback /> instead of letting
+  // bad data poison downstream sort/render/cache logic.
+  msg = validateProxyMessage(msg) as ProxyMessage;
   const tsMs = msg.channel_timestamp
     ? new Date(msg.channel_timestamp).getTime()
     : new Date(msg.received_at).getTime();
