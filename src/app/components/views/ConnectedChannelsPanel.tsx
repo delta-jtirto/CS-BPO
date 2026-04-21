@@ -3,9 +3,9 @@ import { toast } from 'sonner';
 import {
   Plus, Trash2, Eye, EyeOff, CheckCircle2, Loader2, Copy,
   MessageSquare, Globe, Phone, Mail, AlertCircle, HelpCircle, ExternalLink,
-  ChevronDown, ChevronUp, ArrowRight,
+  ChevronDown, ChevronUp, ArrowRight, Settings2, Clock,
 } from 'lucide-react';
-import { getAccessToken, getUserCompanyIds } from '@/lib/supabase-client';
+import { getAccessToken, getUserCompanyIds, supabase } from '@/lib/supabase-client';
 import { channelDisplayName } from '@/lib/channel-config';
 import { MOCK_HOSTS } from '@/app/data/mock-data';
 import {
@@ -95,6 +95,171 @@ function LineSetupGuide() {
               </div>
             </div>
           ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Email Sync Advanced Settings ──────────────────────────
+// Controls the pg_cron-backed email poll interval. The cron fires every 20s
+// in Postgres; the interval setting throttles when the actual IMAP fetch
+// callout runs. See: supabase/migrations/*_email_sync_cron.sql
+const EMAIL_SYNC_PRESETS = [20, 30, 60] as const;
+
+function EmailSyncAdvanced() {
+  const [open, setOpen] = useState(false);
+  const [enabled, setEnabled] = useState(true);
+  const [intervalSec, setIntervalSec] = useState(60);
+  const [lastRunAt, setLastRunAt] = useState<string | null>(null);
+  const [lastStatus, setLastStatus] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+
+  // Load current settings once the accordion is opened — avoids a query
+  // on every Settings tab visit when nobody touches the advanced panel.
+  const loadSettings = useCallback(async () => {
+    const { data, error } = await supabase
+      .from('email_sync_settings')
+      .select('enabled, interval_seconds, last_run_at, last_status')
+      .eq('id', 1)
+      .maybeSingle();
+    if (error || !data) { setLoaded(true); return; }
+    setEnabled(data.enabled);
+    setIntervalSec(data.interval_seconds);
+    setLastRunAt(data.last_run_at);
+    setLastStatus(data.last_status);
+    setLoaded(true);
+  }, []);
+
+  useEffect(() => {
+    if (open && !loaded) loadSettings();
+  }, [open, loaded, loadSettings]);
+
+  async function saveInterval(next: number, nextEnabled = enabled) {
+    // Clamp defensively — the DB CHECK constraint will also reject, but
+    // bailing early gives a cleaner error and avoids a round-trip.
+    if (next < 20 || next > 3600) {
+      toast.error('Interval must be between 20 and 3600 seconds');
+      return;
+    }
+    setSaving(true);
+    const { data, error } = await supabase.rpc('set_email_sync_settings', {
+      p_interval_seconds: next,
+      p_enabled: nextEnabled,
+    });
+    setSaving(false);
+    if (error) {
+      toast.error(`Failed to save: ${error.message}`);
+      return;
+    }
+    if (data) {
+      const row = Array.isArray(data) ? data[0] : data;
+      setIntervalSec(row.interval_seconds);
+      setEnabled(row.enabled);
+    }
+    toast.success('Email sync settings updated');
+  }
+
+  const customValue = EMAIL_SYNC_PRESETS.includes(intervalSec as 20 | 30 | 60)
+    ? ''
+    : String(intervalSec);
+
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white overflow-hidden">
+      <button
+        onClick={() => setOpen(v => !v)}
+        className="w-full flex items-center justify-between px-3 py-2.5 text-left"
+      >
+        <span className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
+          <Settings2 size={13} className="text-slate-500" />
+          Advanced — Email sync interval
+        </span>
+        {open
+          ? <ChevronUp size={13} className="text-slate-500 shrink-0" />
+          : <ChevronDown size={13} className="text-slate-500 shrink-0" />}
+      </button>
+
+      {open && (
+        <div className="px-3 pb-3 space-y-3 border-t border-slate-100 pt-3">
+          <p className="text-[11px] text-slate-500 leading-relaxed">
+            How often the server polls connected mailboxes for new mail.
+            Webhook channels (WhatsApp/Instagram/LINE) are push-based and
+            ignore this setting.
+          </p>
+
+          {/* Preset chips */}
+          <div className="flex gap-1.5">
+            {EMAIL_SYNC_PRESETS.map(sec => (
+              <button
+                key={sec}
+                disabled={saving}
+                onClick={() => saveInterval(sec)}
+                className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${
+                  intervalSec === sec
+                    ? 'bg-indigo-600 text-white'
+                    : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                }`}
+              >
+                {sec}s
+              </button>
+            ))}
+          </div>
+
+          {/* Custom input */}
+          <div>
+            <label className="text-[10px] font-medium text-slate-500 mb-1 block">
+              Custom (20–3600 seconds)
+            </label>
+            <div className="flex gap-2">
+              <input
+                type="number"
+                min={20}
+                max={3600}
+                placeholder={customValue || String(intervalSec)}
+                defaultValue={customValue}
+                key={`custom-${intervalSec}`}
+                onBlur={e => {
+                  const n = parseInt(e.target.value, 10);
+                  if (!Number.isNaN(n) && n !== intervalSec) saveInterval(n);
+                }}
+                className="h-8 w-24 rounded-md border border-slate-300 bg-white px-2 text-xs outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+              />
+              {intervalSec < 30 && (
+                <span className="text-[10px] text-amber-600 flex items-center gap-1">
+                  <AlertCircle size={10} />
+                  Aggressive — may trigger provider rate limits
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* Enable toggle */}
+          <div className="flex items-center justify-between pt-1">
+            <span className="text-[11px] text-slate-600">
+              {enabled ? 'Sync enabled' : 'Sync paused'}
+            </span>
+            <button
+              disabled={saving}
+              onClick={() => saveInterval(intervalSec, !enabled)}
+              className={`w-8 h-[18px] rounded-full transition-colors relative cursor-pointer ${
+                enabled ? 'bg-indigo-500' : 'bg-slate-300'
+              }`}
+            >
+              <span className={`pointer-events-none absolute top-[2px] left-[2px] w-[14px] h-[14px] bg-white rounded-full shadow-sm transition-transform ${
+                enabled ? 'translate-x-[14px]' : 'translate-x-0'
+              }`} />
+            </button>
+          </div>
+
+          {/* Last run indicator */}
+          {lastRunAt && (
+            <div className="flex items-center gap-1.5 text-[10px] text-slate-400 pt-1 border-t border-slate-100">
+              <Clock size={10} />
+              Last tick: {new Date(lastRunAt).toLocaleTimeString()}
+              {lastStatus && <span className="text-slate-300">· {lastStatus}</span>}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -528,6 +693,13 @@ export default function ConnectedChannelsPanel() {
       >
         <Plus size={16} /> Connect Channel
       </button>
+
+      {/* Advanced email-sync cron settings */}
+      {accounts.some(a => a.channel === 'email') && (
+        <div className="mt-6">
+          <EmailSyncAdvanced />
+        </div>
+      )}
 
       {/* ─── Connect Dialog ────────────────────────── */}
       <Dialog open={connectOpen} onOpenChange={setConnectOpen}>
