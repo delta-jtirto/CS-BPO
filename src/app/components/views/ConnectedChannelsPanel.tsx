@@ -3,9 +3,9 @@ import { toast } from 'sonner';
 import {
   Plus, Trash2, Eye, EyeOff, CheckCircle2, Loader2, Copy,
   MessageSquare, Globe, Phone, Mail, AlertCircle, HelpCircle, ExternalLink,
-  ChevronDown, ChevronUp, ArrowRight,
+  ChevronDown, ChevronUp, ArrowRight, Settings2, Clock,
 } from 'lucide-react';
-import { getAccessToken, getUserCompanyIds } from '@/lib/supabase-client';
+import { getAccessToken, getUserCompanyIds, supabase } from '@/lib/supabase-client';
 import { channelDisplayName } from '@/lib/channel-config';
 import { MOCK_HOSTS } from '@/app/data/mock-data';
 import {
@@ -95,6 +95,277 @@ function LineSetupGuide() {
               </div>
             </div>
           ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Email Sync Advanced Settings ──────────────────────────
+// Controls the pg_cron-backed email poll interval. The cron fires every 20s
+// in Postgres; the interval setting throttles when the actual IMAP fetch
+// callout runs. See: supabase/migrations/*_email_sync_cron.sql
+const EMAIL_SYNC_PRESETS = [20, 30, 60] as const;
+
+interface EmailSyncHealth {
+  enabled: boolean;
+  interval_seconds: number;
+  last_run_at: string | null;
+  last_status: string | null;
+  proxy_url: string | null;
+  http_status: number | null;
+  http_error: string | null;
+  http_excerpt: string;
+  http_at: string | null;
+  recent_email_count: number;
+  last_email_at: string | null;
+}
+
+// Classify health into a single traffic-light level. "Is sync actually
+// working" = (a) cron dispatched recently AND (b) proxy accepted AND
+// (c) mail is flowing (or no mail is a valid quiet state).
+type HealthLevel = 'healthy' | 'warn' | 'broken' | 'paused' | 'unknown';
+
+function classifyHealth(h: EmailSyncHealth | null, intervalSec: number): { level: HealthLevel; label: string; detail: string } {
+  if (!h) return { level: 'unknown', label: 'Loading…', detail: '' };
+  if (!h.enabled) return { level: 'paused', label: 'Paused', detail: 'Sync is disabled' };
+
+  const lastRunAgeMs = h.last_run_at ? Date.now() - new Date(h.last_run_at).getTime() : Infinity;
+  const staleThresholdMs = Math.max(intervalSec * 1000 * 3, 90_000);
+
+  // Cron hasn't fired recently — pg_cron or the tick function is broken.
+  if (lastRunAgeMs > staleThresholdMs) {
+    return { level: 'broken', label: 'Cron not firing', detail: `Last tick ${Math.round(lastRunAgeMs / 1000)}s ago (expected every ${intervalSec}s)` };
+  }
+
+  // Tick fired but short-circuited: config missing or function error.
+  if (h.last_status?.startsWith('skipped:')) {
+    return { level: 'warn', label: 'Not configured', detail: h.last_status };
+  }
+  if (h.last_status?.startsWith('error:')) {
+    return { level: 'broken', label: 'Tick error', detail: h.last_status };
+  }
+
+  // Dispatched but proxy returned a non-2xx.
+  if (h.http_status && (h.http_status < 200 || h.http_status >= 300)) {
+    return {
+      level: 'broken',
+      label: `Proxy ${h.http_status}`,
+      detail: h.http_excerpt || h.http_error || 'Proxy returned an error',
+    };
+  }
+
+  // Dispatched OK with no auth yet — soft warning.
+  if (h.last_status === 'dispatched:no_auth' && !h.http_status) {
+    return { level: 'warn', label: 'No auth secret', detail: 'Set channel_proxy_secret in Supabase Vault' };
+  }
+
+  // Dispatched + 2xx response. Green. (Zero new messages in 10min is not an
+  // error — your mailbox may simply be quiet.)
+  return {
+    level: 'healthy',
+    label: 'Healthy',
+    detail: h.recent_email_count > 0
+      ? `${h.recent_email_count} inbound in last 10 min`
+      : 'No recent mail (mailbox quiet)',
+  };
+}
+
+const HEALTH_STYLES: Record<HealthLevel, { dot: string; text: string; bg: string }> = {
+  healthy: { dot: 'bg-emerald-500', text: 'text-emerald-700', bg: 'bg-emerald-50' },
+  warn:    { dot: 'bg-amber-500',   text: 'text-amber-700',   bg: 'bg-amber-50' },
+  broken:  { dot: 'bg-red-500',     text: 'text-red-700',     bg: 'bg-red-50' },
+  paused:  { dot: 'bg-slate-400',   text: 'text-slate-600',   bg: 'bg-slate-50' },
+  unknown: { dot: 'bg-slate-300',   text: 'text-slate-500',   bg: 'bg-slate-50' },
+};
+
+function EmailSyncAdvanced() {
+  const [open, setOpen] = useState(false);
+  const [enabled, setEnabled] = useState(true);
+  const [intervalSec, setIntervalSec] = useState(60);
+  const [saving, setSaving] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [health, setHealth] = useState<EmailSyncHealth | null>(null);
+
+  const loadHealth = useCallback(async () => {
+    const { data, error } = await supabase.rpc('email_sync_health');
+    if (error || !data) return;
+    const h = data as EmailSyncHealth;
+    setHealth(h);
+    setEnabled(h.enabled);
+    setIntervalSec(h.interval_seconds);
+    setLoaded(true);
+  }, []);
+
+  // First load on open, then poll while the accordion is visible. 5s is
+  // frequent enough to feel live without hammering the RPC.
+  useEffect(() => {
+    if (!open) return;
+    loadHealth();
+    const iv = setInterval(loadHealth, 5000);
+    return () => clearInterval(iv);
+  }, [open, loadHealth]);
+
+  async function saveInterval(next: number, nextEnabled = enabled) {
+    // Clamp defensively — the DB CHECK constraint will also reject, but
+    // bailing early gives a cleaner error and avoids a round-trip.
+    if (next < 20 || next > 3600) {
+      toast.error('Interval must be between 20 and 3600 seconds');
+      return;
+    }
+    setSaving(true);
+    const { data, error } = await supabase.rpc('set_email_sync_settings', {
+      p_interval_seconds: next,
+      p_enabled: nextEnabled,
+    });
+    setSaving(false);
+    if (error) {
+      toast.error(`Failed to save: ${error.message}`);
+      return;
+    }
+    if (data) {
+      const row = Array.isArray(data) ? data[0] : data;
+      setIntervalSec(row.interval_seconds);
+      setEnabled(row.enabled);
+    }
+    toast.success('Email sync settings updated');
+  }
+
+  const customValue = EMAIL_SYNC_PRESETS.includes(intervalSec as 20 | 30 | 60)
+    ? ''
+    : String(intervalSec);
+
+  const healthInfo = classifyHealth(health, intervalSec);
+  const healthStyle = HEALTH_STYLES[healthInfo.level];
+
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white overflow-hidden">
+      <button
+        onClick={() => setOpen(v => !v)}
+        className="w-full flex items-center justify-between px-3 py-2.5 text-left"
+      >
+        <span className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
+          <Settings2 size={13} className="text-slate-500" />
+          Advanced — Email sync interval
+          {loaded && (
+            <span className={`inline-block w-2 h-2 rounded-full ${healthStyle.dot}`}
+                  title={`${healthInfo.label} — ${healthInfo.detail}`} />
+          )}
+        </span>
+        {open
+          ? <ChevronUp size={13} className="text-slate-500 shrink-0" />
+          : <ChevronDown size={13} className="text-slate-500 shrink-0" />}
+      </button>
+
+      {open && (
+        <div className="px-3 pb-3 space-y-3 border-t border-slate-100 pt-3">
+          <p className="text-[11px] text-slate-500 leading-relaxed">
+            How often the server polls connected mailboxes for new mail.
+            Webhook channels (WhatsApp/Instagram/LINE) are push-based and
+            ignore this setting.
+          </p>
+
+          {/* Preset chips */}
+          <div className="flex gap-1.5">
+            {EMAIL_SYNC_PRESETS.map(sec => (
+              <button
+                key={sec}
+                disabled={saving}
+                onClick={() => saveInterval(sec)}
+                className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${
+                  intervalSec === sec
+                    ? 'bg-indigo-600 text-white'
+                    : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                }`}
+              >
+                {sec}s
+              </button>
+            ))}
+          </div>
+
+          {/* Custom input */}
+          <div>
+            <label className="text-[10px] font-medium text-slate-500 mb-1 block">
+              Custom (20–3600 seconds)
+            </label>
+            <div className="flex gap-2">
+              <input
+                type="number"
+                min={20}
+                max={3600}
+                placeholder={customValue || String(intervalSec)}
+                defaultValue={customValue}
+                key={`custom-${intervalSec}`}
+                onBlur={e => {
+                  const n = parseInt(e.target.value, 10);
+                  if (!Number.isNaN(n) && n !== intervalSec) saveInterval(n);
+                }}
+                className="h-8 w-24 rounded-md border border-slate-300 bg-white px-2 text-xs outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+              />
+              {intervalSec < 30 && (
+                <span className="text-[10px] text-amber-600 flex items-center gap-1">
+                  <AlertCircle size={10} />
+                  Aggressive — may trigger provider rate limits
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* Enable toggle */}
+          <div className="flex items-center justify-between pt-1">
+            <span className="text-[11px] text-slate-600">
+              {enabled ? 'Sync enabled' : 'Sync paused'}
+            </span>
+            <button
+              disabled={saving}
+              onClick={() => saveInterval(intervalSec, !enabled)}
+              className={`w-8 h-[18px] rounded-full transition-colors relative cursor-pointer ${
+                enabled ? 'bg-indigo-500' : 'bg-slate-300'
+              }`}
+            >
+              <span className={`pointer-events-none absolute top-[2px] left-[2px] w-[14px] h-[14px] bg-white rounded-full shadow-sm transition-transform ${
+                enabled ? 'translate-x-[14px]' : 'translate-x-0'
+              }`} />
+            </button>
+          </div>
+
+          {/* Health card — live health signal polled every 5s */}
+          {loaded && (
+            <div className={`rounded-md px-2.5 py-2 ${healthStyle.bg} border border-slate-100`}>
+              <div className={`flex items-center gap-2 text-xs font-semibold ${healthStyle.text}`}>
+                <span className={`w-2 h-2 rounded-full ${healthStyle.dot}`} />
+                {healthInfo.label}
+              </div>
+              <p className="text-[10px] text-slate-600 mt-1 leading-relaxed">
+                {healthInfo.detail}
+              </p>
+              {health && (
+                <div className="mt-2 pt-2 border-t border-slate-200/60 space-y-0.5 text-[10px] text-slate-500">
+                  {health.last_run_at && (
+                    <div className="flex items-center gap-1.5">
+                      <Clock size={10} />
+                      Last tick {new Date(health.last_run_at).toLocaleTimeString()}
+                      <span className="text-slate-400">· {health.last_status}</span>
+                    </div>
+                  )}
+                  {health.http_status != null && (
+                    <div>
+                      Proxy reply: <span className="font-mono">{health.http_status}</span>
+                      {health.http_at && (
+                        <span className="text-slate-400"> · {new Date(health.http_at).toLocaleTimeString()}</span>
+                      )}
+                    </div>
+                  )}
+                  <div>
+                    Inbound emails (10 min): <span className="font-mono">{health.recent_email_count}</span>
+                    {health.last_email_at && (
+                      <span className="text-slate-400"> · newest {new Date(health.last_email_at).toLocaleTimeString()}</span>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -528,6 +799,13 @@ export default function ConnectedChannelsPanel() {
       >
         <Plus size={16} /> Connect Channel
       </button>
+
+      {/* Advanced email-sync cron settings */}
+      {accounts.some(a => a.channel === 'email') && (
+        <div className="mt-6">
+          <EmailSyncAdvanced />
+        </div>
+      )}
 
       {/* ─── Connect Dialog ────────────────────────── */}
       <Dialog open={connectOpen} onOpenChange={setConnectOpen}>
