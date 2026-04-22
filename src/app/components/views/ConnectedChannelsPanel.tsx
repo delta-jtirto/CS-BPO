@@ -118,17 +118,23 @@ function EmailSyncAdvanced() {
 
   // Load current settings once the accordion is opened — avoids a query
   // on every Settings tab visit when nobody touches the advanced panel.
+  // Routes through email_sync_health() RPC because the tick-written fields
+  // (last_run_at, last_status) live in email_sync_tick_state now, outside
+  // the realtime publication — kept that way to stop tick churn from
+  // flashing every subscribed client (see migration 20260422000005).
   const loadSettings = useCallback(async () => {
-    const { data, error } = await supabase
-      .from('email_sync_settings')
-      .select('enabled, interval_seconds, last_run_at, last_status')
-      .eq('id', 1)
-      .maybeSingle();
+    const { data, error } = await supabase.rpc('email_sync_health');
     if (error || !data) { setLoaded(true); return; }
-    setEnabled(data.enabled);
-    setIntervalSec(data.interval_seconds);
-    setLastRunAt(data.last_run_at);
-    setLastStatus(data.last_status);
+    const h = data as {
+      enabled: boolean;
+      interval_seconds: number;
+      last_run_at: string | null;
+      last_status: string | null;
+    };
+    setEnabled(h.enabled);
+    setIntervalSec(h.interval_seconds);
+    setLastRunAt(h.last_run_at);
+    setLastStatus(h.last_status);
     setLoaded(true);
   }, []);
 
