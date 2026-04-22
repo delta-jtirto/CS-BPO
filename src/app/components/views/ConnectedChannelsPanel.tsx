@@ -107,104 +107,34 @@ function LineSetupGuide() {
 // callout runs. See: supabase/migrations/*_email_sync_cron.sql
 const EMAIL_SYNC_PRESETS = [20, 30, 60] as const;
 
-interface EmailSyncHealth {
-  enabled: boolean;
-  interval_seconds: number;
-  last_run_at: string | null;
-  last_status: string | null;
-  proxy_url: string | null;
-  http_status: number | null;
-  http_error: string | null;
-  http_excerpt: string;
-  http_at: string | null;
-  recent_email_count: number;
-  last_email_at: string | null;
-}
-
-// Classify health into a single traffic-light level. "Is sync actually
-// working" = (a) cron dispatched recently AND (b) proxy accepted AND
-// (c) mail is flowing (or no mail is a valid quiet state).
-type HealthLevel = 'healthy' | 'warn' | 'broken' | 'paused' | 'unknown';
-
-function classifyHealth(h: EmailSyncHealth | null, intervalSec: number): { level: HealthLevel; label: string; detail: string } {
-  if (!h) return { level: 'unknown', label: 'Loading…', detail: '' };
-  if (!h.enabled) return { level: 'paused', label: 'Paused', detail: 'Sync is disabled' };
-
-  const lastRunAgeMs = h.last_run_at ? Date.now() - new Date(h.last_run_at).getTime() : Infinity;
-  const staleThresholdMs = Math.max(intervalSec * 1000 * 3, 90_000);
-
-  // Cron hasn't fired recently — pg_cron or the tick function is broken.
-  if (lastRunAgeMs > staleThresholdMs) {
-    return { level: 'broken', label: 'Cron not firing', detail: `Last tick ${Math.round(lastRunAgeMs / 1000)}s ago (expected every ${intervalSec}s)` };
-  }
-
-  // Tick fired but short-circuited: config missing or function error.
-  if (h.last_status?.startsWith('skipped:')) {
-    return { level: 'warn', label: 'Not configured', detail: h.last_status };
-  }
-  if (h.last_status?.startsWith('error:')) {
-    return { level: 'broken', label: 'Tick error', detail: h.last_status };
-  }
-
-  // Dispatched but proxy returned a non-2xx.
-  if (h.http_status && (h.http_status < 200 || h.http_status >= 300)) {
-    return {
-      level: 'broken',
-      label: `Proxy ${h.http_status}`,
-      detail: h.http_excerpt || h.http_error || 'Proxy returned an error',
-    };
-  }
-
-  // Dispatched OK with no auth yet — soft warning.
-  if (h.last_status === 'dispatched:no_auth' && !h.http_status) {
-    return { level: 'warn', label: 'No auth secret', detail: 'Set channel_proxy_secret in Supabase Vault' };
-  }
-
-  // Dispatched + 2xx response. Green. (Zero new messages in 10min is not an
-  // error — your mailbox may simply be quiet.)
-  return {
-    level: 'healthy',
-    label: 'Healthy',
-    detail: h.recent_email_count > 0
-      ? `${h.recent_email_count} inbound in last 10 min`
-      : 'No recent mail (mailbox quiet)',
-  };
-}
-
-const HEALTH_STYLES: Record<HealthLevel, { dot: string; text: string; bg: string }> = {
-  healthy: { dot: 'bg-emerald-500', text: 'text-emerald-700', bg: 'bg-emerald-50' },
-  warn:    { dot: 'bg-amber-500',   text: 'text-amber-700',   bg: 'bg-amber-50' },
-  broken:  { dot: 'bg-red-500',     text: 'text-red-700',     bg: 'bg-red-50' },
-  paused:  { dot: 'bg-slate-400',   text: 'text-slate-600',   bg: 'bg-slate-50' },
-  unknown: { dot: 'bg-slate-300',   text: 'text-slate-500',   bg: 'bg-slate-50' },
-};
-
 function EmailSyncAdvanced() {
   const [open, setOpen] = useState(false);
   const [enabled, setEnabled] = useState(true);
   const [intervalSec, setIntervalSec] = useState(60);
+  const [lastRunAt, setLastRunAt] = useState<string | null>(null);
+  const [lastStatus, setLastStatus] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [loaded, setLoaded] = useState(false);
-  const [health, setHealth] = useState<EmailSyncHealth | null>(null);
 
-  const loadHealth = useCallback(async () => {
-    const { data, error } = await supabase.rpc('email_sync_health');
-    if (error || !data) return;
-    const h = data as EmailSyncHealth;
-    setHealth(h);
-    setEnabled(h.enabled);
-    setIntervalSec(h.interval_seconds);
+  // Load current settings once the accordion is opened — avoids a query
+  // on every Settings tab visit when nobody touches the advanced panel.
+  const loadSettings = useCallback(async () => {
+    const { data, error } = await supabase
+      .from('email_sync_settings')
+      .select('enabled, interval_seconds, last_run_at, last_status')
+      .eq('id', 1)
+      .maybeSingle();
+    if (error || !data) { setLoaded(true); return; }
+    setEnabled(data.enabled);
+    setIntervalSec(data.interval_seconds);
+    setLastRunAt(data.last_run_at);
+    setLastStatus(data.last_status);
     setLoaded(true);
   }, []);
 
-  // First load on open, then poll while the accordion is visible. 5s is
-  // frequent enough to feel live without hammering the RPC.
   useEffect(() => {
-    if (!open) return;
-    loadHealth();
-    const iv = setInterval(loadHealth, 5000);
-    return () => clearInterval(iv);
-  }, [open, loadHealth]);
+    if (open && !loaded) loadSettings();
+  }, [open, loaded, loadSettings]);
 
   async function saveInterval(next: number, nextEnabled = enabled) {
     // Clamp defensively — the DB CHECK constraint will also reject, but
@@ -235,9 +165,6 @@ function EmailSyncAdvanced() {
     ? ''
     : String(intervalSec);
 
-  const healthInfo = classifyHealth(health, intervalSec);
-  const healthStyle = HEALTH_STYLES[healthInfo.level];
-
   return (
     <div className="rounded-lg border border-slate-200 bg-white overflow-hidden">
       <button
@@ -247,10 +174,6 @@ function EmailSyncAdvanced() {
         <span className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
           <Settings2 size={13} className="text-slate-500" />
           Advanced — Email sync interval
-          {loaded && (
-            <span className={`inline-block w-2 h-2 rounded-full ${healthStyle.dot}`}
-                  title={`${healthInfo.label} — ${healthInfo.detail}`} />
-          )}
         </span>
         {open
           ? <ChevronUp size={13} className="text-slate-500 shrink-0" />
@@ -329,41 +252,12 @@ function EmailSyncAdvanced() {
             </button>
           </div>
 
-          {/* Health card — live health signal polled every 5s */}
-          {loaded && (
-            <div className={`rounded-md px-2.5 py-2 ${healthStyle.bg} border border-slate-100`}>
-              <div className={`flex items-center gap-2 text-xs font-semibold ${healthStyle.text}`}>
-                <span className={`w-2 h-2 rounded-full ${healthStyle.dot}`} />
-                {healthInfo.label}
-              </div>
-              <p className="text-[10px] text-slate-600 mt-1 leading-relaxed">
-                {healthInfo.detail}
-              </p>
-              {health && (
-                <div className="mt-2 pt-2 border-t border-slate-200/60 space-y-0.5 text-[10px] text-slate-500">
-                  {health.last_run_at && (
-                    <div className="flex items-center gap-1.5">
-                      <Clock size={10} />
-                      Last tick {new Date(health.last_run_at).toLocaleTimeString()}
-                      <span className="text-slate-400">· {health.last_status}</span>
-                    </div>
-                  )}
-                  {health.http_status != null && (
-                    <div>
-                      Proxy reply: <span className="font-mono">{health.http_status}</span>
-                      {health.http_at && (
-                        <span className="text-slate-400"> · {new Date(health.http_at).toLocaleTimeString()}</span>
-                      )}
-                    </div>
-                  )}
-                  <div>
-                    Inbound emails (10 min): <span className="font-mono">{health.recent_email_count}</span>
-                    {health.last_email_at && (
-                      <span className="text-slate-400"> · newest {new Date(health.last_email_at).toLocaleTimeString()}</span>
-                    )}
-                  </div>
-                </div>
-              )}
+          {/* Last run indicator */}
+          {lastRunAt && (
+            <div className="flex items-center gap-1.5 text-[10px] text-slate-400 pt-1 border-t border-slate-100">
+              <Clock size={10} />
+              Last tick: {new Date(lastRunAt).toLocaleTimeString()}
+              {lastStatus && <span className="text-slate-300">· {lastStatus}</span>}
             </div>
           )}
         </div>
