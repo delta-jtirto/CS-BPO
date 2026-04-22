@@ -459,19 +459,27 @@ export function InboxView() {
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
   const [inboxMenuOpen, setInboxMenuOpen] = useState(false);
   const [syncingEmail, setSyncingEmail] = useState(false);
+  const [resumingSync, setResumingSync] = useState(false);
 
   // pg_cron-driven auto-sync status. When enabled the banner below is
   // suppressed because email is effectively near-real-time and the
-  // "Sync now" manual nudge is just noise.
+  // "Sync now" manual nudge is just noise. We also track the configured
+  // interval so the "Resume" button can re-enable without clobbering the
+  // user's chosen cadence (Settings → Advanced).
   const [autoSyncActive, setAutoSyncActive] = useState(false);
+  const [syncIntervalSec, setSyncIntervalSec] = useState(30);
   useEffect(() => {
     let cancelled = false;
     supabaseClient
       .from('email_sync_settings')
-      .select('enabled')
+      .select('enabled, interval_seconds')
       .eq('id', 1)
       .maybeSingle()
-      .then(({ data }) => { if (!cancelled) setAutoSyncActive(!!data?.enabled); });
+      .then(({ data }) => {
+        if (cancelled || !data) return;
+        setAutoSyncActive(!!data.enabled);
+        if (typeof data.interval_seconds === 'number') setSyncIntervalSec(data.interval_seconds);
+      });
 
     // Reflect toggle changes made in Settings → Advanced without a reload.
     const channel = supabaseClient
@@ -480,8 +488,9 @@ export function InboxView() {
         'postgres_changes',
         { event: 'UPDATE', schema: 'public', table: 'email_sync_settings' },
         payload => {
-          const row = payload.new as { enabled?: boolean };
+          const row = payload.new as { enabled?: boolean; interval_seconds?: number };
           setAutoSyncActive(!!row.enabled);
+          if (typeof row.interval_seconds === 'number') setSyncIntervalSec(row.interval_seconds);
         },
       )
       .subscribe();
@@ -1903,12 +1912,39 @@ export function InboxView() {
           />
         )}
 
-        {/* Email sync notice — hidden when pg_cron auto-sync is on
-            (banner becomes misleading once mail is arriving every 20-60s). */}
+        {/* Paused-state banner — only renders when pg_cron auto-sync is off.
+            Copy is accurate for the paused state ("won't arrive" vs. the old
+            "syncs periodically") and offers a one-click re-enable so users
+            don't have to hunt in Settings. Manual "Sync once" stays for the
+            "just this once" escape hatch. Amber styling signals "attention
+            needed" without the alarm of red. */}
         {activeTicket.channel?.toLowerCase() === 'email' && !guestMode && !autoSyncActive && (
-          <div className="px-3 md:px-4 py-1.5 flex items-center gap-2 text-[10px] text-slate-500 bg-slate-50 border-t border-slate-200 shrink-0">
-            <Info size={11} className="text-slate-400 shrink-0" />
-            <span className="flex-1 truncate">Emails sync periodically, not in real-time.</span>
+          <div className="px-3 md:px-4 py-1.5 flex items-center gap-2 text-[10px] bg-amber-50 border-t border-amber-200 shrink-0">
+            <AlertCircle size={11} className="text-amber-500 shrink-0" />
+            <span className="flex-1 truncate text-amber-800">
+              Email auto-sync is paused — new mail won't arrive until resumed.
+            </span>
+            <button
+              disabled={resumingSync}
+              onClick={async () => {
+                if (resumingSync) return;
+                setResumingSync(true);
+                // Preserve whatever interval the user previously chose in
+                // Settings → Advanced — don't silently reset to a default.
+                const { error } = await supabaseClient.rpc('set_email_sync_settings', {
+                  p_interval_seconds: syncIntervalSec,
+                  p_enabled: true,
+                });
+                setResumingSync(false);
+                if (error) toast.error(`Could not resume: ${error.message}`);
+                else toast.success('Auto-sync resumed');
+              }}
+              className="flex items-center gap-1 text-[10px] font-semibold text-amber-800 hover:text-amber-950 hover:underline transition-colors shrink-0 disabled:opacity-60 disabled:cursor-wait"
+            >
+              <Zap size={10} />
+              {resumingSync ? 'Resuming…' : 'Resume auto-sync'}
+            </button>
+            <span className="text-amber-300" aria-hidden="true">·</span>
             <button
               disabled={syncingEmail}
               onClick={async () => {
@@ -1931,10 +1967,10 @@ export function InboxView() {
                   setSyncingEmail(false);
                 }
               }}
-              className="flex items-center gap-1 text-[10px] font-medium text-indigo-600 hover:text-indigo-700 hover:underline transition-colors shrink-0 disabled:opacity-60 disabled:cursor-wait disabled:hover:no-underline"
+              className="flex items-center gap-1 text-[10px] font-medium text-amber-700 hover:text-amber-900 hover:underline transition-colors shrink-0 disabled:opacity-60 disabled:cursor-wait"
             >
               <RefreshCw size={10} className={syncingEmail ? 'animate-spin' : ''} />
-              {syncingEmail ? 'Syncing…' : 'Sync now'}
+              {syncingEmail ? 'Syncing…' : 'Sync once'}
             </button>
           </div>
         )}
