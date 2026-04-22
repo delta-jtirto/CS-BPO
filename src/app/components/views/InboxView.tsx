@@ -1983,10 +1983,12 @@ export function InboxView() {
           </div>
         )}
 
-        {/* Reply area */}
-        <div className={`px-3 py-2 md:px-4 md:py-3 shrink-0 transition-colors ${
-          activeTicket.channel?.toLowerCase() === 'email' && !guestMode ? '' : 'border-t'
-        } ${
+        {/* Reply area — always has a top border for visual separation from
+            the conversation. The previous conditional omitted the border on
+            email because the "Emails sync periodically" banner above
+            provided the divider; now that the banner is hidden when
+            auto-sync is on, the reply area owns its own separator. */}
+        <div className={`px-3 py-2 md:px-4 md:py-3 shrink-0 transition-colors border-t ${
           guestMode ? 'bg-emerald-50/80 border-emerald-200' : 'bg-white border-slate-200'
         }`}>
           {activeDraft && !guestMode && (
