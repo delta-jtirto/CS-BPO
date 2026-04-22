@@ -459,6 +459,39 @@ export function InboxView() {
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
   const [inboxMenuOpen, setInboxMenuOpen] = useState(false);
   const [syncingEmail, setSyncingEmail] = useState(false);
+
+  // pg_cron-driven auto-sync status. When enabled the banner below is
+  // suppressed because email is effectively near-real-time and the
+  // "Sync now" manual nudge is just noise.
+  const [autoSyncActive, setAutoSyncActive] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    supabaseClient
+      .from('email_sync_settings')
+      .select('enabled')
+      .eq('id', 1)
+      .maybeSingle()
+      .then(({ data }) => { if (!cancelled) setAutoSyncActive(!!data?.enabled); });
+
+    // Reflect toggle changes made in Settings → Advanced without a reload.
+    const channel = supabaseClient
+      .channel('email_sync_settings_banner')
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'email_sync_settings' },
+        payload => {
+          const row = payload.new as { enabled?: boolean };
+          setAutoSyncActive(!!row.enabled);
+        },
+      )
+      .subscribe();
+
+    return () => {
+      cancelled = true;
+      supabaseClient.removeChannel(channel);
+    };
+  }, []);
+
   useEffect(() => {
     if (!cardMenuOpen && !headerMenuOpen && !inboxMenuOpen) return;
     const close = () => { setCardMenuOpen(null); setHeaderMenuOpen(false); setInboxMenuOpen(false); };
@@ -1870,8 +1903,9 @@ export function InboxView() {
           />
         )}
 
-        {/* Email sync notice — sticks to top of compose box (emails poll, not real-time) */}
-        {activeTicket.channel?.toLowerCase() === 'email' && !guestMode && (
+        {/* Email sync notice — hidden when pg_cron auto-sync is on
+            (banner becomes misleading once mail is arriving every 20-60s). */}
+        {activeTicket.channel?.toLowerCase() === 'email' && !guestMode && !autoSyncActive && (
           <div className="px-3 md:px-4 py-1.5 flex items-center gap-2 text-[10px] text-slate-500 bg-slate-50 border-t border-slate-200 shrink-0">
             <Info size={11} className="text-slate-400 shrink-0" />
             <span className="flex-1 truncate">Emails sync periodically, not in real-time.</span>
