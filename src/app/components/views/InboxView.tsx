@@ -1936,8 +1936,16 @@ export function InboxView() {
                   p_enabled: true,
                 });
                 setResumingSync(false);
-                if (error) toast.error(`Could not resume: ${error.message}`);
-                else toast.success('Auto-sync resumed');
+                if (error) {
+                  toast.error(`Could not resume: ${error.message}`);
+                  return;
+                }
+                // Optimistically flip local state — realtime UPDATE events
+                // from SECURITY DEFINER RPCs race against the client toast,
+                // so don't make the user stare at a stale banner waiting
+                // for the WAL-driven refresh.
+                setAutoSyncActive(true);
+                toast.success('Auto-sync resumed');
               }}
               className="flex items-center gap-1 text-[10px] font-semibold text-amber-800 hover:text-amber-950 hover:underline transition-colors shrink-0 disabled:opacity-60 disabled:cursor-wait"
             >
