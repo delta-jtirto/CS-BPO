@@ -5,6 +5,7 @@ import { MOCK_HOSTS } from '../../data/mock-data';
 import { useAppContext } from '../../context/AppContext';
 import { ZoomControl } from './ZoomControl';
 import { supabase } from '@/lib/supabase-client';
+import { KBSyncIndicator } from '../shared/KBSyncIndicator';
 
 // Default values if context is unavailable (e.g. during HMR or error boundary recovery)
 const CONTEXT_DEFAULTS = {
@@ -84,6 +85,11 @@ export function TopBar({ onShowShortcuts }: { onShowShortcuts?: () => void }) {
 
       <div className="flex items-center gap-3">
         {(hostSettings?.[0]?.demoFeatures?.showZoomOverride ?? true) && <ZoomControl />}
+
+        {/* KB sync indicator — hidden when in sync; shows count + spinner
+            while Supabase writes are in flight, amber when offline or
+            retrying after a failure. Click = force retry. */}
+        <KBSyncIndicator />
 
         {/* AI Kill Switch — global halt for auto-replies. Enabled path
             flips the button red so operators see the degraded state at

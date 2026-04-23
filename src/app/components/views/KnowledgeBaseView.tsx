@@ -16,7 +16,11 @@ import { useIsMobile } from '../ui/use-mobile';
 import { ScopeBadge } from '../shared/ScopeBadge';
 import { importDocumentAI } from '../../ai/api-client';
 import { KB_IMPORT_SYSTEM, KB_IMPORT_USER, resolvePrompt, resolveModel, interpolate } from '../../ai/prompts';
-import type { KBEntry } from '../../data/types';
+import type { KBEntry, KnowledgeChunk, IngestedDocument } from '../../data/types';
+import { normalizeDocument } from '../../lib/doc-normalize';
+import { ingestDocument } from '../../ai/import-router';
+import { diffReingest, type DiffOutcome } from '../../lib/reingest-diff';
+import { ReingestReviewModal, type ReingestDecision } from './ReingestReviewModal';
 
 
 function relativeTime(isoString: string): string {
@@ -152,7 +156,11 @@ export function KnowledgeBaseView() {
   const { propertyId: urlPropertyId } = useParams();
   const navigate = useNavigate();
   const isMobile = useIsMobile();
-  const { activeHostFilter, kbEntries, addKBEntry, updateKBEntry, deleteKBEntry, devMode, properties, promptOverrides } = useAppContext();
+  const {
+    activeHostFilter, kbEntries, addKBEntry, updateKBEntry, deleteKBEntry, devMode, properties, promptOverrides,
+    formTemplate, knowledgeChunks, ingestedDocuments,
+    upsertKnowledgeChunks, updateKnowledgeChunk, upsertIngestedDocument,
+  } = useAppContext();
 
   const [selectedPropertyId, setSelectedPropertyId] = useState<string | null>(urlPropertyId || null);
   const [showToonViewer, setShowToonViewer] = useState(false);
@@ -174,6 +182,14 @@ export function KnowledgeBaseView() {
   const [ingestionPreviewEntries, setIngestionPreviewEntries] = useState<typeof SIMULATED_EXTRACTIONS>([]);
   const [ingestionSelectedEntries, setIngestionSelectedEntries] = useState<Set<number>>(new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Unified ingest pipeline (Phase 1) — produces a diff preview for the
+  // ReingestReviewModal. When present, takes precedence over the legacy
+  // preview flow above.
+  const [reingestState, setReingestState] = useState<{
+    doc: IngestedDocument;
+    diff: DiffOutcome;
+  } | null>(null);
   // List view: inline editing for company-wide rules
   const [listEditingId, setListEditingId] = useState<number | null>(null);
   const [listEditTitle, setListEditTitle] = useState('');
@@ -230,56 +246,151 @@ export function KnowledgeBaseView() {
   const handleFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    e.target.value = '';
 
+    // Unified Phase 1 pipeline:
+    //   Stage A (local) → Stage B (AI router per-section) → deterministic diff
+    //   → ReingestReviewModal. No "flat entries" parsing — the router yields
+    //   typed KnowledgeChunks with slotKey / originalText / confidence.
     try {
       setIngestionFile(file.name);
-      toast.loading('Analyzing document with AI...');
+      toast.loading('Reading document...');
+      const normalized = await normalizeDocument(file);
 
-      // Read file content
-      const fileContent = await readFileAsText(file);
-      if (!fileContent) {
-        throw new Error('Could not read file');
-      }
-
-      // Call AI to extract KB entries via server proxy (no client-side API key needed)
-      const systemPrompt = resolvePrompt('kb_import', 'system', promptOverrides);
-      const userPrompt = interpolate(resolvePrompt('kb_import', 'user', promptOverrides), {
-        fileName: file.name,
-        fileContent: fileContent.substring(0, 8000),
-      });
-
-      const result = await importDocumentAI({
-        model: resolveModel('kb_import', promptOverrides),
-        systemPrompt,
-        userPrompt,
-        attachment: fileContent.substring(0, 8000),
-      });
-
-      // Parse Claude's response
-      const extracted = parseKBResponse(result.text);
-      if (extracted.length === 0) {
-        toast.warning('No entries extracted', {
-          description: 'Claude could not extract any KB entries from this file.',
-        });
-        setIngestionFile('');
-        e.target.value = '';
+      if (normalized.error) {
+        toast.dismiss();
+        toast.error('Parse failed', { description: normalized.error });
         return;
       }
 
-      setIngestionPreviewEntries(extracted);
-      setIngestionSelectedEntries(new Set(extracted.map((_, i) => i)));
-      setIngestionStep('preview');
-      toast.dismiss();
-      toast.success(`Extracted ${extracted.length} entries`, {
-        description: `Ready to import from "${file.name}"`,
+      // Contenthash match → skip Stage B entirely.
+      const prior = ingestedDocuments.find(d => d.filename === file.name && d.propId === (ingestionProperty || null));
+      if (prior && prior.contentHash === normalized.contentHash) {
+        toast.dismiss();
+        toast.info('Nothing changed', { description: `${file.name} is identical to the last upload.` });
+        setIngestionFile('');
+        return;
+      }
+
+      toast.loading('Classifying content with AI...');
+      const prop = ingestionProperty ? properties.find(p => p.id === ingestionProperty) : null;
+      const roomNames = prop?.roomNames ?? (prop?.units === 1 ? ['Entire Property'] : Array.from({ length: prop?.units ?? 1 }, (_, i) => `Unit ${i + 1}`));
+      const result = await ingestDocument(
+        normalized,
+        {
+          hostId: ingestionHost,
+          propId: ingestionProperty || null,
+          roomNames,
+          promptOverrides,
+        },
+        formTemplate,
+        'user',
+      );
+
+      if (result.chunks.length === 0) {
+        toast.dismiss();
+        toast.warning('No knowledge extracted', {
+          description: result.sectionErrors.length > 0
+            ? result.sectionErrors.map(e => e.label).join(', ')
+            : 'The router found nothing actionable in this document.',
+        });
+        setIngestionFile('');
+        return;
+      }
+
+      // Diff against what's already in the store for this docId, scoped
+      // appropriately.
+      const existingScoped = knowledgeChunks.filter(c =>
+        c.hostId === ingestionHost &&
+        (ingestionProperty ? c.propId === ingestionProperty : c.propId === null)
+      );
+      const diff = diffReingest({
+        newChunks: result.chunks,
+        existingChunks: existingScoped,
+        docId: result.doc.id,
+        previousDocId: prior?.id,
       });
-    } catch (err: any) {
-      console.error('File extraction error:', err);
+
+      setReingestState({ doc: result.doc, diff });
       toast.dismiss();
-      toast.error('Extraction failed', { description: err.message || 'Unknown error' });
+      const total = diff.summary.newCount + diff.summary.unchangedCount + diff.summary.pendingCount;
+      toast.success(`Analyzed ${total} chunks`, {
+        description: `${diff.summary.newCount} new · ${diff.summary.pendingCount} need review`,
+      });
+    } catch (err: unknown) {
+      console.error('Ingest error:', err);
+      toast.dismiss();
+      toast.error('Import failed', {
+        description: err instanceof Error ? err.message : String(err),
+      });
       setIngestionFile('');
     }
-    e.target.value = '';
+  };
+
+  // Commit the ReingestReviewModal decisions to the store.
+  const applyReingest = (decisions: ReingestDecision[]) => {
+    if (!reingestState) return;
+    const { doc, diff } = reingestState;
+
+    // Resolve pending-review items per user decision.
+    const chunksToCommit: KnowledgeChunk[] = [];
+    const archiveIds = new Set(diff.toArchive);
+
+    // First, all "unambiguous" inserts (those NOT in pendingReview).
+    const pendingProposedIds = new Set(
+      diff.pendingReview.map(p => p.proposed?.id).filter((id): id is string => !!id)
+    );
+    for (const c of diff.toInsert) {
+      if (pendingProposedIds.has(c.id)) continue; // handled below via decisions
+      chunksToCommit.push(c);
+    }
+
+    // Then apply the user's per-item decisions.
+    for (const decision of decisions) {
+      const item = diff.pendingReview[decision.itemIndex];
+      if (!item) continue;
+
+      if (decision.choice === 'use_new' && item.proposed) {
+        // Accept the new doc value. If there was an existing override,
+        // archive it (user chose the doc over their edit).
+        if (item.existing) archiveIds.add(item.existing.id);
+        chunksToCommit.push({ ...item.proposed, status: 'active' });
+      } else if (decision.choice === 'keep_existing') {
+        // Nothing to insert — the existing chunk stays active. Any proposed
+        // chunk with status='pending_review' should be dropped (not added).
+        // (pendingProposedIds filter above already excluded it.)
+      } else {
+        // 'skip' — park the proposal as pending_review so the user can come
+        // back to it later. The existing chunk (if any) stays put.
+        if (item.proposed) {
+          chunksToCommit.push({ ...item.proposed, status: 'pending_review' });
+        }
+      }
+    }
+
+    // Flip archived chunks to status='archived'.
+    for (const id of archiveIds) {
+      updateKnowledgeChunk(id, { status: 'archived' });
+    }
+
+    // Clear supersedes pointers on orphaned overrides.
+    for (const id of diff.toUnlink) {
+      updateKnowledgeChunk(id, { supersedes: undefined });
+    }
+
+    // Upsert new / replaced chunks.
+    upsertKnowledgeChunks(chunksToCommit);
+    // Record the doc.
+    upsertIngestedDocument(doc);
+
+    const added = chunksToCommit.filter(c => c.status === 'active').length;
+    toast.success(`Imported from "${doc.filename}"`, {
+      description: `${added} new · ${archiveIds.size} archived · ${decisions.length} resolved`,
+    });
+
+    setReingestState(null);
+    setShowIngestionModal(false);
+    setIngestionFile('');
   };
 
   const confirmIngestion = () => {
@@ -733,6 +844,33 @@ export function KnowledgeBaseView() {
                   <ListChecks size={14} /> {bulkMode ? 'Cancel' : 'Select'}
                 </button>
               )}
+              {(() => {
+                const pendingCount = knowledgeChunks.filter(c =>
+                  c.status === 'pending_review' &&
+                  (c.propId === prop.id || (c.propId === null && c.hostId === prop.hostId))
+                ).length;
+                return (
+                  <button
+                    onClick={() => navigate(`/kb/${prop.id}/inspector`)}
+                    className={`px-3 py-2 text-xs font-medium rounded-lg flex items-center gap-1.5 shadow-sm transition-colors border whitespace-nowrap shrink-0 relative ${
+                      pendingCount > 0
+                        ? 'bg-amber-50 text-amber-800 border-amber-200 hover:bg-amber-100'
+                        : 'bg-slate-100 text-slate-700 border-slate-200 hover:bg-slate-200'
+                    }`}
+                    title={pendingCount > 0
+                      ? `${pendingCount} ${pendingCount === 1 ? 'entry needs' : 'entries need'} review`
+                      : 'Browse all imported knowledge (FAQs, SOPs, rules, templates…)'
+                    }
+                  >
+                    <Search size={14} /> {isMobile ? 'Inspect' : 'Inspect Knowledge'}
+                    {pendingCount > 0 && (
+                      <span className="ml-0.5 px-1.5 py-0.5 text-[9px] font-bold rounded-full bg-amber-600 text-white tabular-nums">
+                        {pendingCount}
+                      </span>
+                    )}
+                  </button>
+                );
+              })()}
               <button
                 onClick={() => navigate(`/kb/onboard/${prop.id}`)}
                 className="px-4 py-2 text-xs font-medium bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 flex items-center gap-2 shadow-sm transition-colors whitespace-nowrap shrink-0"
@@ -1327,6 +1465,14 @@ export function KnowledgeBaseView() {
           )}
         </div>
       </div>
+
+      <ReingestReviewModal
+        open={reingestState !== null}
+        doc={reingestState?.doc ?? null}
+        diff={reingestState?.diff ?? null}
+        onCancel={() => { setReingestState(null); setIngestionFile(''); }}
+        onApply={applyReingest}
+      />
     </div>
   );
 }

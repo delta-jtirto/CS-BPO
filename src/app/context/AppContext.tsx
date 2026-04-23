@@ -1,5 +1,7 @@
-import React, { createContext, useContext, useState, useCallback, useEffect, useRef } from 'react';
-import type { Ticket, KBEntry, Host, Message } from '../data/types';
+import React, { createContext, useContext, useState, useCallback, useEffect, useRef, useMemo } from 'react';
+import type { Ticket, KBEntry, Host, Message, KnowledgeChunk, IngestedDocument } from '../data/types';
+import { kvGet, kvSet, stableHash, STORAGE_KEYS } from '../lib/storage';
+import * as kbPersist from '@/lib/kb-persistence';
 import { MOCK_TICKETS, MOCK_KB, MOCK_HOSTS, MOCK_PROPERTIES } from '../data/mock-data';
 import type { Property } from '../data/types';
 import { parseThreadStatus } from '../data/types';
@@ -83,7 +85,6 @@ export interface HostSettings {
     showTicketDistribution: boolean;  // Show Ticket Distribution settings tab
     showQualityPerformance: boolean;  // Show Quality & Performance settings tab
     showZoomOverride: boolean;        // Show zoom control in TopBar
-    guestNeedsMode: 'ai-context' | 'kb-scoring'; // How "What the Guest Needs" works
   };
 }
 
@@ -106,6 +107,106 @@ const DEFAULT_PHASES: FormPhase[] = [
   { id: 1, label: 'Critical', color: 'red' },
   { id: 2, label: 'Guest Experience', color: 'blue' },
 ];
+
+/**
+ * Project a manual-sourced `KnowledgeChunk` back to the legacy `KBEntry`
+ * shape so callers of `kbEntries` (KnowledgeBaseView's inline editor,
+ * InquiryDetector's legacy consumers) keep working without rewriting.
+ *
+ * The chunk id convention is `manual-${timestamp}`; we extract the
+ * timestamp as the KBEntry's numeric id. For chunks with unexpected ids
+ * we hash to a stable positive int so the legacy UI can still key them.
+ */
+function chunkToKBEntry(c: KnowledgeChunk): KBEntry {
+  const legacyIdMatch = c.id.match(/^manual-(\d+)/);
+  let numericId: number;
+  if (legacyIdMatch) {
+    numericId = parseInt(legacyIdMatch[1], 10);
+  } else {
+    // Deterministic string→int fold; same chunk id always maps to same legacy id.
+    let h = 0;
+    for (let i = 0; i < c.id.length; i++) {
+      h = ((h * 31) + c.id.charCodeAt(i)) | 0;
+    }
+    numericId = Math.abs(h) || 1;
+  }
+  return {
+    id: numericId,
+    hostId: c.hostId,
+    propId: c.propId,
+    roomId: c.roomId,
+    scope: c.roomId ? 'Room' : c.propId ? 'Property' : 'Host Global',
+    title: c.title,
+    content: c.body,
+    tags: c.tags,
+    internal: c.visibility === 'internal',
+    source: 'manual',
+    sectionId: typeof c.structured?.sectionId === 'string' ? c.structured.sectionId : undefined,
+  };
+}
+
+/**
+ * Parse a form-data key into its structured parts so we can derive the
+ * deterministic `property_fact` slotKey that `knowledge_chunks` expects.
+ *
+ * Shapes supported:
+ *   "basics__address"           → non-perRoom field
+ *   "wifi__room0__networkName"  → perRoom field
+ *
+ * Returns null for keys that don't match a known schema field (e.g.
+ * `faqs__items`, `_meta__filledBy`, stale keys after a FormBuilder edit).
+ */
+function parseFormKey(
+  key: string,
+  formTemplate: OnboardingSection[],
+  roomNames: string[],
+): null | {
+  sectionId: string;
+  sectionTitle: string;
+  fieldId: string;
+  fieldLabel: string;
+  roomId: string | null;
+  roomName: string | undefined;
+  slotKey: string;
+  hostHidden: boolean;
+} {
+  const parts = key.split('__');
+  if (parts.length < 2 || parts.length > 3) return null;
+
+  const sectionId = parts[0];
+  const isRoomScoped = parts.length === 3 && parts[1].startsWith('room');
+  const fieldId = isRoomScoped ? parts[2] : parts[1];
+  const roomIdx = isRoomScoped ? parseInt(parts[1].slice(4), 10) : -1;
+
+  const section = formTemplate.find(s => s.id === sectionId);
+  if (!section) return null;
+  if (section.id === 'faqs') return null;
+  const field = section.fields.find(f => f.id === fieldId);
+  if (!field) return null;
+
+  // Guard: if the schema says perRoom, the key MUST be room-scoped — and
+  // vice versa. Mismatch = stale key from a schema change; skip silently.
+  if (section.perRoom && !isRoomScoped) return null;
+  if (!section.perRoom && isRoomScoped) return null;
+
+  const roomName = isRoomScoped && roomIdx >= 0 && roomIdx < roomNames.length
+    ? roomNames[roomIdx]
+    : undefined;
+
+  const roomId = isRoomScoped ? `room${roomIdx}` : null;
+  const slotKey = `property_fact:${sectionId}:${fieldId}${roomId ? `:${roomId}` : ''}`;
+
+  return {
+    sectionId,
+    sectionTitle: section.title,
+    fieldId,
+    fieldLabel: field.label,
+    roomId,
+    roomName,
+    slotKey,
+    hostHidden: section.hostHidden === true || field.hostHidden === true,
+  };
+}
 
 interface AppState {
   // Global filter
@@ -206,6 +307,19 @@ interface AppState {
   deleteKBEntry: (id: number) => void;
   deleteKBEntriesBySource: (propId: string, source: 'onboarding' | 'manual') => void;
 
+  // Knowledge Chunks (new typed store — populated by Phase 1 ingest pipeline;
+  // empty during Phase 0, but the plumbing is in place so downstream AI
+  // context already consumes chunks from both legacy state and this store).
+  knowledgeChunks: KnowledgeChunk[];
+  upsertKnowledgeChunks: (chunks: KnowledgeChunk[]) => void;
+  updateKnowledgeChunk: (id: string, updates: Partial<KnowledgeChunk>) => void;
+  deleteKnowledgeChunks: (ids: string[]) => void;
+
+  // Ingested documents — tracks raw uploads so re-ingest is idempotent.
+  ingestedDocuments: IngestedDocument[];
+  upsertIngestedDocument: (doc: IngestedDocument) => void;
+  deleteIngestedDocument: (id: string) => void;
+
   // Properties (mutable for status updates)
   properties: Property[];
   addProperty: (prop: Property) => void;
@@ -215,8 +329,8 @@ interface AppState {
 
   // Onboarding form data: { [propertyId]: { [sectionId__fieldId]: value } }
   onboardingData: Record<string, Record<string, string>>;
-  setOnboardingField: (propertyId: string, key: string, value: string) => void;
-  setOnboardingBulk: (propertyId: string, data: Record<string, string>) => void;
+  setOnboardingField: (propertyId: string, key: string, value: string) => Promise<void>;
+  setOnboardingBulk: (propertyId: string, data: Record<string, string>) => Promise<void>;
   formPersistStatus: 'local' | 'server' | 'syncing';
 
   // Custom form sections per property
@@ -340,7 +454,6 @@ function makeDefaultHostSettings(h: Host): HostSettings {
       showTicketDistribution: false,
       showQualityPerformance: false,
       showZoomOverride: false,
-      guestNeedsMode: 'ai-context',
     },
   };
 }
@@ -350,7 +463,38 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // Start empty — Firestore threads merge in once connections authenticate.
   // MOCK_TICKETS only loaded when devMode is explicitly enabled.
   const [tickets, setTickets] = useState<Ticket[]>([]);
-  const [kbEntries, setKbEntries] = useState<KBEntry[]>(MOCK_KB);
+  // Legacy `kbEntries` is now a DERIVED view over `knowledgeChunks`.
+  // The mutators (addKBEntry/updateKBEntry/deleteKBEntry) write to the
+  // chunk store so there's a single source of truth. MOCK_KB is kept as
+  // a seed pool that's merged in when the chunk store is empty for demos —
+  // writing to a MOCK seed entry no-ops because its id has no backing chunk.
+  const [mockKbSeed] = useState<KBEntry[]>(MOCK_KB);
+  // Typed knowledge chunks — Phase 1+ ingest pipeline writes here. Empty in
+  // Phase 0; buildPropertyContext still derives chunks from legacy state.
+  const [knowledgeChunks, setKnowledgeChunks] = useState<KnowledgeChunk[]>([]);
+  const [ingestedDocuments, setIngestedDocuments] = useState<IngestedDocument[]>([]);
+  // Latest-value refs so async effects (Supabase hydrate) can snapshot
+  // current state without capturing stale closures.
+  const knowledgeChunksRef = useRef(knowledgeChunks);
+  const ingestedDocumentsRef = useRef(ingestedDocuments);
+  useEffect(() => { knowledgeChunksRef.current = knowledgeChunks; }, [knowledgeChunks]);
+  useEffect(() => { ingestedDocumentsRef.current = ingestedDocuments; }, [ingestedDocuments]);
+
+  // Derived kbEntries — projection of manual-sourced active chunks into
+  // the legacy `KBEntry` shape, merged with MOCK_KB seeds for demos.
+  // This kills the old setKbEntries state path; writes now flow through
+  // addKBEntry/updateKBEntry/deleteKBEntry → knowledgeChunks.
+  const kbEntries = useMemo<KBEntry[]>(() => {
+    const manualChunks = knowledgeChunks
+      .filter(c => c.source.type === 'manual' && c.status === 'active')
+      .map(chunkToKBEntry);
+    // Dedupe: a MOCK seed and a user-created chunk could collide on id
+    // (unlikely — seed ids are small ints, chunks use Date.now()-ish).
+    const byId = new Map<number, KBEntry>();
+    for (const e of mockKbSeed) byId.set(e.id, e);
+    for (const e of manualChunks) byId.set(e.id, e);
+    return Array.from(byId.values());
+  }, [knowledgeChunks, mockKbSeed]);
   // Messages for the currently active thread — lazy-loaded from Firestore
   const [activeMessages, setActiveMessages] = useState<Message[]>([]);
   // Tracks which tickets just received their first Firestore message sync
@@ -855,8 +999,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           if (Array.isArray(entries) && entries.length > 0) {
             // Filter out stale form-derived entries — form data is now used directly for AI context
             const manualOnly = entries.filter((e: { source?: string }) => e.source !== 'onboarding');
-            console.log(`[KB Load] ✓ Loaded ${manualOnly.length} manual entries from localStorage`);
-            setKbEntries(manualOnly);
+            console.log(`[KB Load] Ignoring ${manualOnly.length} stale legacy KB entries from localStorage — kbEntries is now derived from knowledge_chunks.`);
             return;
           }
         } catch {}
@@ -1603,22 +1746,123 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setDraftRepliesState(prev => { const n = { ...prev }; delete n[ticketId]; return n; });
   }, []);
 
-  const addKBEntry = useCallback((entry: Omit<KBEntry, 'id'>) => {
-    const newEntry: KBEntry = { ...entry, tags: entry.tags || [], id: Date.now() };
-    setKbEntries(prev => [...prev, newEntry]);
+  // ─── Knowledge Chunks + Ingested Documents mutators ───────────────────────
+  //
+  // Write model: optimistic state update, then async Supabase upsert. The
+  // IndexedDB cache-write effect further down picks up the state change and
+  // mirrors it locally so offline readers still work.
+  //
+  // Realtime events from other tabs come in through a separate subscription
+  // and feed back into the same setState — upserts are idempotent by `id`
+  // so concurrent tabs converge on the same final state without loops.
+  const companyIdRef = useRef<string | null>(null);
+
+  const upsertKnowledgeChunks = useCallback((chunks: KnowledgeChunk[]) => {
+    setKnowledgeChunks(prev => {
+      const byId = new Map(prev.map(c => [c.id, c]));
+      for (const c of chunks) byId.set(c.id, c);
+      return Array.from(byId.values());
+    });
+    const companyId = companyIdRef.current;
+    if (!companyId) return;
+    // Queued: failed writes retry with exponential backoff + online flush.
+    kbPersist.enqueueUpsertChunks(chunks, companyId);
   }, []);
 
-  const updateKBEntry = useCallback((id: number, updates: Partial<KBEntry>) => {
-    setKbEntries(prev => prev.map(kb => kb.id === id ? { ...kb, ...updates } : kb));
+  const updateKnowledgeChunk = useCallback((id: string, updates: Partial<KnowledgeChunk>) => {
+    const nowIso = new Date().toISOString();
+    setKnowledgeChunks(prev => prev.map(c =>
+      c.id === id ? { ...c, ...updates, updatedAt: nowIso } : c,
+    ));
+    kbPersist.enqueueUpdateChunk(id, updates);
   }, []);
+
+  const deleteKnowledgeChunks = useCallback((ids: string[]) => {
+    const idSet = new Set(ids);
+    setKnowledgeChunks(prev => prev.filter(c => !idSet.has(c.id)));
+    kbPersist.enqueueDeleteChunks(ids);
+  }, []);
+
+  const upsertIngestedDocument = useCallback((doc: IngestedDocument) => {
+    setIngestedDocuments(prev => {
+      const idx = prev.findIndex(d => d.id === doc.id);
+      if (idx === -1) return [...prev, doc];
+      const next = [...prev];
+      next[idx] = doc;
+      return next;
+    });
+    const companyId = companyIdRef.current;
+    if (!companyId) return;
+    kbPersist.enqueueUpsertDoc(doc, companyId);
+  }, []);
+
+  const deleteIngestedDocument = useCallback((id: string) => {
+    setIngestedDocuments(prev => prev.filter(d => d.id !== id));
+    kbPersist.enqueueDeleteDoc(id);
+  }, []);
+
+  // Legacy KB mutators — now write to `knowledge_chunks` under the hood.
+  // `kbEntries` is a read-only derived view, so these callers still get
+  // their expected behavior, but the data flows through the single
+  // canonical store that every AI path reads from.
+  //
+  // Declared AFTER the chunk mutators so the useCallback deps arrays
+  // below resolve without TDZ errors at render time.
+  const addKBEntry = useCallback(async (entry: Omit<KBEntry, 'id'>) => {
+    const nowIso = new Date().toISOString();
+    const timestamp = Date.now();
+    const chunkId = `manual-${timestamp}`;
+    const hash = await stableHash(JSON.stringify({ title: entry.title, body: entry.content }));
+    upsertKnowledgeChunks([{
+      id: chunkId,
+      hostId: entry.hostId,
+      propId: entry.propId,
+      roomId: entry.roomId,
+      kind: 'property_fact',
+      title: entry.title,
+      body: entry.content,
+      chunkHash: hash,
+      structured: entry.sectionId ? { sectionId: entry.sectionId } : undefined,
+      source: { type: 'manual', extractedAt: nowIso, editedBy: 'agent' },
+      visibility: entry.internal ? 'internal' : 'guest_facing',
+      status: 'active',
+      tags: entry.tags || [],
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    }]);
+  }, [upsertKnowledgeChunks]);
+
+  const updateKBEntry = useCallback(async (id: number, updates: Partial<KBEntry>) => {
+    const chunkId = `manual-${id}`;
+    const patch: Partial<KnowledgeChunk> = {};
+    if (updates.title !== undefined) patch.title = updates.title;
+    if (updates.content !== undefined) patch.body = updates.content;
+    if (updates.tags !== undefined) patch.tags = updates.tags;
+    if (updates.internal !== undefined) {
+      patch.visibility = updates.internal ? 'internal' : 'guest_facing';
+    }
+    if (updates.content !== undefined || updates.title !== undefined) {
+      patch.chunkHash = await stableHash(JSON.stringify({
+        title: updates.title ?? '',
+        body: updates.content ?? '',
+      }));
+    }
+    updateKnowledgeChunk(chunkId, patch);
+  }, [updateKnowledgeChunk]);
 
   const deleteKBEntry = useCallback((id: number) => {
-    setKbEntries(prev => prev.filter(kb => kb.id !== id));
-  }, []);
+    deleteKnowledgeChunks([`manual-${id}`]);
+  }, [deleteKnowledgeChunks]);
 
   const deleteKBEntriesBySource = useCallback((propId: string, source: 'onboarding' | 'manual') => {
-    setKbEntries(prev => prev.filter(kb => !(kb.source === source && kb.propId === propId)));
-  }, []);
+    // Only the 'manual' branch was ever actively used. We find every
+    // manual chunk scoped to this property and delete them in one batch.
+    if (source !== 'manual') return;
+    const ids = knowledgeChunksRef.current
+      .filter(c => c.source.type === 'manual' && c.propId === propId)
+      .map(c => c.id);
+    if (ids.length > 0) deleteKnowledgeChunks(ids);
+  }, [deleteKnowledgeChunks]);
 
   const markNotificationRead = useCallback((id: string) => {
     setNotifications(prev => prev.map(n => n.id === id ? { ...n, read: true } : n));
@@ -1682,31 +1926,261 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     })();
   }, []);
 
-  const setOnboardingField = useCallback((propertyId: string, key: string, value: string) => {
-    setOnboardingData(prev => ({
-      ...prev,
-      [propertyId]: {
-        ...prev[propertyId],
-        [key]: value,
-      },
-    }));
-  }, []);
+  // FAQ dual-write: the form stores FAQs as a JSON array under the single
+  // `faqs__items` key; `knowledge_chunks` wants one row per Q/A pair. This
+  // helper reconciles both — fired from setOnboardingField when that key
+  // changes. Each FAQ gets a stable id `form-faq-${propId}-${faqId}` so
+  // re-saves are idempotent. Removed FAQs are archived (90d TTL), not
+  // hard-deleted, matching the property_fact semantics below.
+  //
+  // Declared BEFORE setOnboardingField so its identifier is initialised
+  // by the time that callback's deps array is evaluated during render.
+  const syncFaqsToChunks = useCallback(async (propertyId: string, faqsJson: string) => {
+    const prop = properties.find(p => p.id === propertyId);
+    if (!prop) return;
 
-  const setOnboardingBulk = useCallback((propertyId: string, data: Record<string, string>) => {
+    type FaqItem = { id: string; question: string; answer: string; language?: string };
+    let items: FaqItem[] = [];
+    try {
+      const parsed = JSON.parse(faqsJson);
+      if (Array.isArray(parsed)) items = parsed;
+    } catch {
+      return; // malformed JSON — the form editor handles validation
+    }
+
+    const seenIds = new Set<string>();
+    const chunksToUpsert: KnowledgeChunk[] = [];
+    const nowIso = new Date().toISOString();
+
+    for (const faq of items) {
+      const q = (faq.question ?? '').trim();
+      const a = (faq.answer ?? '').trim();
+      if (!q || !a) continue; // half-filled rows don't become chunks
+      const chunkId = `form-faq-${propertyId}-${faq.id}`;
+      seenIds.add(chunkId);
+      const hash = await stableHash(JSON.stringify({ q, a, lang: faq.language }));
+      chunksToUpsert.push({
+        id: chunkId,
+        hostId: prop.hostId,
+        propId: propertyId,
+        roomId: null,
+        kind: 'faq',
+        title: q.length > 80 ? q.slice(0, 77) + '…' : q,
+        body: a,
+        chunkHash: hash,
+        structured: { question: q, answer: a, language: faq.language },
+        source: { type: 'form', extractedAt: nowIso, editedBy: 'agent' },
+        visibility: 'guest_facing',
+        status: 'active',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      });
+    }
+
+    if (chunksToUpsert.length > 0) upsertKnowledgeChunks(chunksToUpsert);
+
+    // Archive any previously-mirrored FAQ chunk that's no longer in the
+    // form list — preserves audit trail, recoverable via Inspector's
+    // Archived tab within 90 days.
+    const stalePrefix = `form-faq-${propertyId}-`;
+    for (const c of knowledgeChunksRef.current) {
+      if (!c.id.startsWith(stalePrefix)) continue;
+      if (c.status !== 'active') continue;
+      if (seenIds.has(c.id)) continue;
+      updateKnowledgeChunk(c.id, { status: 'archived' });
+    }
+  }, [properties, upsertKnowledgeChunks, updateKnowledgeChunk]);
+
+  // Atomic form → knowledge_chunks mirror.
+  //
+  // Every form field write is simultaneously written to `onboardingData`
+  // (form UI state) AND mirrored as a `property_fact` chunk in
+  // `knowledge_chunks` (canonical AI-readable store). No debounce, no
+  // gap — the moment a user types, the chunk is in state and queued
+  // for Supabase.
+  //
+  // `buildFormFactChunk` is pure and synchronous (chunkHash is an
+  // awaitable stableHash, so we build it async inside the callback).
+  const setOnboardingField = useCallback(async (propertyId: string, key: string, value: string) => {
     setOnboardingData(prev => ({
       ...prev,
-      [propertyId]: {
-        ...prev[propertyId],
-        ...data,
-      },
+      [propertyId]: { ...prev[propertyId], [key]: value },
     }));
-  }, []);
+
+    // FAQs — the form stores them as a JSON array under `faqs__items`.
+    // Mirror each Q/A pair as a `kind='faq'` chunk with a stable id so
+    // the Inspector and the AI see them through the unified store.
+    if (key === 'faqs__items') {
+      await syncFaqsToChunks(propertyId, value);
+      return;
+    }
+    // Form metadata (author, dates) is agent-only scaffolding, not KB.
+    if (key.startsWith('faqs__') || key.startsWith('_meta__')) return;
+
+    const prop = properties.find(p => p.id === propertyId);
+    if (!prop) return;
+    const roomNames = prop.roomNames
+      ?? (prop.units === 1 ? ['Entire Property']
+          : Array.from({ length: prop.units }, (_, i) => `Unit ${i + 1}`));
+    const parsed = parseFormKey(key, formTemplate, roomNames);
+    if (!parsed) return;
+
+    const chunkId = `form-${propertyId}-${parsed.slotKey}`;
+    const trimmed = value.trim();
+    if (!trimmed) {
+      // Cleared field → archive any existing chunk (90-day TTL).
+      const existing = knowledgeChunksRef.current.find(c => c.id === chunkId);
+      if (existing && existing.status === 'active') {
+        updateKnowledgeChunk(chunkId, { status: 'archived' });
+      }
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const hash = await stableHash(JSON.stringify({ body: trimmed, slotKey: parsed.slotKey }));
+    upsertKnowledgeChunks([{
+      id: chunkId,
+      hostId: prop.hostId,
+      propId: propertyId,
+      roomId: parsed.roomId,
+      kind: 'property_fact',
+      title: parsed.roomName ? `${parsed.roomName} — ${parsed.fieldLabel}` : parsed.fieldLabel,
+      body: trimmed,
+      chunkHash: hash,
+      structured: {
+        sectionId: parsed.sectionId,
+        sectionTitle: parsed.sectionTitle,
+        fieldId: parsed.fieldId,
+        fieldLabel: parsed.fieldLabel,
+        roomName: parsed.roomName,
+      },
+      slotKey: parsed.slotKey,
+      isOverride: true,
+      source: { type: 'form', extractedAt: nowIso, editedBy: 'agent' },
+      visibility: parsed.hostHidden ? 'internal' : 'guest_facing',
+      status: 'active',
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    }]);
+  }, [properties, formTemplate, updateKnowledgeChunk, upsertKnowledgeChunks, syncFaqsToChunks]);
+
+  const setOnboardingBulk = useCallback(async (propertyId: string, data: Record<string, string>) => {
+    setOnboardingData(prev => ({
+      ...prev,
+      [propertyId]: { ...prev[propertyId], ...data },
+    }));
+
+    const prop = properties.find(p => p.id === propertyId);
+    if (!prop) return;
+    const roomNames = prop.roomNames
+      ?? (prop.units === 1 ? ['Entire Property']
+          : Array.from({ length: prop.units }, (_, i) => `Unit ${i + 1}`));
+
+    const chunksToUpsert: KnowledgeChunk[] = [];
+    const idsToArchive: string[] = [];
+    const nowIso = new Date().toISOString();
+
+    for (const [key, value] of Object.entries(data)) {
+      if (key.startsWith('faqs__') || key.startsWith('_meta__')) continue;
+      const parsed = parseFormKey(key, formTemplate, roomNames);
+      if (!parsed) continue;
+      const chunkId = `form-${propertyId}-${parsed.slotKey}`;
+      const trimmed = value.trim();
+      if (!trimmed) {
+        idsToArchive.push(chunkId);
+        continue;
+      }
+      const hash = await stableHash(JSON.stringify({ body: trimmed, slotKey: parsed.slotKey }));
+      chunksToUpsert.push({
+        id: chunkId,
+        hostId: prop.hostId,
+        propId: propertyId,
+        roomId: parsed.roomId,
+        kind: 'property_fact',
+        title: parsed.roomName ? `${parsed.roomName} — ${parsed.fieldLabel}` : parsed.fieldLabel,
+        body: trimmed,
+        chunkHash: hash,
+        structured: {
+          sectionId: parsed.sectionId,
+          sectionTitle: parsed.sectionTitle,
+          fieldId: parsed.fieldId,
+          fieldLabel: parsed.fieldLabel,
+          roomName: parsed.roomName,
+        },
+        slotKey: parsed.slotKey,
+        isOverride: true,
+        source: { type: 'form', extractedAt: nowIso, editedBy: 'agent' },
+        visibility: parsed.hostHidden ? 'internal' : 'guest_facing',
+        status: 'active',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      });
+    }
+
+    if (chunksToUpsert.length > 0) upsertKnowledgeChunks(chunksToUpsert);
+    for (const id of idsToArchive) {
+      const existing = knowledgeChunksRef.current.find(c => c.id === id);
+      if (existing && existing.status === 'active') updateKnowledgeChunk(id, { status: 'archived' });
+    }
+    // Mirror FAQ blob if present in the bulk payload.
+    if (data['faqs__items']) await syncFaqsToChunks(propertyId, data['faqs__items']);
+  }, [properties, formTemplate, updateKnowledgeChunk, upsertKnowledgeChunks, syncFaqsToChunks]);
 
   // Persist onboardingData to localStorage so host portal changes survive AppProvider re-creation
   useEffect(() => {
     try { localStorage.setItem('onboardingData', JSON.stringify(onboardingData)); } catch {}
   }, [onboardingData]);
 
+  // NOTE: The debounced `syncFormToChunks` effect was removed. Form→chunk
+  // mirroring is now ATOMIC inside `setOnboardingField` / `setOnboardingBulk`
+  // above — every form write instantly lands as a property_fact chunk in
+  // state and is queued for Supabase. No 1s gap, no derivation fallback.
+  //
+  // One-time BACKFILL effect:
+  //
+  // PREFILLED_ONBOARDING demo data (and any form data persisted before
+  // this refactor) lives in `onboardingData` state but was never routed
+  // through the atomic mirror. Without this effect, AI prompts for those
+  // properties would see an empty KB — the legacy derivation that used
+  // to salvage them was deleted in Step 6 of the clean-data-model
+  // refactor.
+  //
+  // Runs ONCE per session, after:
+  //   - IndexedDB cache hydrate (so chunks state reflects local data)
+  //   - Supabase server sync (so we don't re-upload chunks the server
+  //     already has)
+  //   - companyIdRef is set (required for Supabase writes)
+  //
+  // Idempotent by chunk hash: rows whose slotKey+body are unchanged
+  // produce the same chunk id and collapse into a no-op upsert.
+  const backfillDoneRef = useRef(false);
+  useEffect(() => {
+    if (backfillDoneRef.current) return;
+    if (!chunksHydrated.current) return;
+    if (!serverSyncedRef.current) return;
+    if (!companyIdRef.current) return;
+
+    backfillDoneRef.current = true;
+    (async () => {
+      let backfilled = 0;
+      for (const [propertyId, fields] of Object.entries(onboardingData)) {
+        const prop = properties.find(p => p.id === propertyId);
+        if (!prop) continue;
+        const fieldCount = Object.keys(fields).filter(k =>
+          !k.startsWith('_meta__')
+        ).length;
+        if (fieldCount === 0) continue;
+        // setOnboardingBulk handles the full property_fact + FAQ mirror
+        // with deterministic chunk ids, so re-uploading existing data
+        // is a no-op at the Supabase level (same content hash).
+        await setOnboardingBulk(propertyId, fields);
+        backfilled += fieldCount;
+      }
+      if (backfilled > 0) {
+        console.log(`[KB Backfill] ✓ Mirrored ${backfilled} pre-existing form fields → knowledge_chunks (${Object.keys(onboardingData).length} properties)`);
+      }
+    })();
+  }, [onboardingData, properties, setOnboardingBulk]);
 
   const addCustomFormSection = useCallback((propertyId: string, title: string) => {
     const newSectionId = `sec-${Date.now()}`;
@@ -1873,6 +2347,203 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     return () => clearTimeout(timer);
   }, [kbEntries]);
 
+  // ─── Knowledge Chunks + Ingested Documents persistence ─────────────────
+  //
+  // Storage layers (in order of authority):
+  //   1. Supabase (canonical, multi-device, RLS-scoped)
+  //   2. IndexedDB (instant-render cache — shows data before network resolves)
+  //   3. React state (runtime)
+  //
+  // Hydrate flow:
+  //   a) Read IndexedDB → setState immediately (instant UI on page load,
+  //      works offline too)
+  //   b) Fetch from Supabase → setState again (canonical state wins)
+  //   c) Subscribe to realtime changes → incremental merges forever
+  //
+  // Write flow:
+  //   Mutators (upsertKnowledgeChunks etc.) already write to Supabase +
+  //   update state. The IndexedDB mirror effect below snapshots current
+  //   state on every change, so the local cache stays warm.
+  const chunksHydrated = useRef(false);
+  const docsHydrated = useRef(false);
+  const serverSyncedRef = useRef(false);
+
+  // Seed companyIdRef once proxyCompanyIds resolves. The prototype fallback
+  // yields 'delta-hq' for any authenticated user when no explicit mapping
+  // exists, so a warmed session always has a valid scope.
+  useEffect(() => {
+    if (proxyCompanyIds.length > 0) {
+      companyIdRef.current = proxyCompanyIds[0];
+    }
+  }, [proxyCompanyIds]);
+
+  // Step 1 — IndexedDB hydrate (fast, offline-safe).
+  useEffect(() => {
+    (async () => {
+      try {
+        const [chunks, docs] = await Promise.all([
+          kvGet<KnowledgeChunk[]>(STORAGE_KEYS.KB_CHUNKS),
+          kvGet<IngestedDocument[]>(STORAGE_KEYS.INGESTED_DOCS),
+        ]);
+        // Race-safe merge: if the user wrote to state before hydrate
+        // completed (e.g. import in <100ms), fresh user writes win over
+        // stale cache values.
+        if (Array.isArray(chunks)) {
+          setKnowledgeChunks(prev => {
+            if (prev.length === 0) return chunks;
+            const byId = new Map(chunks.map(c => [c.id, c]));
+            for (const c of prev) byId.set(c.id, c);
+            return Array.from(byId.values());
+          });
+        }
+        if (Array.isArray(docs)) {
+          setIngestedDocuments(prev => {
+            if (prev.length === 0) return docs;
+            const byId = new Map(docs.map(d => [d.id, d]));
+            for (const d of prev) byId.set(d.id, d);
+            return Array.from(byId.values());
+          });
+        }
+        console.log(`[KB Persist] ✓ Cache hydrated: ${chunks?.length ?? 0} chunks, ${docs?.length ?? 0} docs from IndexedDB`);
+      } catch (err) {
+        console.warn('[KB Persist] Cache hydrate failed:', err);
+      } finally {
+        chunksHydrated.current = true;
+        docsHydrated.current = true;
+      }
+    })();
+  }, []);
+
+  // Step 2 — Supabase fetch (canonical). Waits for proxyCompanyIds so RLS
+  // has a valid scope. Runs once per session; realtime handles updates.
+  //
+  // Also performs a one-time local→server migration: if the user has
+  // chunks in their IndexedDB cache that don't exist on the server, we
+  // upload them on first sync. Protects any work done before Supabase
+  // was enabled and any offline work that hasn't round-tripped yet.
+  useEffect(() => {
+    if (proxyCompanyIds.length === 0) return;
+    if (serverSyncedRef.current) return;
+    serverSyncedRef.current = true;
+    const companyId = proxyCompanyIds[0];
+    (async () => {
+      try {
+        const [serverChunks, serverDocs] = await Promise.all([
+          kbPersist.fetchAllChunks(),
+          kbPersist.fetchAllDocs(),
+        ]);
+
+        // Snapshot current in-memory state so we can detect local-only
+        // items. Read via the refs, not closure — state may have changed
+        // since mount.
+        const localChunks = knowledgeChunksRef.current;
+        const localDocs = ingestedDocumentsRef.current;
+
+        // local-only = present locally but absent on server. These are
+        // either pre-migration writes or offline writes awaiting sync.
+        const serverChunkIds = new Set(serverChunks.map(c => c.id));
+        const orphanLocalChunks = localChunks.filter(c => !serverChunkIds.has(c.id));
+        const serverDocIds = new Set(serverDocs.map(d => d.id));
+        const orphanLocalDocs = localDocs.filter(d => !serverDocIds.has(d.id));
+
+        if (orphanLocalChunks.length > 0 || orphanLocalDocs.length > 0) {
+          console.log(`[KB Persist] Migrating ${orphanLocalChunks.length} chunks + ${orphanLocalDocs.length} docs from local cache → Supabase`);
+          // Fire-and-forget — if it fails, the chunks stay in the local
+          // cache and the next user action will retry via the mutators.
+          if (orphanLocalChunks.length > 0) {
+            kbPersist.upsertChunks(orphanLocalChunks, companyId).catch(err =>
+              console.warn('[KB Persist] Migration upload failed:', err),
+            );
+          }
+          for (const d of orphanLocalDocs) {
+            kbPersist.upsertDoc(d, companyId).catch(err =>
+              console.warn('[KB Persist] Doc migration upload failed:', err),
+            );
+          }
+        }
+
+        // Merge: server is canonical, but keep local-only items (will be
+        // reconciled by the upload above or on next realtime tick) and
+        // prefer newer-updatedAt between the two.
+        setKnowledgeChunks(prev => {
+          const byId = new Map(serverChunks.map(c => [c.id, c]));
+          for (const c of prev) {
+            const serverCopy = byId.get(c.id);
+            if (!serverCopy) { byId.set(c.id, c); continue; }
+            if (new Date(c.updatedAt) > new Date(serverCopy.updatedAt)) byId.set(c.id, c);
+          }
+          return Array.from(byId.values());
+        });
+        setIngestedDocuments(prev => {
+          const byId = new Map(serverDocs.map(d => [d.id, d]));
+          for (const d of prev) if (!byId.has(d.id)) byId.set(d.id, d);
+          return Array.from(byId.values());
+        });
+        console.log(`[KB Persist] ✓ Synced from Supabase: ${serverChunks.length} chunks, ${serverDocs.length} docs`);
+      } catch (err) {
+        console.warn('[KB Persist] Supabase fetch failed — staying on IndexedDB cache:', err);
+      }
+    })();
+  }, [proxyCompanyIds]);
+
+  // Step 3 — Realtime. One tab's mutations become every other tab's
+  // incremental merge. Keeps two agents on two devices in sync without
+  // polling. Unsubscribe on provider unmount.
+  useEffect(() => {
+    if (proxyCompanyIds.length === 0) return;
+    const unsub = kbPersist.subscribeKBRealtime({
+      onChunkChange: (event, c) => {
+        if (event === 'DELETE') {
+          setKnowledgeChunks(prev => prev.filter(x => x.id !== c.id));
+          return;
+        }
+        // INSERT / UPDATE — upsert by id.
+        setKnowledgeChunks(prev => {
+          const idx = prev.findIndex(x => x.id === c.id);
+          if (idx === -1) return [...prev, c as KnowledgeChunk];
+          const next = [...prev];
+          next[idx] = c as KnowledgeChunk;
+          return next;
+        });
+      },
+      onDocChange: (event, d) => {
+        if (event === 'DELETE') {
+          setIngestedDocuments(prev => prev.filter(x => x.id !== d.id));
+          return;
+        }
+        setIngestedDocuments(prev => {
+          const idx = prev.findIndex(x => x.id === d.id);
+          if (idx === -1) return [...prev, d as IngestedDocument];
+          const next = [...prev];
+          next[idx] = d as IngestedDocument;
+          return next;
+        });
+      },
+    });
+    return unsub;
+  }, [proxyCompanyIds]);
+
+  // IndexedDB mirror — fire-and-forget cache writes on every state change.
+  // Doesn't block UI; failure here is non-fatal (Supabase is canonical).
+  useEffect(() => {
+    if (!chunksHydrated.current) return;
+    const timer = setTimeout(() => {
+      kvSet(STORAGE_KEYS.KB_CHUNKS, knowledgeChunks)
+        .then(() => console.log(`[KB Persist] ✓ Cached ${knowledgeChunks.length} chunks to IndexedDB`))
+        .catch(err => console.warn('[KB Persist] Cache write failed:', err));
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [knowledgeChunks]);
+
+  useEffect(() => {
+    if (!docsHydrated.current) return;
+    const timer = setTimeout(() => {
+      kvSet(STORAGE_KEYS.INGESTED_DOCS, ingestedDocuments)
+        .catch(err => console.warn('[KB Persist] Doc cache write failed:', err));
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [ingestedDocuments]);
+
   // ─── Manual sync to Supabase ─────────────────────────────────
   const manualSyncFormData = useCallback(async () => {
     const data = onboardingDataRef.current;
@@ -2002,7 +2673,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setActiveHostFilter('all');
     skipNextTicketSaveRef.current = true;
     setTickets(MOCK_TICKETS);
-    setKbEntries(MOCK_KB);
+    // NOTE: kbEntries is now derived from knowledgeChunks + MOCK_KB seed;
+    // resetting the chunk store wipes user-created entries. The seed
+    // re-appears automatically via the derived memo.
+    setKnowledgeChunks([]);
     setDarkModeRaw(false);
     setDevModeRaw(false);
     // Don't reset agent name — it comes from Supabase profile
@@ -2209,6 +2883,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       draftReplies, setDraftReply, clearDraftReply,
       ticketNotes, updateTicketNotes,
       kbEntries, addKBEntry, updateKBEntry, deleteKBEntry, deleteKBEntriesBySource,
+      knowledgeChunks, upsertKnowledgeChunks, updateKnowledgeChunk, deleteKnowledgeChunks,
+      ingestedDocuments, upsertIngestedDocument, deleteIngestedDocument,
       properties, addProperty, updatePropertyStatus, updatePropertyMeta, deleteProperty,
       onboardingData, setOnboardingField, setOnboardingBulk,
       formPersistStatus, manualSyncFormData,

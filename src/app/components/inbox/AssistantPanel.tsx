@@ -208,8 +208,7 @@ interface ChatMessage {
 const MAX_CONTEXT_TURNS = 3; // 3 user+assistant pairs = 6 messages
 
 export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInquiriesClassified, inquiryResolutions, onResolutionChange, onBulkResolution, onSummaryUpdate, onClassifyingChange }: AssistantPanelProps) {
-  const { kbEntries, hasApiKey: hasApiKeyFromCtx, aiModel, onboardingData, formTemplate, properties, hostSettings, promptOverrides, activeMessages, classifyCache } = useAppContext();
-  const guestNeedsMode = hostSettings?.[0]?.demoFeatures?.guestNeedsMode ?? 'ai-context';
+  const { kbEntries, knowledgeChunks, hasApiKey: hasApiKeyFromCtx, aiModel, onboardingData, formTemplate, properties, hostSettings, promptOverrides, activeMessages, classifyCache } = useAppContext();
   const [isAnalyzing, setIsAnalyzing] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   // Emit classifying state to parent so it can show loading placeholders
@@ -217,6 +216,22 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
   useEffect(() => {
     onClassifyingChange?.(isAnalyzing || isRefreshing);
   }, [isAnalyzing, isRefreshing, onClassifyingChange]);
+
+  // Watchdog: the classify pipeline has several paths that could in theory
+  // leave isAnalyzing stuck at true (LLM promise that never resolves, cache
+  // hook stuck mid-hydrate, debounce race). The parent shows a pulsing blue
+  // skeleton the whole time, which looks like an infinite load to the user.
+  // After 15s we force-unset so the UI recovers even if the underlying call
+  // never completes; real results still land when they arrive.
+  useEffect(() => {
+    if (!isAnalyzing && !isRefreshing) return;
+    const t = window.setTimeout(() => {
+      setIsAnalyzing(false);
+      setIsRefreshing(false);
+      console.warn('[AssistantPanel] classify watchdog fired — forcing analyzing=false after 15s');
+    }, 15000);
+    return () => window.clearTimeout(t);
+  }, [isAnalyzing, isRefreshing]);
   const [expandedInquiries, setExpandedInquiries] = useState<Set<string>>(new Set());
   const [expandedArticle, setExpandedArticle] = useState<string | null>(null);
 
@@ -238,7 +253,9 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
     return Object.keys(propData).some(k => k !== 'faqs__items' && propData[k]?.trim());
   }, [onboardingData, activeProp?.id]);
 
-  // Scope-filtered knowledge base
+  // Scope-filtered legacy KB (still passed to buildPropertyContext's
+  // `manualKBEntries` arg for back-compat with the legacy derivation
+  // path; the canonical store is `knowledgeChunks` below).
   const scopeFilteredKb = useMemo(() => {
     return kbEntries.filter(kb =>
       kb.hostId === ticket.host.id &&
@@ -246,12 +263,40 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
     );
   }, [kbEntries, ticket.host.id, activeProp?.id]);
 
+  // Scope-filtered knowledge chunks — THE canonical input to the scorer
+  // and to buildPropertyContext. Filters: active only (archived /
+  // pending_review / superseded excluded), host matches, property matches
+  // or null (host-global). This is what the AI actually reasons over.
+  const scopeFilteredChunks = useMemo(() => {
+    return knowledgeChunks.filter(c =>
+      c.status === 'active' &&
+      c.hostId === ticket.host.id &&
+      (!c.propId || c.propId === activeProp?.id)
+    );
+  }, [knowledgeChunks, ticket.host.id, activeProp?.id]);
+
   // Full property context — used by BOTH classify-inquiry and compose-reply
   const propContext = useMemo(() => {
     const prop = properties.find(p => p.name === ticket.property) ?? activeProp;
     const roomNames = prop?.roomNames ?? (prop?.units === 1 ? ['Entire Property'] : Array.from({ length: prop?.units ?? 1 }, (_, i) => `Unit ${i + 1}`));
-    return buildPropertyContext(prop?.id ?? '', ticket.property, onboardingData, formTemplate, roomNames, scopeFilteredKb);
-  }, [properties, ticket.property, activeProp, onboardingData, formTemplate, scopeFilteredKb]);
+    return buildPropertyContext(
+      prop?.id ?? '',
+      ticket.property,
+      onboardingData,
+      formTemplate,
+      roomNames,
+      scopeFilteredKb,
+      {
+        knowledgeChunks,
+        hostId: ticket.host.id,
+        // AssistantPanel drives BOTH internal classify (needs SOPs/urgency
+        // rules) and guest-facing compose/ask-AI. Include internal chunks
+        // so the classify prompt can route correctly. The compose prompt
+        // itself has separate guardrails against leaking internals.
+        includeInternal: true,
+      },
+    );
+  }, [properties, ticket.property, ticket.host.id, activeProp, onboardingData, formTemplate, scopeFilteredKb, knowledgeChunks]);
 
   // LLM-primary classification — always fires, regex only as no-API-key fallback
   const [aiInquiries, setAiInquiries] = useState<DetectedInquiry[] | null>(null);
@@ -272,8 +317,6 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
   promptOverridesRef.current = promptOverrides;
   const aiModelRef = useRef(aiModel);
   aiModelRef.current = aiModel;
-  const guestNeedsModeRef = useRef(guestNeedsMode);
-  guestNeedsModeRef.current = guestNeedsMode;
 
   // For Firestore tickets, activeMessages (updated directly by the subscription) is more
   // up-to-date than ticket.messages (which goes through a setTickets → re-render cycle).
@@ -359,7 +402,6 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
       (opts) => classifyInquiriesProxy({ ...opts, model: resolveModel('classify_inquiry', promptOverrides), temperature: resolveTemperature('classify_inquiry', promptOverrides), maxTokens: resolveMaxTokens('classify_inquiry', promptOverrides) }),
       propContext,
       promptOverrides,
-      guestNeedsMode,
       true,
     ).then(cr => {
       llmClassifyRef.current = classifyKey;
@@ -411,13 +453,12 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
     // the intermediate key would pollute the cache row for B with A's data.
     // The cleanup clears the pending timer on every re-render, so only the
     // settled key actually reaches the cache check + LLM. Inputs read from
-    // refs (propContext / promptOverrides / aiModel / guestNeedsMode) so
-    // parent re-renders don't re-fire this effect and cancel the timer.
+    // refs (propContext / promptOverrides / aiModel) so parent re-renders
+    // don't re-fire this effect and cancel the timer.
     const debounceTimer = setTimeout(() => {
       const propContext = propContextRef.current;
       const promptOverrides = promptOverridesRef.current;
       const aiModel = aiModelRef.current;
-      const guestNeedsMode = guestNeedsModeRef.current;
       void aiModel;
       llmClassifyRef.current = classifyKey;
 
@@ -445,7 +486,6 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
       (opts) => classifyInquiriesProxy({ ...opts, model: resolveModel('classify_inquiry', promptOverrides), temperature: resolveTemperature('classify_inquiry', promptOverrides), maxTokens: resolveMaxTokens('classify_inquiry', promptOverrides) }),
       propContext,
       promptOverrides,
-      guestNeedsMode,
     ).then(cr => {
       console.log('[AssistantPanel] LLM classified %d inquiries for key %s', cr.inquiries.length, classifyKey);
       handleClassifyResult(cr);
@@ -506,15 +546,18 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
     return Array.from(seen.values());
   })();
 
-  // Score knowledge base per inquiry
+  // Score knowledge base per inquiry — now operates on the unified
+  // knowledge_chunks store (no more legacy kbEntries). Covers everything:
+  // form-entered property facts, imported FAQs, SOPs, reply templates,
+  // urgency rules, workflows, and manual entries.
   const kbMatchesByInquiry = useMemo(() => {
     const result: Record<string, InquiryKBMatch[]> = {};
     for (const inq of inquiries) {
-      const withRoomBoost = scopeFilteredKb.map(kb => {
-        if (kb.roomId && ticketRoom && kb.roomId === ticketRoom) {
-          return { ...kb, tags: [...(kb.tags || []), '__room_match__'] };
+      const withRoomBoost = scopeFilteredChunks.map(c => {
+        if (c.roomId && ticketRoom && c.roomId === ticketRoom) {
+          return { ...c, tags: [...(c.tags || []), '__room_match__'] };
         }
-        return kb;
+        return c;
       });
       const matches = scoreKBForInquiry(inq, withRoomBoost);
       result[inq.id] = matches.map(m => ({
@@ -525,7 +568,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
       })).sort((a, b) => b.score - a.score);
     }
     return result;
-  }, [inquiries, scopeFilteredKb, ticketRoom]);
+  }, [inquiries, scopeFilteredChunks, ticketRoom]);
 
   // Extract relevant form fields per inquiry from onboardingData
   // Fields are deduplicated across inquiry cards — a field shown in card #1 won't repeat in card #2
@@ -1039,34 +1082,7 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
 
                     {/* Coverage chip + chevron */}
                     <div className="flex items-center gap-1.5 shrink-0">
-                      {guestNeedsMode === 'kb-scoring' && coverageStatus === 'kb' && (
-                        <span className="text-[9px] font-medium text-slate-500 bg-slate-100 px-2 py-0.5 rounded-full tabular-nums">
-                          {matches.length} {matches.length === 1 ? 'article' : 'articles'}
-                        </span>
-                      )}
-                      {guestNeedsMode === 'kb-scoring' && coverageStatus === 'form' && (
-                        <span className="text-[8px] font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full flex items-center gap-0.5 tabular-nums">
-                          <Sparkles size={7} /> {formFields.length} {formFields.length === 1 ? 'field' : 'fields'}
-                        </span>
-                      )}
-                      {guestNeedsMode === 'kb-scoring' && coverageStatus === 'none' && needsKb && (
-                        <>
-                          <span className="text-[8px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full flex items-center gap-0.5">
-                            <AlertTriangle size={7} /> Gap
-                          </span>
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleSend(generateQuickQuestion(inq, ticket.property, ticket.room));
-                            }}
-                            className="shrink-0 p-1 rounded-lg bg-indigo-50 border border-indigo-100 hover:bg-indigo-100 transition-colors"
-                            title="Ask AI about this gap"
-                          >
-                            <Bot size={10} className="text-indigo-600" />
-                          </button>
-                        </>
-                      )}
-                      {guestNeedsMode === 'ai-context' && needsKb && (inq.context ?? []).filter(isSubstantiveContextItem).length === 0 && formFields.length === 0 && (
+                      {needsKb && (inq.context ?? []).filter(isSubstantiveContextItem).length === 0 && formFields.length === 0 && (
                         <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" title="No info on file for this topic" />
                       )}
                       {/* Resolution toggle */}
@@ -1100,9 +1116,8 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
                   {isExpanded && (
                     <div className="border-t border-slate-100 bg-white">
 
-                      {/* AI Summary mode — plain text context */}
-                      {guestNeedsMode === 'ai-context' && (
-                        <div className="px-3 py-2.5">
+                      {/* Per-inquiry context — AI-written source-tagged briefing */}
+                      <div className="px-3 py-2.5">
                           {(() => {
                             const rawItems = inq.context ?? [];
                             // Filter out LLM-hallucinated filler so a vague "I'll look into this"
@@ -1187,191 +1202,6 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
                             );
                           })()}
                         </div>
-                      )}
-
-                      {/* KB Matching mode — KB article cards */}
-                      {guestNeedsMode === 'kb-scoring' && coverageStatus === 'kb' && (
-                        <div className="p-2.5 space-y-1.5">
-                          {matches.map((m) => {
-                            const cardKey = `kb-${m.entry.id}`;
-                            const isArticleOpen = expandedArticle === cardKey;
-                            const isInternal = m.isActionable || m.entry.internal;
-                            return (
-                              <div
-                                key={cardKey}
-                                className={`rounded-lg border overflow-hidden transition-all duration-150 ${
-                                  isInternal ? 'border-amber-200' : 'border-slate-200'
-                                }`}
-                              >
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    setExpandedArticle(isArticleOpen ? null : cardKey);
-                                  }}
-                                  className={`w-full flex items-start gap-2.5 px-2.5 py-2 text-left transition-colors ${
-                                    isInternal
-                                      ? 'bg-amber-50/60 hover:bg-amber-50'
-                                      : isArticleOpen
-                                        ? 'bg-slate-50'
-                                        : 'bg-white hover:bg-slate-50/70'
-                                  }`}
-                                >
-                                  <div className="flex-1 min-w-0">
-                                    <div className="flex items-center gap-1.5 mb-1">
-                                      <span className="text-[11px] font-semibold text-slate-700 leading-tight">{m.entry.title}</span>
-                                      {isInternal && (
-                                        <span className="shrink-0 text-[7px] font-bold text-amber-700 bg-amber-100 px-1 py-0.5 rounded border border-amber-200">
-                                          Agent-only
-                                        </span>
-                                      )}
-                                    </div>
-                                    <p className={`text-[10px] text-slate-500 leading-relaxed ${isArticleOpen ? '' : 'line-clamp-2'}`}>
-                                      {m.entry.content}
-                                    </p>
-                                    {isArticleOpen && (
-                                      <div className="flex items-center gap-1.5 mt-2 flex-wrap">
-                                        <ScopeBadge scope={m.entry.scope} />
-                                        {m.entry.source === 'manual' && (
-                                          <span className="text-[8px] text-indigo-600 bg-indigo-50 border border-indigo-200 px-1.5 py-0.5 rounded-full flex items-center gap-0.5">
-                                            <Pencil size={7} /> Custom entry
-                                          </span>
-                                        )}
-                                        {!m.entry.source && (
-                                          <span className="text-[8px] text-slate-400 bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded-full">
-                                            Seed data
-                                          </span>
-                                        )}
-                                        <button
-                                          onClick={(e) => { e.stopPropagation(); handleInsertMsg(m.entry.content); }}
-                                          title="Insert into reply"
-                                          className="ml-auto flex items-center gap-0.5 text-[8px] font-medium text-indigo-600 bg-indigo-50 border border-indigo-200 px-1.5 py-0.5 rounded-full hover:bg-indigo-100 transition-colors"
-                                        >
-                                          <CornerDownLeft size={7} /> Insert
-                                        </button>
-                                      </div>
-                                    )}
-                                  </div>
-                                  <ChevronDown
-                                    size={11}
-                                    className={`shrink-0 mt-0.5 text-slate-300 transition-transform duration-150 ${isArticleOpen ? '' : '-rotate-90'}`}
-                                  />
-                                </button>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      )}
-
-                      {/* Form field cards — actual values from onboarding form */}
-                      {guestNeedsMode === 'kb-scoring' && coverageStatus === 'form' && (
-                        <div className="p-2.5 space-y-1.5">
-                          {/* Subtle provenance note */}
-                          <div className="flex items-center gap-1 px-0.5 mb-2">
-                            <Sparkles size={8} className="text-emerald-500" />
-                            <span className="text-[9px] text-emerald-600 font-medium">From property form · AI has this info</span>
-                          </div>
-                          {formFields.map((field) => {
-                            const cardKey = `form-${field.id}`;
-                            const isFieldOpen = expandedArticle === cardKey;
-                            return (
-                              <div key={cardKey} className="rounded-lg border border-slate-200 overflow-hidden transition-all duration-150">
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    setExpandedArticle(isFieldOpen ? null : cardKey);
-                                  }}
-                                  className={`w-full flex items-start gap-2.5 px-2.5 py-2 text-left transition-colors ${
-                                    isFieldOpen ? 'bg-slate-50' : 'bg-white hover:bg-slate-50/70'
-                                  }`}
-                                >
-                                  <div className="flex-1 min-w-0">
-                                    <div className="flex items-center gap-1.5 mb-1 flex-wrap">
-                                      <span className="text-[11px] font-semibold text-slate-700 leading-tight">{field.label}</span>
-                                      {field.roomName && (
-                                        <span className="text-[7px] font-semibold text-blue-600 bg-blue-50 border border-blue-200 px-1.5 py-0.5 rounded-full leading-none">
-                                          {field.roomName}
-                                        </span>
-                                      )}
-                                    </div>
-                                    <p className={`text-[10px] text-slate-500 leading-relaxed ${isFieldOpen ? '' : 'line-clamp-2'}`}>
-                                      {field.value}
-                                    </p>
-                                    {isFieldOpen && (
-                                      <div className="flex items-center gap-1.5 mt-2 flex-wrap">
-                                        <span className="text-[8px] text-emerald-600 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded-full flex items-center gap-0.5">
-                                          <Sparkles size={7} /> Form · {field.sectionTitle}
-                                        </span>
-                                        {field.roomName && (
-                                          <span className="text-[8px] text-blue-600 bg-blue-50 border border-blue-200 px-1.5 py-0.5 rounded-full">
-                                            {field.roomName}
-                                          </span>
-                                        )}
-                                        {field.value && (
-                                          <button
-                                            onClick={(e) => { e.stopPropagation(); handleInsertMsg(field.value); }}
-                                            title="Insert into reply"
-                                            className="ml-auto flex items-center gap-0.5 text-[8px] font-medium text-indigo-600 bg-indigo-50 border border-indigo-200 px-1.5 py-0.5 rounded-full hover:bg-indigo-100 transition-colors"
-                                          >
-                                            <CornerDownLeft size={7} /> Insert
-                                          </button>
-                                        )}
-                                      </div>
-                                    )}
-                                  </div>
-                                  <ChevronDown
-                                    size={11}
-                                    className={`shrink-0 mt-0.5 text-slate-300 transition-transform duration-150 ${isFieldOpen ? '' : '-rotate-90'}`}
-                                  />
-                                </button>
-                              </div>
-                            );
-                          })}
-                          {/* Ask AI button at the bottom */}
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleSend(generateQuickQuestion(inq, ticket.property, ticket.room));
-                            }}
-                            className="w-full mt-1 text-[10px] font-medium text-indigo-600 bg-indigo-50 border border-indigo-100 px-2.5 py-1.5 rounded-lg hover:bg-indigo-100 transition-colors flex items-center justify-center gap-1"
-                          >
-                            <Bot size={10} /> Ask AI about this
-                          </button>
-                        </div>
-                      )}
-
-                      {/* Not covered */}
-                      {guestNeedsMode === 'kb-scoring' && coverageStatus === 'none' && needsKb && (
-                        <div className="p-3 space-y-2">
-                          <div className="flex items-start gap-2 p-2.5 bg-amber-50 border border-amber-200 rounded-lg">
-                            <AlertTriangle size={12} className="text-amber-500 shrink-0 mt-0.5" />
-                            <div>
-                              <p className="text-[10px] font-semibold text-amber-800">No info on file</p>
-                              <p className="text-[9px] text-amber-600 mt-0.5 leading-relaxed">
-                                {inq.detail || `Guest asked about ${inq.label.toLowerCase()}.`} — reply manually or add an article so AI can handle it next time.
-                              </p>
-                            </div>
-                          </div>
-                          <div className="flex items-center gap-1.5">
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleSend(generateQuickQuestion(inq, ticket.property, ticket.room));
-                              }}
-                              className="flex-1 text-[10px] font-medium text-indigo-600 bg-indigo-50 border border-indigo-100 px-2.5 py-1.5 rounded-lg hover:bg-indigo-100 transition-colors flex items-center justify-center gap-1"
-                            >
-                              <Bot size={10} /> Ask AI
-                            </button>
-                            {activeProp && (
-                              <button
-                                onClick={(e) => { e.stopPropagation(); onNavigateToKB(activeProp.id); }}
-                                className="flex-1 text-[10px] font-medium text-slate-600 bg-white border border-slate-200 px-2.5 py-1.5 rounded-lg hover:bg-slate-50 transition-colors flex items-center justify-center gap-1"
-                              >
-                                <Pencil size={10} /> Add article
-                              </button>
-                            )}
-                          </div>
-                        </div>
-                      )}
 
                     </div>
                   )}
@@ -1475,54 +1305,52 @@ export function AssistantPanel({ ticket, onComposeReply, onNavigateToKB, onInqui
                             {/* ── Expanded body (renders at normal contrast for readability) ── */}
                             {isExpanded && (
                               <div className="border-t border-slate-100 bg-white">
-                                {guestNeedsMode === 'ai-context' && (
-                                  <div className="px-3 py-2.5">
-                                    {(() => {
-                                      const rawItems = inq.context ?? [];
-                                      const llmItems = rawItems.filter(isSubstantiveContextItem);
-                                      const formItems = llmItems.length === 0
-                                        ? formFields.map(f => ({
-                                            section: f.roomName ? `${f.sectionTitle} — ${f.roomName}` : f.sectionTitle,
-                                            text: `${f.label}: ${f.value}`,
-                                            source: 'kb' as const,
-                                          }))
-                                        : [];
-                                      const items = llmItems.length > 0 ? llmItems : formItems;
-                                      const isGreeting = inq.needsKbSearch === false;
+                                <div className="px-3 py-2.5">
+                                  {(() => {
+                                    const rawItems = inq.context ?? [];
+                                    const llmItems = rawItems.filter(isSubstantiveContextItem);
+                                    const formItems = llmItems.length === 0
+                                      ? formFields.map(f => ({
+                                          section: f.roomName ? `${f.sectionTitle} — ${f.roomName}` : f.sectionTitle,
+                                          text: `${f.label}: ${f.value}`,
+                                          source: 'kb' as const,
+                                        }))
+                                      : [];
+                                    const items = llmItems.length > 0 ? llmItems : formItems;
+                                    const isGreeting = inq.needsKbSearch === false;
 
-                                      if (isGreeting) return (
-                                        <p className="text-[10px] text-slate-400 italic">No additional context needed.</p>
-                                      );
-                                      if (items.length === 0) return (
-                                        <p className="text-[10px] text-slate-400 italic">No info on file for this topic.</p>
-                                      );
+                                    if (isGreeting) return (
+                                      <p className="text-[10px] text-slate-400 italic">No additional context needed.</p>
+                                    );
+                                    if (items.length === 0) return (
+                                      <p className="text-[10px] text-slate-400 italic">No info on file for this topic.</p>
+                                    );
 
-                                      const sections = items.reduce<Record<string, typeof items>>((acc, item) => {
-                                        (acc[item.section] ??= []).push(item);
-                                        return acc;
-                                      }, {});
-                                      return (
-                                        <div className="space-y-2">
-                                          {Object.entries(sections).map(([section, sectionItems]) => (
-                                            <div key={section}>
-                                              <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide mb-1">{section}</p>
-                                              <div className="space-y-0.5">
-                                                {sectionItems.map((item, i) => (
-                                                  <div key={i} className="flex gap-1.5 items-start">
-                                                    <span className="text-slate-300 shrink-0 leading-none mt-[3px]">•</span>
-                                                    <span className={`text-[11px] leading-snug flex-1 ${item.source === 'ai' ? 'text-slate-400 italic' : 'text-slate-600'}`}>
-                                                      {item.text}
-                                                    </span>
-                                                  </div>
-                                                ))}
-                                              </div>
+                                    const sections = items.reduce<Record<string, typeof items>>((acc, item) => {
+                                      (acc[item.section] ??= []).push(item);
+                                      return acc;
+                                    }, {});
+                                    return (
+                                      <div className="space-y-2">
+                                        {Object.entries(sections).map(([section, sectionItems]) => (
+                                          <div key={section}>
+                                            <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide mb-1">{section}</p>
+                                            <div className="space-y-0.5">
+                                              {sectionItems.map((item, i) => (
+                                                <div key={i} className="flex gap-1.5 items-start">
+                                                  <span className="text-slate-300 shrink-0 leading-none mt-[3px]">•</span>
+                                                  <span className={`text-[11px] leading-snug flex-1 ${item.source === 'ai' ? 'text-slate-400 italic' : 'text-slate-600'}`}>
+                                                    {item.text}
+                                                  </span>
+                                                </div>
+                                              ))}
                                             </div>
-                                          ))}
-                                        </div>
-                                      );
-                                    })()}
-                                  </div>
-                                )}
+                                          </div>
+                                        ))}
+                                      </div>
+                                    );
+                                  })()}
+                                </div>
                               </div>
                             )}
                           </div>

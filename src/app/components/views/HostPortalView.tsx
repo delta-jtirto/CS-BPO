@@ -5,13 +5,18 @@ import {
   ClipboardList, HelpCircle, Lock, MapPin, MessageCircle,
   Shield, Sparkles, Wifi, Home, Recycle,
   Utensils, BedDouble, Phone, Send, Building,
-  Camera, DollarSign, ImageIcon, Save, ArrowUp, Circle
+  Camera, DollarSign, ImageIcon, Save, ArrowUp, Circle, Upload, Loader2,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { motion, AnimatePresence } from 'motion/react';
 import { MOCK_HOSTS } from '../../data/mock-data';
 import { useAppContext } from '../../context/AppContext';
 import type { OnboardingSection, OnboardingField } from '../../data/onboarding-template';
+import type { KnowledgeChunk, IngestedDocument } from '../../data/types';
+import { normalizeDocument } from '../../lib/doc-normalize';
+import { ingestDocument } from '../../ai/import-router';
+import { diffReingest, type DiffOutcome } from '../../lib/reingest-diff';
+import { ReingestReviewModal, type ReingestDecision } from './ReingestReviewModal';
 
 const SECTION_ICONS: Record<string, React.ReactNode> = {
   basics: <MapPin size={18} />,
@@ -32,7 +37,11 @@ const SECTION_ICONS: Record<string, React.ReactNode> = {
 
 export function HostPortalView() {
   const { propertyId, token } = useParams();
-  const { properties, onboardingData, setOnboardingField, formTemplate } = useAppContext();
+  const {
+    properties, onboardingData, setOnboardingField, setOnboardingBulk, formTemplate,
+    knowledgeChunks, ingestedDocuments, upsertKnowledgeChunks, updateKnowledgeChunk, upsertIngestedDocument,
+    promptOverrides,
+  } = useAppContext();
   const ONBOARDING_SECTIONS = formTemplate;
 
   const prop = properties.find(p => p.id === propertyId);
@@ -65,6 +74,118 @@ export function HostPortalView() {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
       saveTimerRef.current = setTimeout(() => setSaveStatus('saved'), 600);
     }
+  };
+
+  // ─── Upload-first flow (Phase 2.4) ─────────────────────────────────────
+  // Host can upload their existing property docs (Sheets, PDFs, etc.) and
+  // the AI fills the form in bulk. Inline edits still work for spot fixes.
+  const uploadInputRef = useRef<HTMLInputElement>(null);
+  const [docProcessing, setDocProcessing] = useState(false);
+  const [reingestState, setReingestState] = useState<{
+    doc: IngestedDocument;
+    diff: DiffOutcome;
+  } | null>(null);
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !propertyId || !prop) return;
+    e.target.value = '';
+
+    try {
+      setDocProcessing(true);
+      const normalized = await normalizeDocument(file);
+      if (normalized.error) {
+        toast.error("Couldn't read that file", { description: normalized.error });
+        setDocProcessing(false);
+        return;
+      }
+      const prior = ingestedDocuments.find(d => d.filename === file.name && d.propId === propertyId);
+      if (prior && prior.contentHash === normalized.contentHash) {
+        toast.info('Nothing changed', { description: `${file.name} is identical to the last upload.` });
+        setDocProcessing(false);
+        return;
+      }
+      const rNames = prop.roomNames ?? (prop.units === 1 ? ['Entire Property'] : Array.from({ length: prop.units }, (_, i) => `Unit ${i + 1}`));
+      const result = await ingestDocument(
+        normalized,
+        { hostId: prop.hostId, propId: propertyId, roomNames: rNames, promptOverrides },
+        formTemplate,
+        'host',
+      );
+      if (result.chunks.length === 0) {
+        toast.warning('No facts found in that document', {
+          description: result.sectionErrors.length > 0
+            ? result.sectionErrors.map(x => x.label).join(', ')
+            : 'Try a spreadsheet with property details, FAQs, or house rules.',
+        });
+        setDocProcessing(false);
+        return;
+      }
+      const existingScoped = knowledgeChunks.filter(c => c.propId === propertyId);
+      const diff = diffReingest({
+        newChunks: result.chunks,
+        existingChunks: existingScoped,
+        docId: result.doc.id,
+        previousDocId: prior?.id,
+      });
+      setReingestState({ doc: result.doc, diff });
+      setDocProcessing(false);
+    } catch (err) {
+      console.error('Host portal upload error:', err);
+      toast.error('Upload failed', { description: err instanceof Error ? err.message : String(err) });
+      setDocProcessing(false);
+    }
+  };
+
+  const applyHostReingest = (decisions: ReingestDecision[]) => {
+    if (!reingestState || !propertyId) return;
+    const { doc, diff } = reingestState;
+
+    const chunksToCommit: KnowledgeChunk[] = [];
+    const archiveIds = new Set(diff.toArchive);
+    const pendingProposedIds = new Set(
+      diff.pendingReview.map(p => p.proposed?.id).filter((id): id is string => !!id)
+    );
+    for (const c of diff.toInsert) {
+      if (pendingProposedIds.has(c.id)) continue;
+      chunksToCommit.push(c);
+    }
+    for (const d of decisions) {
+      const item = diff.pendingReview[d.itemIndex];
+      if (!item) continue;
+      if (d.choice === 'use_new' && item.proposed) {
+        if (item.existing) archiveIds.add(item.existing.id);
+        chunksToCommit.push({ ...item.proposed, status: 'active' });
+      } else if (d.choice === 'skip' && item.proposed) {
+        chunksToCommit.push({ ...item.proposed, status: 'pending_review' });
+      }
+    }
+    for (const id of archiveIds) updateKnowledgeChunk(id, { status: 'archived' });
+    for (const id of diff.toUnlink) updateKnowledgeChunk(id, { supersedes: undefined });
+    upsertKnowledgeChunks(chunksToCommit);
+    upsertIngestedDocument(doc);
+
+    // Mirror property_fact chunks back to onboardingData so the form UI
+    // visibly fills in for the host.
+    const formPatch: Record<string, string> = {};
+    for (const c of chunksToCommit) {
+      if (c.status !== 'active') continue;
+      if (c.kind === 'property_fact' && c.slotKey) {
+        const parts = c.slotKey.split(':');
+        if (parts.length >= 3 && parts[0] === 'property_fact') {
+          const sectionId = parts[1];
+          const fieldId = parts[2];
+          const roomPart = parts[3];
+          const key = roomPart ? `${sectionId}__${roomPart}__${fieldId}` : `${sectionId}__${fieldId}`;
+          formPatch[key] = c.body;
+        }
+      }
+    }
+    if (Object.keys(formPatch).length > 0) setOnboardingBulk(propertyId, formPatch);
+    toast.success(`Imported from "${doc.filename}"`, {
+      description: `${chunksToCommit.filter(c => c.status === 'active').length} facts added · ${archiveIds.size} archived`,
+    });
+    setReingestState(null);
   };
 
   const roomLabels = useMemo(() => {
@@ -384,6 +505,40 @@ export function HostPortalView() {
           </div>
         </div>
 
+        {/* Upload-first CTA (Phase 2.4) — primary path for hosts who
+            already maintain their own property docs. Form edits below
+            are available as a fallback for spot fixes. */}
+        {!submitted && (
+          <div className="px-4 sm:px-6 pb-3">
+            <input
+              ref={uploadInputRef}
+              type="file"
+              accept=".xlsx,.xls,.csv,.pdf,.txt,.md,.docx,.json"
+              style={{ display: 'none' }}
+              onChange={handleFileUpload}
+            />
+            <button
+              type="button"
+              onClick={() => uploadInputRef.current?.click()}
+              disabled={docProcessing}
+              className="w-full flex items-center gap-3 p-3 rounded-xl bg-gradient-to-br from-blue-50 to-indigo-50 border border-blue-200 hover:border-blue-300 transition-all text-left shadow-sm active:scale-[0.99]"
+            >
+              <div className="p-2 bg-white rounded-lg text-blue-600 shrink-0 shadow-sm">
+                {docProcessing ? <Loader2 size={18} className="animate-spin" /> : <Upload size={18} />}
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="text-sm font-bold text-slate-800">
+                  {docProcessing ? 'Reading your document…' : 'Have it already in a doc?'}
+                </div>
+                <div className="text-[11px] text-slate-500 leading-snug">
+                  Upload any spreadsheet, PDF, or Sheets export — we'll extract everything and fill this form for you.
+                </div>
+              </div>
+              <ChevronRight size={16} className="text-blue-400 shrink-0" />
+            </button>
+          </div>
+        )}
+
         {/* Section picker button */}
         <button
           onClick={() => setShowSectionPicker(prev => !prev)}
@@ -569,6 +724,14 @@ export function HostPortalView() {
           )}
         </div>
       </div>
+
+      <ReingestReviewModal
+        open={reingestState !== null}
+        doc={reingestState?.doc ?? null}
+        diff={reingestState?.diff ?? null}
+        onCancel={() => setReingestState(null)}
+        onApply={applyHostReingest}
+      />
     </div>
   );
 }

@@ -1060,7 +1060,7 @@ export function FormBuilderView() {
           <div className="flex items-center gap-1.5 text-xs text-slate-400 mb-2">
             <button onClick={() => navigate('/settings')} className="hover:text-indigo-600 transition-colors">Settings</button>
             <ChevronRight size={10} />
-            <span className="text-slate-700 font-medium">Form Builder</span>
+            <span className="text-slate-700 font-medium">Knowledge Requirements</span>
           </div>
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-4">
@@ -1070,9 +1070,9 @@ export function FormBuilderView() {
               <div>
                 <h1 className="text-lg font-bold text-slate-800 flex items-center gap-2">
                   <Settings2 size={20} className="text-indigo-600" />
-                  Onboarding Form Builder
+                  Knowledge Requirements
                 </h1>
-                <p className="text-xs text-slate-500">Customize what fields hosts fill out when onboarding a property. Drag to reorder.</p>
+                <p className="text-xs text-slate-500">What facts must the AI find for a property to be considered ready? These fields drive the extraction schema for document imports and the gap detector on Go Live.</p>
               </div>
             </div>
             <div className="flex gap-2 items-center">

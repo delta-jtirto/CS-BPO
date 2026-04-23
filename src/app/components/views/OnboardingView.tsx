@@ -15,6 +15,11 @@ import { MOCK_HOSTS } from '../../data/mock-data';
 import { useAppContext } from '../../context/AppContext';
 import type { OnboardingSection, OnboardingField } from '../../data/onboarding-template';
 import { importDocumentAI } from '../../ai/api-client';
+import type { KnowledgeChunk, IngestedDocument } from '../../data/types';
+import { normalizeDocument } from '../../lib/doc-normalize';
+import { ingestDocument, IngestAbortedError } from '../../ai/import-router';
+import { diffReingest, type DiffOutcome } from '../../lib/reingest-diff';
+import { ReingestReviewModal, type ReingestDecision } from './ReingestReviewModal';
 
 const SECTION_ICONS: Record<string, React.ReactNode> = {
   basics: <MapPin size={16} />,
@@ -106,6 +111,9 @@ export function OnboardingView() {
     customFormSections, addCustomFormSection, removeCustomFormSection, renameCustomFormSection,
     formTemplate, formPhases,
     importAiModel,
+    // Unified ingest pipeline (Phase 1)
+    knowledgeChunks, ingestedDocuments, upsertKnowledgeChunks, updateKnowledgeChunk, upsertIngestedDocument,
+    promptOverrides,
   } = useAppContext();
 
   // Use mutable form template from context instead of static import
@@ -251,22 +259,54 @@ export function OnboardingView() {
     return map;
   }, [sectionCompletion, formPhases, sectionsByPhase]);
 
-  const isPhase1Complete = useMemo(() => {
+  // Named missing critical fields — powers the coverage-gap panel in the
+  // Go Live banner. Each item links back to the section + room so agents
+  // can click through and fill (or re-import).
+  const missingPhase1Fields = useMemo(() => {
+    const missing: { sectionId: string; sectionTitle: string; fieldLabel: string; roomIndex?: number; roomName?: string }[] = [];
     for (const section of PHASE_1_SECTIONS) {
       if (section.perRoom) {
         for (let r = 0; r < roomLabels.length; r++) {
           for (const field of section.fields) {
-            if (field.required && !formData[`${section.id}__room${r}__${field.id}`]?.trim()) return false;
+            if (field.required && !formData[`${section.id}__room${r}__${field.id}`]?.trim()) {
+              missing.push({
+                sectionId: section.id,
+                sectionTitle: section.title,
+                fieldLabel: field.label,
+                roomIndex: r,
+                roomName: roomLabels[r],
+              });
+            }
           }
         }
       } else {
         for (const field of section.fields) {
-          if (field.required && !formData[`${section.id}__${field.id}`]?.trim()) return false;
+          if (field.required && !formData[`${section.id}__${field.id}`]?.trim()) {
+            missing.push({
+              sectionId: section.id,
+              sectionTitle: section.title,
+              fieldLabel: field.label,
+            });
+          }
         }
       }
     }
-    return true;
-  }, [formData, roomLabels]);
+    return missing;
+  }, [PHASE_1_SECTIONS, formData, roomLabels]);
+
+  const isPhase1Complete = missingPhase1Fields.length === 0;
+
+  // Pending-review count for the Inspect Knowledge button badge —
+  // drives the user to the Inspector's triage mode when the AI left
+  // anything unmapped or low-confidence. Scoped to this property plus
+  // host-global entries (which also feed this property's AI context).
+  const pendingReviewCount = useMemo(() => {
+    if (!prop) return 0;
+    return knowledgeChunks.filter(c =>
+      c.status === 'pending_review' &&
+      (c.propId === propertyId || (c.propId === null && c.hostId === prop.hostId))
+    ).length;
+  }, [knowledgeChunks, prop, propertyId]);
 
   const currentSection = ONBOARDING_SECTIONS.find(s => s.id === activeSection) || ONBOARDING_SECTIONS[0];
   const currentIndex = ONBOARDING_SECTIONS.findIndex(s => s.id === activeSection);
@@ -294,102 +334,191 @@ export function OnboardingView() {
     setFaqs(prev => prev.map(f => f.id === id ? { ...f, [field]: value } : f));
   };
 
-  // Unified file import handler with AI mapping
+  // Unified Phase 1 ingest pipeline. Produces typed KnowledgeChunks with
+  // provenance. Also syncs `property_fact` chunks back to `onboardingData`
+  // so the form UI visibly fills in — the form remains a write path through
+  // Phase 2, when it becomes a read-only projection.
+  const [reingestState, setReingestState] = useState<{
+    doc: IngestedDocument;
+    diff: DiffOutcome;
+  } | null>(null);
+
+  // AbortController for the in-flight ingest. Held in a ref so the overlay's
+  // Cancel button can reach it without re-rendering the entire view tree.
+  const ingestAbortRef = useRef<AbortController | null>(null);
+
+  const cancelIngest = () => {
+    if (!ingestAbortRef.current) return;
+    const confirmed = window.confirm(
+      'Cancel import?\n\n' +
+      'The AI tokens already spent analyzing this document will be wasted. ' +
+      'Any sections classified so far will be dropped — no partial results are saved.\n\n' +
+      'Are you sure you want to stop?'
+    );
+    if (!confirmed) return;
+    ingestAbortRef.current.abort();
+    // Don't clear docProcessing here — the catch block in handleFileImport
+    // will do it after the abort unwinds the in-flight promise.
+  };
+
   const handleFileImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !propertyId) return;
+    e.target.value = '';
 
+    const abortController = new AbortController();
+    ingestAbortRef.current = abortController;
     try {
       setDocProcessing(true);
-
-      // Read file content
-      const fileContent = await readFileAsText(file);
-      if (!fileContent) {
-        throw new Error('Could not read file');
+      const normalized = await normalizeDocument(file);
+      if (normalized.error) {
+        toast.error('Parse failed', { description: normalized.error });
+        setDocProcessing(false);
+        return;
       }
 
-      // Build form field schema for Claude
-      const fieldSchema = buildFormFieldSchema(ONBOARDING_SECTIONS, prop?.units || 1);
+      // Skip Stage B if nothing changed.
+      const prior = ingestedDocuments.find(d => d.filename === file.name && d.propId === propertyId);
+      if (prior && prior.contentHash === normalized.contentHash) {
+        toast.info('Nothing changed', { description: `${file.name} is identical to the last upload.` });
+        setDocProcessing(false);
+        return;
+      }
 
-      // Call Claude to map the data via server proxy (no client-side API key needed)
-      const systemPrompt = `You are an AI that extracts property information from documents and maps it to structured form fields.
-Respond ONLY with valid JSON (no markdown, no explanation).
+      const roomNames = prop?.roomNames ?? (prop?.units === 1 ? ['Entire Property'] : Array.from({ length: prop?.units ?? 1 }, (_, i) => `Unit ${i + 1}`));
+      const result = await ingestDocument(
+        normalized,
+        { hostId: prop?.hostId ?? '', propId: propertyId, roomNames, promptOverrides, signal: abortController.signal },
+        ONBOARDING_SECTIONS,
+        'user',
+      );
 
-Rules:
-- Only include fields where you found a real value in the document. Omit fields with no data.
-- For fields with type "select": the value MUST exactly match one of the listed options. If nothing matches, omit the field.
-- For fields with type "time": use HH:MM 24-hour format (e.g. "15:00" for 3 PM, "11:00" for 11 AM). Never include text like "By" or "AM/PM".
-- For fields with type "number": output digits only (e.g. "8" not "8 units").
-- Do NOT copy placeholder examples from the schema as values.
-- If the document contains a FAQ section with guest questions and answers, include them as "faqs": [{"question": "...", "answer": "..."}, ...]`;
-
-      const toonSchema = schemaToTOON(fieldSchema);
-
-      const userPrompt = `Extract property information from this document and map it to the form fields below.
-File: "${file.name}"
-
-Field schema (id: Label — with type hints: # = number, @time = HH:MM 24h, [A|B] = pick one exactly):
-${toonSchema}
-
-Document:
-${fileContent.substring(0, 1000000)}
-
-Output ONLY a JSON object. For regular fields use flat keys. For FAQs use a "faqs" array. Example:
-{"basics__address": "123 Main St", "checkinout__checkinTime": "15:00", "faqs": [{"question": "Is there parking?", "answer": "Yes, one space is available."}]}`;
-
-      const result = await importDocumentAI({
-        model: importAiModel,
-        systemPrompt,
-        userPrompt,
-        attachment: fileContent.substring(0, 1000000),
-      });
-
-      // Parse Claude's response — extract FAQs separately before field coercion
-      let rawJson: any = {};
-      try {
-        const jsonMatch = result.text.match(/\{[\s\S]*\}/);
-        if (jsonMatch) rawJson = JSON.parse(jsonMatch[0]);
-      } catch { /* ignore parse errors */ }
-
-      const extractedFaqs: FAQItem[] = (rawJson.faqs || [])
-        .filter((f: any) => f.question?.trim() && f.answer?.trim())
-        .map((f: any, i: number) => ({ id: String(i + 1), question: f.question.trim(), answer: f.answer.trim() }));
-
-      // Remove faqs from the object before field mapping
-      delete rawJson.faqs;
-      const mappedData = parseAIResponse(JSON.stringify(rawJson), fieldSchema);
-      const fieldCount = Object.keys(mappedData).length + extractedFaqs.length;
-
-      if (fieldCount === 0) {
-        toast.warning('No data extracted', {
-          description: 'Claude could not extract any recognizable property information from this file.',
+      if (result.chunks.length === 0) {
+        toast.warning('No knowledge extracted', {
+          description: result.sectionErrors.length > 0
+            ? result.sectionErrors.map(e => e.label).join(', ')
+            : 'The router found nothing actionable in this document.',
         });
         setDocProcessing(false);
         return;
       }
 
-      // Show preview before applying
-      setDocProcessing(false);
-      setImportPreview({ data: mappedData, schema: fieldSchema, fileName: file.name, faqs: extractedFaqs.length > 0 ? extractedFaqs : undefined });
-    } catch (err: any) {
-      console.error('File import error:', err);
-      toast.error('Import failed', { description: err.message || 'Unknown error' });
-      setDocProcessing(false);
-    }
+      const existingScoped = knowledgeChunks.filter(c => c.propId === propertyId);
+      const diff = diffReingest({
+        newChunks: result.chunks,
+        existingChunks: existingScoped,
+        docId: result.doc.id,
+        previousDocId: prior?.id,
+      });
 
-    e.target.value = '';
+      setReingestState({ doc: result.doc, diff });
+      setDocProcessing(false);
+    } catch (err) {
+      if (err instanceof IngestAbortedError || abortController.signal.aborted) {
+        toast.info('Import cancelled');
+      } else {
+        console.error('File import error:', err);
+        toast.error('Import failed', {
+          description: err instanceof Error ? err.message : String(err),
+        });
+      }
+      setDocProcessing(false);
+    } finally {
+      ingestAbortRef.current = null;
+    }
   };
 
+  // Commit reingest decisions. In addition to writing KnowledgeChunks,
+  // mirror `property_fact` chunks into `onboardingData` (via setOnboardingBulk)
+  // and `faq` chunks into the FAQs list so the existing form UI shows the
+  // newly imported values immediately.
+  const applyReingest = (decisions: ReingestDecision[]) => {
+    if (!reingestState || !propertyId) return;
+    const { doc, diff } = reingestState;
+
+    const chunksToCommit: KnowledgeChunk[] = [];
+    const archiveIds = new Set(diff.toArchive);
+
+    const pendingProposedIds = new Set(
+      diff.pendingReview.map(p => p.proposed?.id).filter((id): id is string => !!id)
+    );
+    for (const c of diff.toInsert) {
+      if (pendingProposedIds.has(c.id)) continue;
+      chunksToCommit.push(c);
+    }
+    for (const decision of decisions) {
+      const item = diff.pendingReview[decision.itemIndex];
+      if (!item) continue;
+      if (decision.choice === 'use_new' && item.proposed) {
+        if (item.existing) archiveIds.add(item.existing.id);
+        chunksToCommit.push({ ...item.proposed, status: 'active' });
+      } else if (decision.choice === 'skip' && item.proposed) {
+        chunksToCommit.push({ ...item.proposed, status: 'pending_review' });
+      }
+      // keep_existing → nothing to write
+    }
+
+    // Archive superseded + commit new
+    for (const id of archiveIds) updateKnowledgeChunk(id, { status: 'archived' });
+    for (const id of diff.toUnlink) updateKnowledgeChunk(id, { supersedes: undefined });
+    upsertKnowledgeChunks(chunksToCommit);
+    upsertIngestedDocument(doc);
+
+    // ── Sync property_fact chunks back to legacy onboardingData ─────────
+    // The form still reads from onboardingData; until Phase 2 flips that,
+    // mirror active property_fact values into the form-field keys so the
+    // UI visibly fills in after import.
+    const formPatch: Record<string, string> = {};
+    const extractedFaqs: FAQItem[] = [];
+    const active = chunksToCommit.filter(c => c.status === 'active');
+
+    for (const c of active) {
+      if (c.kind === 'property_fact' && c.slotKey) {
+        // slotKey shape: property_fact:<sectionId>:<fieldId>[:room<N>]
+        const parts = c.slotKey.split(':');
+        if (parts.length >= 3 && parts[0] === 'property_fact') {
+          const sectionId = parts[1];
+          const fieldId = parts[2];
+          const roomPart = parts[3];
+          const key = roomPart
+            ? `${sectionId}__${roomPart}__${fieldId}`
+            : `${sectionId}__${fieldId}`;
+          formPatch[key] = c.body;
+        }
+      } else if (c.kind === 'faq') {
+        const q = (c.structured?.question as string | undefined) ?? c.title;
+        const a = (c.structured?.answer as string | undefined) ?? c.body;
+        if (q.trim() && a.trim()) {
+          extractedFaqs.push({
+            id: String(extractedFaqs.length + 1),
+            question: q.trim(),
+            answer: a.trim(),
+          });
+        }
+      }
+    }
+
+    if (Object.keys(formPatch).length > 0) {
+      setOnboardingBulk(propertyId, formPatch);
+    }
+    if (extractedFaqs.length > 0) {
+      setFaqs(extractedFaqs);
+    }
+
+    const addedCount = active.length;
+    toast.success(`Imported from "${doc.filename}"`, {
+      description: `${addedCount} new · ${archiveIds.size} archived · ${decisions.length} resolved`,
+    });
+    setReingestState(null);
+  };
+
+  // Legacy confirmImport retained as a no-op shim so the JSX preview UI
+  // doesn't crash if it still references it. Real confirm is `applyReingest`
+  // above, triggered through ReingestReviewModal.
   const confirmImport = () => {
     if (!importPreview || !propertyId) return;
     setOnboardingBulk(propertyId, importPreview.data);
-    if (importPreview.faqs && importPreview.faqs.length > 0) {
-      setFaqs(importPreview.faqs);
-    }
-    const fieldCount = Object.keys(importPreview.data).length + (importPreview.faqs?.length || 0);
-    toast.success(`Imported ${fieldCount} fields from "${importPreview.fileName}"`, {
-      description: isActive ? 'AI knowledge will update automatically.' : 'Form fields updated.',
-    });
+    if (importPreview.faqs && importPreview.faqs.length > 0) setFaqs(importPreview.faqs);
     setImportPreview(null);
   };
 
@@ -870,7 +999,7 @@ Output ONLY a JSON object. For regular fields use flat keys. For FAQs use a "faq
           <span className="text-slate-600 font-medium">{prop.name}</span>
         </div>
 
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-y-2">
           <div className="flex items-center gap-3">
             <button onClick={() => navigate('/kb')} className="p-1.5 hover:bg-slate-100 rounded-lg transition-colors text-slate-400 hover:text-slate-700">
               <ArrowLeft size={18} />
@@ -969,8 +1098,10 @@ Output ONLY a JSON object. For regular fields use flat keys. For FAQs use a "faq
               </div>
             </div>
 
-            {/* Action Buttons */}
-            <div className="flex items-center gap-2">
+            {/* Action Buttons — wrap to a second row on narrow viewports so
+                no button gets clipped off-screen. Keeps each button visible
+                and tappable without introducing horizontal scroll. */}
+            <div className="flex flex-wrap items-center gap-2">
               <input
                 ref={fileInputRef}
                 type="file"
@@ -984,6 +1115,25 @@ Output ONLY a JSON object. For regular fields use flat keys. For FAQs use a "faq
                 disabled={docProcessing}
               >
                 📊 Import
+              </button>
+              <button
+                onClick={() => navigate(`/kb/${propertyId}/inspector`)}
+                className={`px-3 py-1.5 text-xs rounded-lg flex items-center gap-1.5 border transition-colors font-medium relative ${
+                  pendingReviewCount > 0
+                    ? 'bg-amber-50 text-amber-800 border-amber-200 hover:bg-amber-100'
+                    : 'text-slate-700 hover:bg-slate-100 border-slate-200'
+                }`}
+                title={pendingReviewCount > 0
+                  ? `${pendingReviewCount} ${pendingReviewCount === 1 ? 'entry needs' : 'entries need'} review`
+                  : 'Browse all imported knowledge'
+                }
+              >
+                <Search size={12} /> Inspect
+                {pendingReviewCount > 0 && (
+                  <span className="ml-0.5 px-1.5 py-0.5 text-[9px] font-bold rounded-full bg-amber-600 text-white tabular-nums">
+                    {pendingReviewCount}
+                  </span>
+                )}
               </button>
               <button
                 onClick={() => setShowPortalLink(true)}
@@ -1016,13 +1166,34 @@ Output ONLY a JSON object. For regular fields use flat keys. For FAQs use a "faq
         </div>
       </div>
 
-      {/* Processing overlay */}
+      {/* Processing overlay — modal-behavior: the backdrop intentionally
+          does NOT dismiss. Only the explicit Cancel button (with a
+          confirmation prompt) stops the in-flight AI call. This protects
+          agents from fat-fingering away tokens mid-analysis. */}
       {docProcessing && (
-        <div className="absolute inset-0 bg-white/80 z-40 flex items-center justify-center">
-          <div className="bg-white border border-slate-200 rounded-xl shadow-lg p-8 text-center animate-in zoom-in-95 duration-200">
+        <div
+          className="absolute inset-0 bg-white/80 z-40 flex items-center justify-center"
+          // Swallow backdrop clicks so an accidental tap outside the card
+          // never bubbles up to dismiss anything behind.
+          onClick={e => e.stopPropagation()}
+          onPointerDown={e => e.stopPropagation()}
+        >
+          <div className="bg-white border border-slate-200 rounded-xl shadow-lg p-8 text-center animate-in zoom-in-95 duration-200 max-w-sm">
             <Loader2 size={32} className="mx-auto text-indigo-500 animate-spin mb-4" />
             <h3 className="font-bold text-slate-800 mb-1">Processing Document</h3>
-            <p className="text-sm text-slate-500">AI is reading the document and extracting property information...</p>
+            <p className="text-sm text-slate-500 mb-4">
+              AI is reading the document and extracting property information...
+            </p>
+            <p className="text-[10px] text-slate-400 mb-4 leading-relaxed">
+              Stay on this page. Closing the tab or navigating away will lose progress.
+            </p>
+            <button
+              type="button"
+              onClick={cancelIngest}
+              className="text-xs font-medium text-slate-500 hover:text-red-600 transition-colors underline underline-offset-2 decoration-slate-300 hover:decoration-red-400"
+            >
+              Cancel import
+            </button>
           </div>
         </div>
       )}
@@ -1248,14 +1419,14 @@ Output ONLY a JSON object. For regular fields use flat keys. For FAQs use a "faq
             );
           })()}
 
-          {/* Form Builder cross-link */}
+          {/* Knowledge Requirements cross-link */}
           <div className="mt-auto p-3 border-t border-slate-100">
             <button
               onClick={() => navigate('/settings/form-builder')}
               className="w-full flex items-center gap-2 px-3 py-2 text-[10px] text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors"
             >
               <Settings2 size={12} />
-              <span>Customize form fields</span>
+              <span>Edit knowledge requirements</span>
               <ChevronRight size={10} className="ml-auto" />
             </button>
           </div>
@@ -1518,13 +1689,38 @@ Output ONLY a JSON object. For regular fields use flat keys. For FAQs use a "faq
             )}
 
             {!isPhase1Complete && !isCustomSection && isOnboarding && (
-              <div className="mt-6 bg-amber-50 border border-amber-200 rounded-lg p-4 flex items-start gap-3">
-                <AlertTriangle size={18} className="text-amber-500 mt-0.5 shrink-0" />
-                <div>
-                  <p className="text-sm font-bold text-amber-800">Required Fields Incomplete</p>
-                  <p className="text-xs text-amber-600 mt-1">
-                    Complete all required fields (marked with <span className="text-red-400 font-bold">*</span>) in the Core Info sections before going live. Guest Experience sections can be completed afterwards.
-                  </p>
+              <div className="mt-6 bg-amber-50 border border-amber-200 rounded-lg p-4">
+                <div className="flex items-start gap-3">
+                  <AlertTriangle size={18} className="text-amber-500 mt-0.5 shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-bold text-amber-800">
+                      {missingPhase1Fields.length} critical {missingPhase1Fields.length === 1 ? 'fact' : 'facts'} missing
+                    </p>
+                    <p className="text-xs text-amber-600 mt-1 mb-2">
+                      These are the facts the AI needs before we can go live. Upload a doc above to fill them in bulk, or click a gap to jump to its section.
+                    </p>
+                    <div className="flex flex-wrap gap-1.5 mt-2">
+                      {missingPhase1Fields.slice(0, 12).map((gap, i) => (
+                        <button
+                          key={`${gap.sectionId}-${gap.roomIndex ?? 'p'}-${i}`}
+                          type="button"
+                          onClick={() => {
+                            setActiveSection(gap.sectionId);
+                            if (gap.roomIndex !== undefined) setActiveRoomTab(gap.roomIndex);
+                          }}
+                          className="text-[10px] px-2 py-1 bg-white border border-amber-300 text-amber-800 rounded-full hover:bg-amber-100 transition-colors flex items-center gap-1"
+                        >
+                          <span className="font-medium">{gap.fieldLabel}</span>
+                          {gap.roomName && <span className="text-amber-500">· {gap.roomName}</span>}
+                        </button>
+                      ))}
+                      {missingPhase1Fields.length > 12 && (
+                        <span className="text-[10px] px-2 py-1 text-amber-600">
+                          + {missingPhase1Fields.length - 12} more
+                        </span>
+                      )}
+                    </div>
+                  </div>
                 </div>
               </div>
             )}
@@ -1710,6 +1906,14 @@ Output ONLY a JSON object. For regular fields use flat keys. For FAQs use a "faq
           </div>
         </div>
       )}
+
+      <ReingestReviewModal
+        open={reingestState !== null}
+        doc={reingestState?.doc ?? null}
+        diff={reingestState?.diff ?? null}
+        onCancel={() => setReingestState(null)}
+        onApply={applyReingest}
+      />
     </div>
   );
 }

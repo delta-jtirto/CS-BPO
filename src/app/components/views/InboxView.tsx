@@ -444,6 +444,26 @@ export function InboxView() {
   ) : false;
 
   const [replyText, setReplyText] = useState('');
+
+  // ── AI Draft → composer (Superhuman-style composer replacement) ──
+  // The AI-generated draft pre-fills the textarea so the agent reviews and
+  // edits in place — no separate preview card stacked on top of a second
+  // empty textarea. Authorship is preserved via a text-equality check at
+  // send time: if the agent never modified the draft, handleSendMessage
+  // routes through addBotMessage (AI attribution in thread history);
+  // otherwise the reply is agent-authored.
+  const lastHydratedDraftRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (activeDraft && lastHydratedDraftRef.current !== activeDraft) {
+      // Hydrate only when the composer is empty — never stomp mid-typing.
+      setReplyText(prev => (prev === '' ? activeDraft : prev));
+      lastHydratedDraftRef.current = activeDraft;
+    } else if (!activeDraft) {
+      lastHydratedDraftRef.current = null;
+    }
+  }, [activeDraft]);
+  const isUnmodifiedDraft = !!activeDraft && replyText.trim() === activeDraft.trim();
+
   const [showResolveConfirm, setShowResolveConfirm] = useState(false);
   const [rightTab, setRightTab] = useState<'assistant' | 'details'>('assistant');
   const [headerPropertyOpen, setHeaderPropertyOpen] = useState(false);
@@ -712,16 +732,24 @@ export function InboxView() {
       setReplyText('');
       toast.success('Guest message injected (test)', { description: `Sent as ${activeTicket.guestName}. AI will respond if enabled.` });
     } else {
-      // #18: If sending a draft as-is, add audit trail system message
-      if (activeDraft && replyText.trim() === activeDraft.trim()) {
-        addSystemMessage(activeTicket.id, `Draft sent as-is — Agent sent the AI-drafted reply without edits.`);
-      }
+      const sendingUnmodifiedDraft = !!activeDraft && replyText.trim() === activeDraft.trim();
+
       // Auto-clear Follow-up badge when agent replies after a partial status
       const lastSys = [...getMessages(activeTicket)].reverse().find(m => m.sender === 'system');
       if (lastSys && parseThreadStatus(lastSys.text) === 'partial') {
         addSystemMessage(activeTicket.id, `AI handled — Agent followed up.`);
       }
-      addMessageToTicket(activeTicket.id, replyText.trim());
+
+      if (sendingUnmodifiedDraft) {
+        // Composer-replacement path: agent reviewed the AI draft and sent it
+        // verbatim. Route through addBotMessage so the thread history shows
+        // AI attribution, and emit an audit system message for review.
+        addBotMessage(activeTicket.id, replyText.trim());
+        addSystemMessage(activeTicket.id, `Draft sent as-is — Agent reviewed and sent the AI-drafted reply without edits.`);
+      } else {
+        // Either no draft, or the agent edited it — human-authored message.
+        addMessageToTicket(activeTicket.id, replyText.trim());
+      }
       // AI re-classification (triggered by classifyKey change in AssistantPanel)
       // handles resolution detection — no heuristic needed here.
 
@@ -1672,7 +1700,7 @@ export function InboxView() {
               pendingDeletes.has(msg.id) ? 'opacity-20 scale-95 pointer-events-none' : ''
             } ${
               msg.sender === 'guest' ? `self-start ${isMobile ? 'max-w-[90%]' : 'max-w-[80%]'}` :
-              msg.sender === 'system' ? 'self-center w-full max-w-[560px] my-1' :
+              msg.sender === 'system' ? 'self-center w-full my-1' :
               `self-end ${isMobile ? 'max-w-[90%]' : 'max-w-[80%]'}`
             }`}
               onContextMenu={msg.sender !== 'system' && !pendingDeletes.has(msg.id) ? (e) => handleMsgContextMenu(e, msg.id, msg.text, msg.sender) : undefined}
@@ -1693,8 +1721,9 @@ export function InboxView() {
                   const divider = (colorLine: string, textCls: string, Icon: any, text: string) => (
                     <div className={`flex items-center gap-2 text-[10px] ${textCls} w-full min-w-0`}>
                       <div className={`flex-1 h-px ${colorLine} shrink`} />
-                      <span className={`flex items-center gap-1 min-w-0 truncate font-medium`}>
-                        <Icon size={10} className="shrink-0" />{text}
+                      <span className={`flex items-start gap-1 min-w-0 font-medium`} title={text}>
+                        <Icon size={10} className="shrink-0 mt-[2px]" />
+                        <span className="line-clamp-2 break-words">{text}</span>
                       </span>
                       <div className={`flex-1 h-px ${colorLine} shrink`} />
                     </div>
@@ -1992,47 +2021,24 @@ export function InboxView() {
           guestMode ? 'bg-emerald-50/80 border-emerald-200' : 'bg-white border-slate-200'
         }`}>
           {activeDraft && !guestMode && (
-            <div className="mb-3 bg-violet-50 border border-violet-200 rounded-xl p-3 animate-in slide-in-from-bottom-2 duration-200">
-              <div className="flex items-center gap-2 mb-2">
-                <FileEdit size={12} className="text-violet-600" />
-                <span className="text-[10px] font-bold text-violet-700 uppercase tracking-wider">AI Draft — Review before sending</span>
-              </div>
-              <p className="text-sm text-slate-700 leading-relaxed mb-3 bg-white rounded-lg p-2.5 border border-violet-100 max-h-[120px] overflow-y-auto">
-                {activeDraft}
-              </p>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => {
-                    if (activeTicket) {
-                      addBotMessage(activeTicket.id, activeDraft);
-                      clearDraftReply(activeTicket.id);
-                      toast.success('Draft sent as AI Auto-Reply');
-                    }
-                  }}
-                  className="text-[11px] font-medium px-3 py-1.5 rounded-lg bg-violet-600 text-white hover:bg-violet-700 transition-colors flex items-center gap-1"
-                >
-                  <Send size={11} /> Send as-is
-                </button>
-                <button
-                  onClick={() => {
-                    setReplyText(activeDraft);
-                    if (activeTicket) clearDraftReply(activeTicket.id);
-                    toast.info('Draft moved to compose box — edit and send when ready');
-                  }}
-                  className="text-[11px] font-medium px-3 py-1.5 rounded-lg bg-white border border-violet-200 text-violet-700 hover:bg-violet-50 transition-colors flex items-center gap-1"
-                >
-                  <FileEdit size={11} /> Edit first
-                </button>
-                <button
-                  onClick={() => {
-                    if (activeTicket) clearDraftReply(activeTicket.id);
-                    toast('Draft discarded');
-                  }}
-                  className="text-[11px] font-medium px-3 py-1.5 rounded-lg text-slate-400 hover:text-red-500 transition-colors flex items-center gap-1"
-                >
-                  <X size={11} /> Discard
-                </button>
-              </div>
+            <div className="flex items-center gap-1.5 mb-1.5 px-2 py-1 bg-violet-50 border border-violet-200 rounded-lg animate-in slide-in-from-bottom-1 duration-200">
+              <FileEdit size={10} className="text-violet-600 shrink-0" />
+              <span className="text-[10px] font-semibold text-violet-700 flex-1 truncate">
+                {isUnmodifiedDraft
+                  ? 'AI Draft — edit below or send as-is'
+                  : 'AI Draft · edited — will send as your reply'}
+              </span>
+              <button
+                onClick={() => {
+                  if (activeTicket) clearDraftReply(activeTicket.id);
+                  if (isUnmodifiedDraft) setReplyText('');
+                  toast('AI draft dismissed');
+                }}
+                title={isUnmodifiedDraft ? 'Dismiss AI draft' : 'Dismiss AI draft (keeps your edits)'}
+                className="text-slate-400 hover:text-red-500 transition-colors shrink-0 p-0.5"
+              >
+                <X size={11} />
+              </button>
             </div>
           )}
           {/* Context switching protection: show which company/channel this reply goes to */}
@@ -2089,7 +2095,9 @@ export function InboxView() {
                 ? 'ring-2 ring-indigo-300 bg-indigo-50/40 border-indigo-200'
                 : guestMode
                   ? 'border-2 border-emerald-300 bg-white focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 placeholder:text-emerald-400'
-                  : 'border border-slate-200 bg-slate-50/60 focus:ring-2 focus:ring-indigo-400 focus:border-indigo-300 placeholder:text-slate-400'
+                  : activeDraft
+                    ? 'border border-violet-300 bg-violet-50/40 focus:ring-2 focus:ring-violet-400 focus:border-violet-400 placeholder:text-slate-400'
+                    : 'border border-slate-200 bg-slate-50/60 focus:ring-2 focus:ring-indigo-400 focus:border-indigo-300 placeholder:text-slate-400'
             }`}
           />
           <div className="flex items-center justify-between mt-1.5 gap-2">

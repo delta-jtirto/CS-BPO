@@ -1,5 +1,5 @@
 import React from 'react';
-import { Check, Minus, Pencil, AlertTriangle } from 'lucide-react';
+import { Check, Minus, Pencil, AlertTriangle, BookOpen } from 'lucide-react';
 import { ScrollArea } from '@/app/components/ui/scroll-area';
 import { SmartReplyHeader } from './SmartReplyHeader';
 import type { SmartReplyState, SmartReplyPanelProps } from './types';
@@ -36,6 +36,49 @@ export function SmartReplyPreview({
           <p className="text-sm text-slate-700 whitespace-pre-wrap leading-relaxed">{composedMessage}</p>
         </ScrollArea>
       </div>
+
+      {/* Citations — which KB entries fed this reply. Agents who need to
+          verify a fact can follow the trail back to the source chunk. Keeps
+          provenance visible without forcing a click when unnecessary. */}
+      {(() => {
+        const seen = new Set<string>();
+        const sources: { title: string; source?: string }[] = [];
+        for (const inq of inquiries) {
+          const matches = kbMatchesByInquiry[inq.id] ?? [];
+          for (const m of matches) {
+            const title = m.entry.title;
+            if (!title || seen.has(title)) continue;
+            seen.add(title);
+            // Back-compat label for provenance — maps the new ChunkSource
+            // shape to the short human-readable tags the citation row
+            // previously showed.
+            const sourceLabel =
+              m.entry.source.type === 'form' ? 'onboarding form' :
+              m.entry.source.type === 'doc_ingest' ? (m.entry.source.docSheet ?? 'imported doc') :
+              m.entry.source.type === 'portal' ? 'host portal' :
+              undefined;
+            sources.push({ title, source: sourceLabel });
+          }
+        }
+        if (sources.length === 0) return null;
+        return (
+          <div className="px-4 pb-2">
+            <div className="flex items-start gap-1.5 text-[10px] text-slate-500">
+              <BookOpen size={10} className="mt-0.5 shrink-0 text-slate-400" />
+              <span className="leading-relaxed">
+                <span className="text-slate-400 mr-1">Drew from:</span>
+                {sources.map((s, i) => (
+                  <span key={s.title}>
+                    <span className="text-slate-600">{s.title}</span>
+                    {s.source && <span className="text-slate-400"> ({s.source})</span>}
+                    {i < sources.length - 1 && <span className="text-slate-300"> · </span>}
+                  </span>
+                ))}
+              </span>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Partial coverage warning */}
       {uncoveredCount > 0 && coveredCount > 0 && (

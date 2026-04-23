@@ -11,6 +11,7 @@ import {
   type ContextItem,
 } from '../InquiryDetector';
 import { composeReplyAI } from '../../../ai/api-client';
+import { buildPropertyContext } from '../../../ai/kb-context';
 import {
   interpolate,
   resolvePrompt,
@@ -46,7 +47,35 @@ function buildGuestInsights(inquiries: DetectedInquiry[]): string {
 }
 
 export function useSmartReply({ ticket, existingDraft, cacheRef, aiInquiries }: SmartReplyPanelProps): SmartReplyState {
-  const { kbEntries, agentName, hasApiKey, aiModel, promptOverrides, properties, proxyCompanyIds } = useAppContext();
+  const {
+    agentName, hasApiKey, aiModel, promptOverrides, properties, proxyCompanyIds,
+    knowledgeChunks, onboardingData, formTemplate,
+  } = useAppContext();
+
+  // Full guest-facing property context — same shape that feeds auto_reply
+  // and ask_ai. Compose/polish prompts need BOTH the per-inquiry scored
+  // matches (for focus) AND the complete KB (for catch-all facts that
+  // don't cross the scorer's keyword threshold — house rules, off-topic
+  // property details, etc.). Without this, SmartReply's compose/polish
+  // would see strictly less than classify_inquiry / auto_reply.
+  //
+  // includeInternal is OFF because compose/polish produce guest-visible
+  // text; SOPs and urgency rules must never leak through.
+  const propContext = useMemo(() => {
+    const prop = properties.find(p => p.name === ticket.property) ?? null;
+    const roomNames = prop?.roomNames
+      ?? (prop?.units === 1 ? ['Entire Property']
+          : Array.from({ length: prop?.units ?? 1 }, (_, i) => `Unit ${i + 1}`));
+    return buildPropertyContext(
+      prop?.id ?? '',
+      ticket.property,
+      onboardingData,
+      formTemplate,
+      roomNames,
+      [], // manualKBEntries — unused since the legacy derivation was removed
+      { knowledgeChunks, hostId: ticket.host.id },
+    );
+  }, [properties, ticket.property, ticket.host.id, onboardingData, formTemplate, knowledgeChunks]);
 
   // Thread-keyed cache so a new guest message arriving mid-edit doesn't
   // silently wipe the agent's in-progress draft (the old
@@ -163,19 +192,12 @@ export function useSmartReply({ ticket, existingDraft, cacheRef, aiInquiries }: 
     }
 
     try {
-      const guestFacts: string[] = [];
-      const internalFacts: string[] = [];
-      for (const inq of inquiries) {
-        for (const m of (kbMatchesByInquiry[inq.id] || [])) {
-          const line = `[${m.entry.title}] ${m.entry.content}`;
-          if (m.entry.internal) internalFacts.push(line);
-          else guestFacts.push(line);
-        }
-      }
-
       const guestMessages = (ticket.messages || []).filter(m => m.sender === 'guest').map(m => m.text).join('\n');
 
       const insights = buildGuestInsights(aiInquiries ?? []);
+      // Raw full KB injection — no per-inquiry filtering or pre-scoring.
+      // The AI sees everything active for this property and picks what's
+      // relevant itself. Simpler, consistent with classify/ask_ai/auto_reply.
       const userPrompt = interpolate(resolvePrompt('polish_draft', 'user', promptOverrides), {
         hostName: ticket.host.name,
         hostTone: ticket.host.tone,
@@ -184,9 +206,9 @@ export function useSmartReply({ ticket, existingDraft, cacheRef, aiInquiries }: 
         language: ticket.language?.split('(')[0]?.trim() || 'English',
         guestMessages,
         agentDraft: draft,
-        guestFacingFacts: guestFacts.length > 0 ? guestFacts.join('\n') : '(none available)',
-        internalFacts: internalFacts.length > 0 ? internalFacts.join('\n') : '(none)',
-      }) + (insights ? `\n\nPre-analyzed guest insights (use to verify and enrich the draft):\n${insights}` : '');
+        propertyKB: propContext,
+      })
+        + (insights ? `\n\nPre-analyzed guest insights (use to verify and enrich the draft):\n${insights}` : '');
 
       const result = await composeReplyAI({
         systemPrompt: resolvePrompt('polish_draft', 'system', promptOverrides),
@@ -203,7 +225,7 @@ export function useSmartReply({ ticket, existingDraft, cacheRef, aiInquiries }: 
       setComposedMessage(draft);
       setPhase('preview');
     }
-  }, [inquiries, kbMatchesByInquiry, ticket, agentName, hasApiKey, aiModel]);
+  }, [inquiries, kbMatchesByInquiry, ticket, agentName, hasApiKey, aiModel, promptOverrides, aiInquiries, propContext]);
 
   // ─── Core compose function ────────────────────────────────────
   const doCompose = useCallback(async (inquiryDecisions: Record<string, InquiryDecision>) => {
@@ -218,16 +240,6 @@ export function useSmartReply({ ticket, existingDraft, cacheRef, aiInquiries }: 
           return `- ${inq.label} (${inq.detail}): ${dec.decision.toUpperCase()}${note}`;
         }).join('\n');
 
-        const guestFacts: string[] = [];
-        const internalFacts: string[] = [];
-        for (const inq of inquiries) {
-          for (const m of (kbMatchesByInquiry[inq.id] || [])) {
-            const line = `[${m.entry.title}] ${m.entry.content}`;
-            if (m.entry.internal) internalFacts.push(line);
-            else guestFacts.push(line);
-          }
-        }
-
         const guestMessages = (ticket.messages || []).filter(m => m.sender === 'guest').map(m => m.text).join('\n');
 
         const botMessages = (ticket.messages || []).filter(m => m.sender === 'bot').map(m => m.text);
@@ -236,6 +248,9 @@ export function useSmartReply({ ticket, existingDraft, cacheRef, aiInquiries }: 
           : '';
 
         const insights = buildGuestInsights(aiInquiries ?? []);
+        // Raw full KB injection — no per-inquiry filtering or pre-scoring.
+        // The AI sees everything active for this property and picks what's
+        // relevant itself. Simpler, consistent with classify/ask_ai/auto_reply.
         const userPrompt = interpolate(resolvePrompt('compose_reply', 'user', promptOverrides), {
           hostName: ticket.host.name,
           hostTone: ticket.host.tone,
@@ -244,9 +259,10 @@ export function useSmartReply({ ticket, existingDraft, cacheRef, aiInquiries }: 
           language: ticket.language?.split('(')[0]?.trim() || 'English',
           guestMessages,
           inquiryDecisions: inquiryDecisionsText,
-          guestFacingFacts: guestFacts.length > 0 ? guestFacts.join('\n') : '(none available)',
-          internalFacts: internalFacts.length > 0 ? internalFacts.join('\n') : '(none)',
-        }) + priorBotContext + (insights ? `\n\nPre-analyzed guest insights (prioritize these facts when composing):\n${insights}` : '');
+          propertyKB: propContext,
+        })
+          + priorBotContext
+          + (insights ? `\n\nPre-analyzed guest insights (prioritize these facts when composing):\n${insights}` : '');
 
         const result = await composeReplyAI({
           systemPrompt: resolvePrompt('compose_reply', 'system', promptOverrides),
@@ -277,7 +293,7 @@ export function useSmartReply({ ticket, existingDraft, cacheRef, aiInquiries }: 
         setPhase('preview');
       }, 400);
     }
-  }, [inquiries, kbMatchesByInquiry, ticket, agentName, hasApiKey, aiModel]);
+  }, [inquiries, kbMatchesByInquiry, ticket, agentName, hasApiKey, aiModel, promptOverrides, aiInquiries, propContext]);
 
   // ─── Auto-compose on mount ────────────────────────────────────
   useEffect(() => {

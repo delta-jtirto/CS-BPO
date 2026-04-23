@@ -84,6 +84,7 @@ Rules:
 - For "custom" decisions, incorporate the agent's custom note verbatim
 - Skip any inquiry the agent did not make a decision on
 - Do NOT reveal internal/agent-only notes to the guest
+- NEVER share host phone numbers, host LINE/LINE WORKS handles, internal escalation contacts, or vendor direct-dial numbers with the guest — these exist in the KB for agent escalation only. If a reply would naturally end with a contact number, omit it and say the team will follow up instead.
 - If previous replies are provided, do NOT repeat information already shared — acknowledge it and build on it
 - Keep it concise — one clear paragraph per topic, no unnecessary filler
 - End with a friendly sign-off using the agent's display name
@@ -107,11 +108,8 @@ Guest messages:
 Detected inquiries & agent decisions:
 {{inquiryDecisions}}
 
-Relevant KB facts (guest-safe):
-{{guestFacingFacts}}
-
-Internal KB facts (agent-only — do NOT share with guest, but use for context):
-{{internalFacts}}
+Property Knowledge Base (full — use whatever is relevant):
+{{propertyKB}}
 
 Compose the reply now.`;
 
@@ -126,6 +124,7 @@ Rules:
 - Address the guest by their first name
 - Reply in the same language as the draft
 - Do NOT reveal internal/agent-only KB entries to the guest
+- NEVER include host phone numbers, host LINE/LINE WORKS handles, internal escalation contacts, or vendor direct-dial numbers in the polished reply — strip them out if present in the draft; these are agent-only
 - Keep it concise — no unnecessary filler
 - End with a friendly sign-off using the agent's display name
 - Do NOT use markdown formatting — write as a plain-text message
@@ -143,11 +142,8 @@ Guest messages:
 Agent's draft to polish:
 {{agentDraft}}
 
-Relevant KB facts (use to enrich the draft if appropriate):
-{{guestFacingFacts}}
-
-Internal KB facts (agent-only context — do NOT share with guest):
-{{internalFacts}}
+Property Knowledge Base (full — use whatever is relevant):
+{{propertyKB}}
 
 Polish the agent's draft now — keep their voice but make it shine.`;
 
@@ -233,7 +229,10 @@ Rules:
 - When the KB has NO relevant data for a substantive question, DO NOT return an empty array. Instead, populate "context" with 2-4 "source":"ai" items containing concrete general hospitality knowledge the agent can use as a starting point (e.g. "Check Google Maps for '<cuisine> near <area>' — filter by 4+ stars", "Typical Japanese izakaya hours: 17:00–23:00, closed Sundays"). Agents treat these as estimates, not guaranteed facts — the "est." label in the UI signals this to them. An empty result leaves the agent with nothing to work with, which is worse than a cautious estimate.
 - Group related items under the same "section" value
 - Be specific: use actual values, concrete suggestions, and named resources — never vague filler like "I will look into this" or "I can check"
-- Leave "context" as [] ONLY for pure greetings or non-informational messages (hello, thank you, etc.) where needsKbSearch is already false. For any substantive inquiry, return at least one useful item — kb-sourced if available, ai-sourced otherwise`;
+- BE TERSE: each "text" value is ONE short actionable line (~20 words max). Do NOT paste full SOPs, step-by-step procedures, template scripts, or multi-step workflows. If the KB has a step-by-step procedure, summarize it in one line (e.g. "First-reply template in SOP 'Night Shift Flow' — escalate to M-Connect via LINE WORKS") — the agent opens the full SOP in the KB viewer. The panel is a briefing, not a reference dump.
+- Return at most ~6 items total across all sections. If a KB entry is long, pick the single most actionable sentence from it, not the whole entry.
+- Leave "context" as [] ONLY for pure greetings or non-informational messages (hello, thank you, etc.) where needsKbSearch is already false. For any substantive inquiry, return at least one useful item — kb-sourced if available, ai-sourced otherwise
+- ESCALATION CONTACT: If the inquiry is urgent/escalation (safety, no hot water, lockout, injury, major maintenance, complaints), include ONE item under section "Escalation Contact" with just the host's name + reachable channel (e.g. "M-Connect — LINE WORKS, 026-217-6269"). Agent-only — never appears in guest replies.`;
 
 export const INQUIRY_SUMMARY_USER = ``;
 
@@ -302,6 +301,7 @@ Reply rules:
 - When the answer is a "no" or a restrictive policy: acknowledge the guest's request with empathy first, state the policy briefly, then offer a path forward (e.g. suggest the team can assist, offer what IS possible, or confirm there are no exceptions). Never just recite a policy coldly — always leave the guest feeling helped, not rejected.
 - If the guest is following up on a prior "no" with "how do I..." — read the context, don't repeat the same policy again. Instead, clarify if there's a process or escalate to a human who can help them further.
 - NEVER reveal you are AI or a bot. If asked directly, deflect naturally (e.g. "I'm here to help with your stay!")
+- NEVER share host phone numbers, host LINE/LINE WORKS handles, internal escalation contacts, or vendor direct-dial numbers with the guest — the KB lists these for agent escalation only. If escalation is needed, say "I'll get someone from the team to reach out" — never give the guest a direct number to call the host.
 - NEVER reference internal systems or terminology. Forbidden phrases: "the KB", "knowledge base", "our records show", "according to our system", "our database", "I found that", "our files"
 - State facts naturally as personal knowledge — say "We have a great spot nearby — Izakaya Ryuga" NOT "the KB lists Izakaya Ryuga"
 - When you cannot answer something, use natural holdback language: "I'll check with the team and get back to you", "Let me look into that for you", "I'll need to confirm that — give me a moment", "I'll have someone from the team follow up with you shortly"
@@ -356,6 +356,86 @@ Respond with ONLY a JSON array. Example:
   { "title": "WiFi Password", "content": "Network: PropertyWiFi, Password: ...", "tags": ["wifi", "amenities"] }
 ]`;
 
+// ─── Unified Import Router ───────────────────────────────
+//
+// Called once per logical section/sheet during doc ingest. Classifies
+// content into typed KnowledgeChunk kinds and — critically — maps
+// property_fact chunks to the ONBOARDING_SECTIONS schema enum so slot
+// identity stays deterministic across re-uploads (LLMs left to invent
+// keys would generate duplicates on re-ingest).
+
+export const IMPORT_ROUTER_SYSTEM = `You are a knowledge extraction router for a property management AI.
+You receive text from ONE section (or sheet) of an uploaded document and classify its content into typed knowledge chunks.
+
+Respond ONLY with valid JSON (no markdown, no prose). Shape:
+{
+  "chunks": [
+    {
+      "kind": "property_fact" | "faq" | "sop" | "urgency_rule" | "reply_template" | "workflow",
+      "title": "<short label>",
+      "body": "<normalized content>",
+      "originalText": "<raw verbatim string from the source — unmodified>",
+      "structured": { /* per-kind fields; see below */ },
+      "slotKey": "<only for property_fact; see Slot rules>",
+      "confidence": 0.0-1.0,
+      "visibility": "internal" | "guest_facing"
+    }
+  ]
+}
+
+RULES — read carefully:
+
+1) KIND selection:
+   - property_fact  = a single discrete fact about this property (address, wifi password, checkout time, parking rate, etc.)
+   - faq            = a guest-facing question+answer pair
+   - sop            = internal operating procedure (shift flow, daily task, handover rule)
+   - urgency_rule   = situation-to-escalation mapping (e.g. "No hot water → M-Connect via LINE WORKS")
+   - reply_template = canned reply template the agent sends to guests
+   - workflow       = multi-step decision tree
+
+2) SLOT IDENTITY (property_fact ONLY):
+   - You MUST map each property_fact to an existing {sectionId, fieldId} pair from the schema below.
+   - Set slotKey = "property_fact:<sectionId>:<fieldId>[:room<N>]" (append :roomN when the section is perRoom and you can determine the room index).
+   - Put {"sectionId": "...", "fieldId": "...", "roomIndex": N (optional)} into structured.
+   - If NO existing slot matches a fact, set slotKey = null and mark kind=property_fact anyway. The agent will decide whether to discard or add a new field.
+   - Free-form kinds (faq, sop, urgency_rule, reply_template, workflow) MUST NOT have a slotKey — always null.
+
+3) PER-KIND structured shape:
+   - faq            → { "question": "...", "answer": "...", "language": "en|ja|..." (optional) }
+   - urgency_rule   → { "situation": "...", "severity": "low|medium|high", "action": "...", "escalateTo": "..." }
+   - reply_template → { "scenario": "...", "template": "...", "language": "...", "timing": "..." (optional) }
+   - sop / workflow → { "steps": [{"title":"...", "body":"..."}] } — use ONLY if the content is step-structured; otherwise omit.
+   - property_fact  → { "sectionId": "...", "fieldId": "...", "roomIndex": N (optional) }
+
+4) VISIBILITY defaults (override only when the source clearly says otherwise):
+   - faq, property_fact            → "guest_facing"
+   - sop, urgency_rule, workflow   → "internal"
+   - reply_template                → "internal" (templates guide the agent; the agent sends the message)
+
+5) originalText is LOAD-BEARING:
+   - Copy the exact raw string from the source text verbatim (trim outer whitespace only).
+   - Used by agents to verify the AI didn't paraphrase a critical nuance away.
+
+6) Confidence:
+   - 1.0 = unambiguous match to a slot / clear structure
+   - 0.7+ = good but not perfect (e.g. you had to infer the sectionId)
+   - Below 0.7 will be staged for human review — don't force-label if unsure.
+
+7) Do NOT invent facts. If the section is empty / generic boilerplate / unrelated to property knowledge, return {"chunks": []}.`;
+
+export const IMPORT_ROUTER_USER = `Classify the content of this section into typed knowledge chunks.
+
+Section label: "{{sectionLabel}}"
+Document: "{{docName}}"
+
+ONBOARDING_SECTIONS schema (use these {sectionId, fieldId} pairs for property_fact slot mapping):
+{{onboardingSchema}}
+
+Section content:
+{{sectionText}}
+
+Return JSON only.`;
+
 // ─── Prompt Override Types ───────────────────────────────
 
 export type OperationId =
@@ -365,7 +445,8 @@ export type OperationId =
   | 'classify_inquiry'
   | 'inquiry_summary'
   | 'auto_reply'
-  | 'kb_import';
+  | 'kb_import'
+  | 'import_router';
 
 export interface PromptOverride {
   system?: string;
@@ -452,6 +533,15 @@ export const PROMPT_DEFAULTS: Record<OperationId, PromptDefaults> = {
     temperature: 0.2,
     maxTokens: 3000,
     model: 'google/gemini-3.1-flash-lite-preview',
+  },
+  import_router: {
+    label: 'Import Router',
+    description: 'Classifies a document section into typed KnowledgeChunks (property_fact, faq, sop, urgency_rule, reply_template, workflow). Enforces slotKey via ONBOARDING_SECTIONS enum for deterministic re-ingest.',
+    system: IMPORT_ROUTER_SYSTEM,
+    user: IMPORT_ROUTER_USER,
+    temperature: 0.1,
+    maxTokens: 4000,
+    model: DEFAULT_MODEL,
   },
 };
 

@@ -72,12 +72,10 @@ export function useClassifyCache({
   companyIds,
 }: UseClassifyCacheOptions): UseClassifyCacheResult {
   const [entries, setEntries] = useState<Record<string, ClassifyCacheEntry>>({});
-  // Stays `true` until the first fetch with non-empty companyIds resolves.
-  // Consumers gate their "should I run the LLM?" decision on this so they
-  // don't fall through on the empty-companies render that happens between
-  // mount and Supabase auth resolving.
+  // Stays `true` until the first fetch resolves (or until we confirm there
+  // are no companies to fetch for). Consumers gate their "should I run the
+  // LLM?" decision on this so they don't stomp a pending cache fetch.
   const [isLoading, setIsLoading] = useState(true);
-  const didHydrateRef = useRef(false);
 
   // Ref mirror so getIfFresh (used inside effects/callbacks) always sees the
   // latest map without joining the closure deps of its consumers.
@@ -87,12 +85,13 @@ export function useClassifyCache({
   // Initial fetch — one round trip per company set change.
   useEffect(() => {
     if (companyIds.length === 0) {
-      // Only declare "done loading" once we've actually hydrated at least
-      // once. Otherwise, the brief empty-companies window between mount and
-      // Supabase session resolution would flip isLoading to false, tricking
-      // callers into treating an empty cache as authoritative.
+      // Empty companies → nothing to fetch. Always flip isLoading to false
+      // so consumers don't hang indefinitely if auth never resolves (e.g.
+      // silently-failed session, cold-load race, user with no company
+      // access). Worst case is one redundant LLM classify on the cold-boot
+      // auth-resolution window — trivial cost versus an infinite skeleton.
       setEntries({});
-      if (didHydrateRef.current) setIsLoading(false);
+      setIsLoading(false);
       return;
     }
 
@@ -123,7 +122,6 @@ export function useClassifyCache({
           }
           setEntries(map);
         }
-        didHydrateRef.current = true;
         setIsLoading(false);
       });
 

@@ -8,7 +8,7 @@
  * 3. Fuzzy KB scoring — Levenshtein-tolerant keyword matching (scoreKBForInquiry)
  */
 
-import type { KBEntry } from '../../data/types';
+import type { KBEntry, KnowledgeChunk } from '../../data/types';
 
 export type ContextSource = 'kb' | 'ai';
 
@@ -35,7 +35,7 @@ export interface DetectedInquiry {
   aiClassified?: boolean;
   /** Whether a KB/form lookup is actually needed (false for greetings, social messages, etc.) */
   needsKbSearch?: boolean;
-  /** Structured source-tagged briefing items for the agent (used in ai-context mode) */
+  /** Structured source-tagged briefing items for the agent — rendered inline in the assistant panel */
   context?: ContextItem[];
   /** Resolution status — set by LLM classification when full conversation is provided */
   status?: 'active' | 'handled';
@@ -443,12 +443,11 @@ export async function classifyWithLLM(
   callAI: (opts: { systemPrompt: string; userPrompt: string }) => Promise<{ text: string }>,
   kbContext?: string,
   overrides?: import('../../ai/prompts').PromptOverrides,
-  mode?: 'ai-context' | 'kb-scoring',
   skipCache?: boolean,
 ): Promise<ClassifyResult> {
-  // Cache key = prompt version + mode + guest messages + first 100 chars of KB
-  // Bump CLASSIFY_MODEL_VERSION when prompt format changes to bust stale cache
-  const cacheKey = (CLASSIFY_MODEL_VERSION + '|' + (mode ?? 'ai-context') + '|' + guestMessages.join('|') + '|' + (kbContext ?? '').slice(0, 100)).slice(0, 300);
+  // Cache key = prompt version + guest messages + first 100 chars of KB.
+  // Bump CLASSIFY_MODEL_VERSION when prompt format changes to bust stale cache.
+  const cacheKey = (CLASSIFY_MODEL_VERSION + '|' + guestMessages.join('|') + '|' + (kbContext ?? '').slice(0, 100)).slice(0, 300);
   const cached = _classifyCache.get(cacheKey);
   if (cached && !skipCache) return cached;
   const EMPTY_RESULT: ClassifyResult = { inquiries: [], summary: undefined };
@@ -463,12 +462,11 @@ export async function classifyWithLLM(
     guestMessages: guestMessages.join('\n'),
   });
 
-  // Append the inquiry_summary system prompt when in ai-context mode (the default).
-  // This populates the "context" field with the agent briefing — no extra API call needed.
+  // Always append the inquiry_summary system prompt — it populates the "context"
+  // field with the agent briefing in the same round-trip as classification.
   const classifySystem = resolvePrompt('classify_inquiry', 'system', overrides ?? {});
-  const needsSummary = !mode || mode === 'ai-context';
-  const summarySystem = needsSummary ? resolvePrompt('inquiry_summary', 'system', overrides ?? {}) : null;
-  const systemPrompt = summarySystem ? `${classifySystem}\n\n${summarySystem}` : classifySystem;
+  const summarySystem = resolvePrompt('inquiry_summary', 'system', overrides ?? {});
+  const systemPrompt = `${classifySystem}\n\n${summarySystem}`;
 
   try {
     const result = await callAI({
@@ -590,16 +588,41 @@ export async function classifyWithLLM(
  * Uses exact + fuzzy keyword matching and tag overlap.
  * Returns sorted results with synthesized facts.
  */
+/**
+ * InquiryKBMatch — a knowledge chunk scored against a detected inquiry.
+ *
+ * The `entry` field was originally typed `KBEntry` (legacy shape); the
+ * unified refactor widened it to `KnowledgeChunk`. Consumers read through
+ * the `title`, `body`, `tags`, `scope`, `internal` accessors on the chunk
+ * (no more branching on legacy vs. chunk shape).
+ *
+ * `scope` is derived at score-time rather than stored on the chunk so the
+ * Inspector's list view and the inbox citations can display it without
+ * the chunks table needing redundant columns.
+ */
 export interface InquiryKBMatch {
-  entry: KBEntry;
+  entry: KnowledgeChunk;
+  /** Derived scope for display — 'Room' if roomId set, else 'Property' if
+   *  propId set, else 'Host Global'. Matches the legacy KBEntry.scope semantics. */
+  scope: 'Host Global' | 'Property' | 'Room';
+  /** Derived from chunk.visibility for back-compat with consumers that
+   *  previously read KBEntry.internal. */
+  internal: boolean;
   score: number;
   matchReason: string;
   isActionable: boolean; // true = vendor contact, emergency; false = informational
 }
 
+/** Helper — derive the legacy `scope` shape from a chunk's room/prop ids. */
+function deriveChunkScope(c: KnowledgeChunk): 'Host Global' | 'Property' | 'Room' {
+  if (c.roomId) return 'Room';
+  if (c.propId) return 'Property';
+  return 'Host Global';
+}
+
 export function scoreKBForInquiry(
   inquiry: DetectedInquiry,
-  kbEntries: KBEntry[],
+  chunks: KnowledgeChunk[],
   maxResults = 4
 ): InquiryKBMatch[] {
   // Generic tags that are too broad to be a sole matching signal.
@@ -609,14 +632,14 @@ export function scoreKBForInquiry(
   // they don't count as a "real signal" by themselves.
   const GENERIC_TAGS = new Set(['policies', 'check-in', 'check-out', 'house rules', 'amenities']);
 
-  const scored = kbEntries.map(kb => {
+  const scored = chunks.map(chunk => {
     let score = 0;
     const reasons: string[] = [];
     let hasRealSignal = false;
     let deferredGenericBonus = 0; // Applied only if hasRealSignal is true at the end
 
     // Tag overlap
-    const kbTags = (kb.tags || []).map(t => t.toLowerCase());
+    const kbTags = (chunk.tags || []).map(t => t.toLowerCase());
     const tagHits = inquiry.relevantTags.filter(t => kbTags.includes(t.toLowerCase()));
     if (tagHits.length > 0) {
       // Separate specific tag hits from generic tag hits
@@ -637,7 +660,7 @@ export function scoreKBForInquiry(
     }
 
     // Keyword match in KB content — exact + fuzzy
-    const kbText = (kb.title + ' ' + kb.content).toLowerCase();
+    const kbText = (chunk.title + ' ' + chunk.body).toLowerCase();
     const kbTextWords = kbText.split(/\W+/).filter(w => w.length > 2);
     let exactHits = 0;
     let fuzzyHits = 0;
@@ -665,6 +688,8 @@ export function scoreKBForInquiry(
       hasRealSignal = true;
     }
 
+    const scope = deriveChunkScope(chunk);
+
     // Apply deferred bonuses only when there's a real signal
     if (hasRealSignal) {
       // Generic tag bonus
@@ -673,29 +698,34 @@ export function scoreKBForInquiry(
         reasons.push(`Generic tag boost: +${deferredGenericBonus}`);
       }
       // Scope bonus — tiebreaker
-      if (kb.scope === 'Room') score += 20;
-      else if (kb.scope === 'Property') score += 10;
+      if (scope === 'Room') score += 20;
+      else if (scope === 'Property') score += 10;
       else score += 5;
     }
 
-    // Safety net: if KB entry is from onboarding and has 3+ keyword hits,
-    // guarantee a minimum score so host-provided info is never missed
+    // Safety net: if chunk came from a form (property_fact/faq) and has
+    // 3+ keyword hits, guarantee a minimum score so host-provided info
+    // is never missed. Matches the old `source === 'onboarding'` rule
+    // under the new chunk shape.
     const totalKwHits = exactHits + fuzzyHits;
-    if (kb.source === 'onboarding' && totalKwHits >= 3 && score < 30) {
+    if (chunk.source.type === 'form' && totalKwHits >= 3 && score < 30) {
       score = 30;
-      reasons.push('Onboarding data (keyword safety net)');
+      reasons.push('Form-entered data (keyword safety net)');
     }
 
     // Actionable detection
+    const internal = chunk.visibility === 'internal';
     const isActionable = !!(
-      kb.internal ||
+      internal ||
       kbTags.includes('vendors') ||
       kbTags.includes('emergency') ||
-      /phone|contact|call|\+\d/i.test(kb.content)
+      /phone|contact|call|\+\d/i.test(chunk.body)
     );
 
     return {
-      entry: kb,
+      entry: chunk,
+      scope,
+      internal,
       score,
       matchReason: reasons.join(' | ') || 'No match',
       isActionable,
@@ -714,7 +744,7 @@ export function scoreKBForInquiry(
 export function synthesizeFacts(matches: InquiryKBMatch[]): string[] {
   return matches.map(m => {
     // Extract the most useful sentence from the content
-    const sentences = m.entry.content.split(/\.\s+/);
+    const sentences = m.entry.body.split(/\.\s+/);
     const bestSentence = sentences[0] + (sentences[0].endsWith('.') ? '' : '.');
     return bestSentence;
   });
@@ -757,7 +787,7 @@ export function composeReply(
     if (!decision) continue;
 
     const matches = kbMatchesByInquiry[inquiry.id] || [];
-    const guestFacingMatches = matches.filter(m => !m.entry.internal);
+    const guestFacingMatches = matches.filter(m => !m.internal);
     const facts = synthesizeFacts(guestFacingMatches);
 
     if (decision.decision === 'yes') {

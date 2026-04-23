@@ -474,6 +474,9 @@ export async function importDocumentAI(opts: {
   model?: string;
   /** Raw file content shown in the debug Attachment tab */
   attachment?: string;
+  /** AbortSignal — aborts the underlying fetch mid-flight so a cancelled
+   *  import stops wasting tokens on remaining sections. */
+  signal?: AbortSignal;
 }): Promise<AIProxyResult> {
   return proxyAICall({
     endpoint: 'ask',
@@ -484,6 +487,7 @@ export async function importDocumentAI(opts: {
     maxTokens: 3000,
     touchpoint: 'kb-document-import',
     attachment: opts.attachment,
+    signal: opts.signal,
   });
 }
 

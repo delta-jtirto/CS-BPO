@@ -105,6 +105,124 @@ export interface KBEntry {
   sectionId?: string; // maps back to the form section that generated this entry
 }
 
+// ─── Knowledge Chunks ─────────────────────────────────────────────
+//
+// Canonical shape for all property knowledge. `KBEntry` above will eventually
+// be derived from this; for now it coexists so Phase 0 can land additively
+// without touching every consumer.
+
+/** Typed categories of knowledge — drives prompt grouping, UI filters, and
+ *  required-coverage checks. Adding a new kind is a forward-compatible change
+ *  (unknown kinds are ignored by older clients). */
+export type KnowledgeKind =
+  | 'property_fact'        // structured fact tied to an onboarding schema slot
+  | 'faq'                  // guest Q→A pair
+  | 'reply_template'       // canned agent reply
+  | 'sop'                  // internal operating procedure
+  | 'urgency_rule'         // situation → escalation route
+  | 'workflow';            // step-by-step decision tree
+
+export type ChunkSourceType = 'manual' | 'doc_ingest' | 'form' | 'portal';
+
+export type ChunkVisibility = 'internal' | 'guest_facing';
+
+export type ChunkStatus =
+  | 'active'               // in use
+  | 'archived'             // removed from latest doc, preserved for undo
+  | 'pending_review'       // conflict with override / low confidence / missing from re-ingest
+  | 'superseded';          // replaced by a newer version of itself
+
+export interface ChunkSource {
+  type: ChunkSourceType;
+  docId?: string;          // FK → IngestedDocument.id
+  docSheet?: string;       // sheet name for xlsx
+  docRow?: number;         // row for tabular sources
+  /** The RAW string extracted from the source doc, pre-AI-normalization.
+   *  Shown next to the normalized body in the KB viewer so agents can verify
+   *  the AI didn't paraphrase away a critical nuance. */
+  originalText?: string;
+  extractedAt?: string;    // ISO
+  editedBy?: string;       // user id/email for manual/override chunks
+  editReason?: string;     // optional free-text rationale
+}
+
+export interface KnowledgeChunk {
+  id: string;
+  hostId: string;
+  propId: string | null;   // null → host-global (applies to all properties)
+  roomId: string | null;   // null → property-wide
+
+  kind: KnowledgeKind;
+
+  title: string;           // short label for browse / AI citations
+  body: string;            // free text (markdown ok)
+  /** Hash of body + structured — stable dedup key within a slot. When a
+   *  re-ingest produces an identical chunk we skip the DB write entirely. */
+  chunkHash: string;
+  /** Escape hatch for kind-specific fields. Kept untyped here; per-kind
+   *  validators live next to the kind's consumer. Examples:
+   *   faq            → { question, answer, language? }
+   *   urgency_rule   → { situation, severity, action, escalateTo }
+   *   reply_template → { scenario, template, language, timing? }
+   *   property_fact  → { fieldId, sectionId } (from ONBOARDING_SECTIONS)
+   *   workflow       → { steps: {title, body, anchor}[] } */
+  structured?: Record<string, unknown>;
+
+  /** Deterministic slot identity for `property_fact` only. Built from the
+   *  onboarding schema enum so two re-ingests produce the same key for the
+   *  same underlying fact. Free-form kinds leave this undefined and use
+   *  document-scoped archive-and-replace instead. */
+  slotKey?: string;
+  /** Override layer — when true, this chunk sits above any doc-ingest chunk
+   *  for the same slotKey and wins. Re-ingest NEVER overwrites an override
+   *  silently; conflicts surface for user review. */
+  isOverride?: boolean;
+  /** Chunk id this override replaces (for audit trail and undo). */
+  supersedes?: string;
+
+  source: ChunkSource;
+  visibility: ChunkVisibility;
+  status: ChunkStatus;
+  tags?: string[];
+
+  createdAt: string;       // ISO
+  updatedAt: string;       // ISO
+}
+
+/** Tracks the original docs that chunks were extracted from. One row per
+ *  uploaded file; re-ingest of the same file reuses the same id. */
+export interface IngestedDocument {
+  id: string;
+  hostId: string;
+  propId: string | null;
+  filename: string;
+  /** Hash of the full normalized text — if unchanged across two uploads we
+   *  skip the expensive AI classification call entirely. */
+  contentHash: string;
+  uploadedAt: string;
+  uploadedBy: string;
+  sheets?: string[];       // xlsx sheet names, if applicable
+  chunkIds: string[];      // all chunks extracted from this doc
+  status: 'processing' | 'ready' | 'partial' | 'failed';
+  parseError?: string;
+}
+
+/** Default visibility per kind. Internal kinds never leak into guest-facing
+ *  AI prompts. Overridable per chunk, but the default protects against
+ *  leaking SOPs or escalation matrices into replies sent to guests. */
+export function defaultVisibilityForKind(kind: KnowledgeKind): ChunkVisibility {
+  switch (kind) {
+    case 'faq':
+    case 'property_fact':
+      return 'guest_facing';
+    case 'sop':
+    case 'urgency_rule':
+    case 'reply_template':
+    case 'workflow':
+      return 'internal';
+  }
+}
+
 /** Structured thread status — avoids brittle string prefix parsing (#23) */
 export type ThreadStatus = 'ai-handled' | 'handed-off' | 'partial' | 'safety' | null;
 

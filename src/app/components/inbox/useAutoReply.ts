@@ -301,6 +301,7 @@ export function useGlobalAutoReply() {
   const tickets = ctx?.tickets ?? [];
   const hostSettings = ctx?.hostSettings ?? [];
   const kbEntries = ctx?.kbEntries ?? [];
+  const knowledgeChunks = ctx?.knowledgeChunks ?? [];
   const properties = ctx?.properties ?? [];
   const onboardingData = ctx?.onboardingData ?? {};
   const formTemplate = ctx?.formTemplate ?? [];
@@ -358,8 +359,21 @@ export function useGlobalAutoReply() {
     const prop = properties.find(p => p.name === ticket.property);
     const roomNames = prop?.roomNames ?? (prop?.units === 1 ? ['Entire Property'] : Array.from({ length: prop?.units ?? 1 }, (_, i) => `Unit ${i + 1}`));
     const manualEntries = kbEntries.filter(kb => kb.hostId === ticket.host.id && (!kb.propId || kb.propId === prop?.id));
-    return buildPropertyContext(prop?.id ?? '', ticket.property, onboardingData, formTemplate, roomNames, manualEntries);
-  }, [kbEntries, properties, onboardingData, formTemplate]);
+    // Auto-reply path is guest-facing by nature — do NOT include internal
+    // chunks (SOPs, urgency rules, hostHidden fields). Internal chunks are
+    // gated by the default (includeInternal: false) so this call matches
+    // historical behavior while also taking advantage of the new typed
+    // knowledge chunks store once Phase 1 populates it.
+    return buildPropertyContext(
+      prop?.id ?? '',
+      ticket.property,
+      onboardingData,
+      formTemplate,
+      roomNames,
+      manualEntries,
+      { knowledgeChunks, hostId: ticket.host.id },
+    );
+  }, [kbEntries, knowledgeChunks, properties, onboardingData, formTemplate]);
 
   // ─── Re-escalation timer (defined before processTicket so it can be referenced) ─
   const startReEscalationTimer = useCallback((ticketId: string) => {

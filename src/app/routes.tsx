@@ -4,6 +4,7 @@ import { InboxView } from './components/views/InboxView';
 import { PropertiesView } from './components/views/PropertiesView';
 import { SettingsView } from './components/views/SettingsView';
 import { OnboardingView } from './components/views/OnboardingView';
+import { KnowledgeInspector } from './components/views/KnowledgeInspector';
 import { HostPortalLayout } from './components/layout/HostPortalLayout';
 import { HostPortalView } from './components/views/HostPortalView';
 import { FormBuilderView } from './components/views/FormBuilderView';
@@ -44,6 +45,7 @@ export const router = createBrowserRouter([
           { path: 'inbox/:ticketId', Component: InboxView },
           { path: 'kb', Component: PropertiesView },
           { path: 'kb/:propertyId', Component: OnboardingView },
+          { path: 'kb/:propertyId/inspector', Component: KnowledgeInspector },
           { path: 'settings', Component: SettingsView },
           { path: 'settings/form-builder', Component: FormBuilderView },
           { path: 'settings/:tab', Component: SettingsView },
