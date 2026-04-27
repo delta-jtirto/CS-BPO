@@ -91,6 +91,10 @@ export interface ProxyMessage {
   metadata: Record<string, unknown>;
   channel_message_id: string | null;
   status: string;
+  /** Populated by the channel proxy when status === 'failed'. Surfaced in
+   *  Message.deliveryError so the UI can show the provider's error text
+   *  on the failed bubble. */
+  error_message?: string | null;
   channel_timestamp: string;
   received_at: string;
 }

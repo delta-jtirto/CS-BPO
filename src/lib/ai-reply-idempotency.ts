@@ -20,10 +20,9 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { supabase } from './supabase-client';
+import { edgeFetchJson } from '@/app/ai/edge-fetch';
 
 export const PROMPT_VERSION = 'auto-reply@2026-04-21';
-
-const BASE_URL = `https://${import.meta.env.VITE_SUPABASE_PROJECT_ID}.supabase.co/functions/v1/make-server-ab702ee0`;
 
 export type AttemptOutcome =
   | 'pending'
@@ -59,15 +58,6 @@ export function deriveGuestMsgId(msg: GuestMessageIdInput): string {
   return `${msg.createdAt}|${(msg.text ?? '').slice(0, 100)}`;
 }
 
-async function userAuthHeaders(): Promise<Record<string, string>> {
-  const { data: { session } } = await supabase.auth.getSession();
-  const token = session?.access_token ?? import.meta.env.VITE_SUPABASE_ANON_KEY;
-  return {
-    'Content-Type': 'application/json',
-    'Authorization': `Bearer ${token}`,
-  };
-}
-
 export interface ClaimResult {
   won: boolean;
   trace_id: string;
@@ -85,9 +75,8 @@ export async function claimAIReply(params: {
   guestMsgId: string;
   model: string;
 }): Promise<ClaimResult> {
-  const res = await fetch(`${BASE_URL}/ai/auto-reply/claim`, {
+  return edgeFetchJson<ClaimResult>('/ai/auto-reply/claim', {
     method: 'POST',
-    headers: await userAuthHeaders(),
     body: JSON.stringify({
       company_id: params.companyId,
       thread_key: params.threadKey,
@@ -96,12 +85,6 @@ export async function claimAIReply(params: {
       model: params.model,
     }),
   });
-
-  const json = await res.json();
-  if (!res.ok) {
-    throw new Error(json.error || `claim failed (${res.status})`);
-  }
-  return json as ClaimResult;
 }
 
 export async function finalizeAIReply(params: {
@@ -112,9 +95,8 @@ export async function finalizeAIReply(params: {
   replyText?: string;
   riskScore?: number;
 }): Promise<void> {
-  const res = await fetch(`${BASE_URL}/ai/auto-reply/finalize`, {
+  await edgeFetchJson('/ai/auto-reply/finalize', {
     method: 'POST',
-    headers: await userAuthHeaders(),
     body: JSON.stringify({
       company_id: params.companyId,
       thread_key: params.threadKey,
@@ -124,11 +106,6 @@ export async function finalizeAIReply(params: {
       risk_score: params.riskScore,
     }),
   });
-
-  if (!res.ok) {
-    const json = await res.json().catch(() => ({}));
-    throw new Error(json.error || `finalize failed (${res.status})`);
-  }
 }
 
 /**

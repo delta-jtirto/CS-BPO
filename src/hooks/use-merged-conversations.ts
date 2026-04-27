@@ -10,6 +10,7 @@
  */
 
 import { useMemo, useCallback } from 'react';
+import { toMillis } from '@/lib/time-normalize';
 import type { ProxyConversation } from './use-proxy-conversations';
 
 /**
@@ -64,7 +65,6 @@ export function useMergedConversations({
 
     // Map Firestore threads
     for (const t of firestoreThreads) {
-      const ts = t.last_message_at ?? 0;
       items.push({
         id: t.thread_id,
         source: 'firestore',
@@ -73,7 +73,7 @@ export function useMergedConversations({
         contactName: t.guest_name ?? 'Unknown',
         contactAvatar: t.guest_avatar_url ?? null,
         lastMessagePreview: t.last_message_preview ?? null,
-        lastMessageAt: ts > 1e12 ? ts : ts * 1000,
+        lastMessageAt: toMillis(t.last_message_at),
         unreadCount: t.unread_count ?? 0,
         subject: null,
         firestoreThread: t,
@@ -94,7 +94,7 @@ export function useMergedConversations({
         contactName: contact?.display_name ?? 'Unknown',
         contactAvatar: contact?.avatar_url ?? null,
         lastMessagePreview: c.last_message_preview,
-        lastMessageAt: new Date(c.last_message_at).getTime(),
+        lastMessageAt: toMillis(c.last_message_at),
         unreadCount: c.unread_count,
         subject: c.subject,
         proxyConversation: c,
@@ -118,14 +118,8 @@ export function useMergedConversations({
     const lastFirestore = firestoreThreads.at(-1);
     const lastProxy = proxyConversations.at(-1);
 
-    const lastFirestoreTs = lastFirestore?.last_message_at
-      ? (lastFirestore.last_message_at > 1e12
-          ? lastFirestore.last_message_at
-          : lastFirestore.last_message_at * 1000)
-      : 0;
-    const lastProxyTs = lastProxy?.last_message_at
-      ? new Date(lastProxy.last_message_at).getTime()
-      : 0;
+    const lastFirestoreTs = toMillis(lastFirestore?.last_message_at);
+    const lastProxyTs = toMillis(lastProxy?.last_message_at);
 
     // Load more from whichever source has newer unseen items
     if (lastFirestoreTs > lastProxyTs) {

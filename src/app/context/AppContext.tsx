@@ -12,7 +12,6 @@ import { clearDebugEntries } from '../ai/debug-store';
 import type { OperationId, PromptOverride, PromptOverrides } from '../ai/prompts';
 import { MessageSquare } from 'lucide-react';
 import { detectInquiries } from '../components/inbox/InquiryDetector';
-import { projectId, publicAnonKey } from '/utils/supabase/info';
 import { useFirestoreConnections, type SavedConnection, type InboxConnection } from '@/hooks/use-firestore-connections';
 import { useFirestoreThreads, type FirestoreConnection, type BPOOverlayState } from '@/hooks/use-firestore-threads';
 import { type EscalationOverride } from '@/lib/compute-ticket-state';
@@ -22,6 +21,7 @@ import { useProxyConversations } from '@/hooks/use-proxy-conversations';
 import { useConversationOverrides } from '@/hooks/use-conversation-overrides';
 import { useClassifyCache, type UseClassifyCacheResult } from '@/hooks/use-classify-cache';
 import { mapProxyConversationToTicket } from '@/lib/proxy-mappers';
+import { edgeFetch } from '@/app/ai/edge-fetch';
 import { hydrateBotSignatures, markBotSent } from '@/lib/bot-signatures';
 import { supabase as supabaseClient, getUserCompanyIds as fetchProxyCompanyIds, getAccessToken } from '@/lib/supabase-client';
 import {
@@ -35,19 +35,6 @@ import { toast } from 'sonner';
 // Lazy-load the API client so a module-level error in api-client.ts
 // cannot crash the entire AppProvider during initialization.
 const getApiClient = () => import('../ai/api-client');
-
-// Auth headers for Supabase Functions. Prefers the authenticated user's
-// access_token so edge endpoints can reject anonymous callers via
-// auth.getUser(). Falls back to the anon key only while the session is
-// loading — those calls hit routes that still permit anon (currently
-// only /health; other anon calls are rejected server-side).
-const getSupabaseHeaders = async () => {
-  const token = (await getAccessToken()) ?? publicAnonKey;
-  return {
-    'Content-Type': 'application/json',
-    'Authorization': `Bearer ${token}`,
-  };
-};
 
 export interface Notification {
   id: string;
@@ -332,6 +319,7 @@ interface AppState {
   setOnboardingField: (propertyId: string, key: string, value: string) => Promise<void>;
   setOnboardingBulk: (propertyId: string, data: Record<string, string>) => Promise<void>;
   formPersistStatus: 'local' | 'server' | 'syncing';
+  manualSyncFormData: () => Promise<void>;
 
   // Custom form sections per property
   customFormSections: Record<string, { id: string; title: string }[]>;
@@ -2298,10 +2286,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
     (async () => {
       try {
-        const res = await fetch(
-          `https://${projectId}.supabase.co/functions/v1/make-server-ab702ee0/onboarding/load?propIds=${encodeURIComponent(propIds)}`,
-          { headers: await getSupabaseHeaders() }
-        );
+        const res = await edgeFetch(`/onboarding/load?propIds=${encodeURIComponent(propIds)}`);
         if (!res.ok) return;
         const { data } = await res.json();
         if (!data || typeof data !== 'object') return;
@@ -2552,14 +2537,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setFormPersistStatus('syncing');
 
     try {
-      const response = await fetch(
-        `https://${projectId}.supabase.co/functions/v1/make-server-ab702ee0/onboarding/save`,
-        {
-          method: 'POST',
-          headers: await getSupabaseHeaders(),
-          body: JSON.stringify(data),
-        }
-      );
+      const response = await edgeFetch('/onboarding/save', {
+        method: 'POST',
+        body: JSON.stringify(data),
+      });
 
       if (!response.ok) {
         throw new Error(`Sync failed: ${response.status}`);
