@@ -6,6 +6,7 @@
 import type { Host, Message, Ticket } from '@/app/data/types';
 import { channelDisplayName, channelToIcon } from './channel-config';
 import { computeSLA, formatSLARelative, type EscalationOverride } from './compute-ticket-state';
+import { toMillis } from './time-normalize';
 import type { ProxyConversation, ProxyMessage } from '@/hooks/use-proxy-conversations';
 
 // ---------------------------------------------------------------------------
@@ -26,9 +27,7 @@ export function mapProxyConversationToTicket(
     channel_contact_id: string;
   } | null;
 
-  const lastMessageAtMs = conversation.last_message_at
-    ? new Date(conversation.last_message_at).getTime()
-    : Date.now();
+  const lastMessageAtMs = toMillis(conversation.last_message_at) || Date.now();
 
   const slaResult = computeSLA(
     lastMessageAtMs,
@@ -101,9 +100,7 @@ export function mapProxyMessageToMessage(
   // fields (like error_message) that aren't in the validated schema yet,
   // and the raw payload remains trustworthy once validation passes.
   validateProxyMessage(msg);
-  const tsMs = msg.channel_timestamp
-    ? new Date(msg.channel_timestamp).getTime()
-    : new Date(msg.received_at).getTime();
+  const tsMs = toMillis(msg.channel_timestamp) || toMillis(msg.received_at);
 
   // Determine sender from direction
   let sender: Message['sender'];

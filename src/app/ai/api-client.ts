@@ -5,40 +5,8 @@
  * never reaches the browser. Settings are persisted in Supabase.
  */
 
-import { projectId, publicAnonKey } from '/utils/supabase/info';
 import { startDebugEntry, updateDebugEntry, type AIDebugEntry } from './debug-store';
-import { getAccessToken } from '@/lib/supabase-client';
-
-const BASE_URL = `https://${projectId}.supabase.co/functions/v1/make-server-ab702ee0`;
-const SUPABASE_REST_URL = `https://${projectId}.supabase.co/rest/v1`;
-
-/**
- * Headers for edge function calls. Previously this used the public
- * anon key as the bearer, which meant the edge function could not
- * distinguish an authenticated user from a random caller with the
- * anon key (which is embedded in every frontend bundle and thus
- * public). We now prefer the user's access_token from the Supabase
- * session — the edge function verifies it via auth.getUser() and
- * can reject anonymous callers. Falls back to the anon key only for
- * the `/health` endpoint and during the brief pre-session startup
- * window; both cases are no-op on the server.
- */
-const headers = async () => {
-  const token = (await getAccessToken()) ?? publicAnonKey;
-  return {
-    'Content-Type': 'application/json',
-    'Authorization': `Bearer ${token}`,
-  };
-};
-
-const getPrefsHeaders = async () => {
-  const token = (await getAccessToken()) ?? publicAnonKey;
-  return {
-    'Content-Type': 'application/json',
-    'Authorization': `Bearer ${token}`,
-    'Prefer': 'return=representation',
-  };
-};
+import { edgeFetch, edgeFetchJson } from './edge-fetch';
 
 // ─── Types ──────────────────────────────────────────────
 
@@ -59,66 +27,31 @@ export interface AIProxyResult {
 // ─── Settings ───────────────────────────────────────────
 
 export async function getAISettings(): Promise<AISettings> {
-  const res = await fetch(`${BASE_URL}/ai/settings`, { headers: await headers() });
-  const json = await res.json();
-  if (!res.ok) {
-    console.error('Failed to fetch AI settings:', json);
-    throw new Error(json.error || 'Failed to load AI settings');
-  }
-  return json;
+  return edgeFetchJson<AISettings>('/ai/settings');
 }
 
 export async function saveAISettings(updates: { apiKey?: string; model?: string; importModel?: string }): Promise<AISettings> {
-  const res = await fetch(`${BASE_URL}/ai/settings`, {
+  return edgeFetchJson<AISettings>('/ai/settings', {
     method: 'PUT',
-    headers: await headers(),
     body: JSON.stringify(updates),
   });
-  const json = await res.json();
-  if (!res.ok) {
-    console.error('Failed to save AI settings:', json);
-    throw new Error(json.error || 'Failed to save AI settings');
-  }
-  return json;
 }
 
 export async function clearAIKey(): Promise<AISettings> {
-  const res = await fetch(`${BASE_URL}/ai/settings/key`, {
-    method: 'DELETE',
-    headers: await headers(),
-  });
-  const json = await res.json();
-  if (!res.ok) {
-    console.error('Failed to clear AI key:', json);
-    throw new Error(json.error || 'Failed to clear API key');
-  }
-  return json;
+  return edgeFetchJson<AISettings>('/ai/settings/key', { method: 'DELETE' });
 }
 
 // ─── Agent Preferences ──────────────────────────────────
 
 export async function getPreferences(): Promise<Record<string, any>> {
-  const res = await fetch(`${BASE_URL}/preferences`, { headers: await headers() });
-  const json = await res.json();
-  if (!res.ok) {
-    console.error('Failed to fetch preferences:', json);
-    throw new Error(json.error || 'Failed to load preferences');
-  }
-  return json;
+  return edgeFetchJson<Record<string, any>>('/preferences');
 }
 
 export async function savePreferences(prefs: Record<string, any>): Promise<{ saved: string[] }> {
-  const res = await fetch(`${BASE_URL}/preferences`, {
+  return edgeFetchJson<{ saved: string[] }>('/preferences', {
     method: 'PUT',
-    headers: await headers(),
     body: JSON.stringify(prefs),
   });
-  const json = await res.json();
-  if (!res.ok) {
-    console.error('Failed to save preferences:', json);
-    throw new Error(json.error || 'Failed to save preferences');
-  }
-  return json;
 }
 
 // ─── Connected Inboxes ─────────────────────────────────
@@ -133,9 +66,7 @@ export interface InboxEntry {
 /** Fetch saved inbox connections (metadata only, no raw tokens). */
 export async function getInboxes(): Promise<InboxEntry[]> {
   try {
-    const res = await fetch(`${BASE_URL}/inboxes`, { headers: await headers() });
-    const json = await res.json();
-    if (!res.ok) throw new Error(json.error || 'Failed to load inboxes');
+    const json = await edgeFetchJson<{ inboxes?: InboxEntry[] }>('/inboxes');
     return json.inboxes ?? [];
   } catch (err: any) {
     console.error('Failed to fetch inboxes:', err);
@@ -147,13 +78,10 @@ export async function getInboxes(): Promise<InboxEntry[]> {
 export async function getInboxTokens(hostIds: string[]): Promise<Record<string, string>> {
   if (hostIds.length === 0) return {};
   try {
-    const res = await fetch(`${BASE_URL}/inboxes/tokens`, {
+    const json = await edgeFetchJson<{ tokens?: Record<string, string> }>('/inboxes/tokens', {
       method: 'POST',
-      headers: await headers(),
       body: JSON.stringify({ hostIds }),
     });
-    const json = await res.json();
-    if (!res.ok) throw new Error(json.error || 'Failed to load tokens');
     return json.tokens ?? {};
   } catch (err: any) {
     console.error('Failed to fetch inbox tokens:', err);
@@ -164,7 +92,7 @@ export async function getInboxTokens(hostIds: string[]): Promise<Record<string, 
 /** Fetch the token for a single host. Returns null if not found. */
 export async function getInboxToken(hostId: string): Promise<string | null> {
   try {
-    const res = await fetch(`${BASE_URL}/inboxes/${encodeURIComponent(hostId)}/token`, { headers: await headers() });
+    const res = await edgeFetch(`/inboxes/${encodeURIComponent(hostId)}/token`);
     if (res.status === 404) return null;
     const json = await res.json();
     if (!res.ok) throw new Error(json.error || 'Failed to load token');
@@ -182,23 +110,15 @@ export async function saveInbox(hostId: string, data: {
   connectedAt: string;
   accessToken: string;
 }): Promise<void> {
-  const res = await fetch(`${BASE_URL}/inboxes/${encodeURIComponent(hostId)}`, {
+  await edgeFetchJson(`/inboxes/${encodeURIComponent(hostId)}`, {
     method: 'PUT',
-    headers: await headers(),
     body: JSON.stringify(data),
   });
-  const json = await res.json();
-  if (!res.ok) throw new Error(json.error || 'Failed to save inbox');
 }
 
 /** Remove an inbox connection (metadata + token). */
 export async function deleteInbox(hostId: string): Promise<void> {
-  const res = await fetch(`${BASE_URL}/inboxes/${encodeURIComponent(hostId)}`, {
-    method: 'DELETE',
-    headers: await headers(),
-  });
-  const json = await res.json();
-  if (!res.ok) throw new Error(json.error || 'Failed to delete inbox');
+  await edgeFetchJson(`/inboxes/${encodeURIComponent(hostId)}`, { method: 'DELETE' });
 }
 
 // Supabase client for direct table access (properties). Re-uses the
@@ -344,9 +264,11 @@ async function proxyAICall(opts: ProxyCallOptions): Promise<AIProxyResult> {
   });
 
   try {
-    const res = await fetch(`${BASE_URL}/ai/${opts.endpoint}`, {
+    // LLM calls can be slow (thinking models can stream for 60s+); give
+    // them a longer ceiling than the default. The user-supplied signal
+    // still wins via composeSignal.
+    const res = await edgeFetch(`/ai/${opts.endpoint}`, {
       method: 'POST',
-      headers: await headers(),
       body: JSON.stringify({
         systemPrompt: opts.systemPrompt,
         userPrompt: opts.userPrompt,
@@ -355,6 +277,7 @@ async function proxyAICall(opts: ProxyCallOptions): Promise<AIProxyResult> {
         maxTokens: opts.maxTokens,
       }),
       signal: opts.signal,
+      timeoutMs: 120_000,
     });
 
     const clientDuration = Math.round(performance.now() - startMs);
@@ -504,19 +427,15 @@ const CHAT_LS_PREFIX = 'askAiChat_';
 
 /** Load saved chat messages for a ticket (backend with localStorage fallback) */
 export async function getChatHistory(ticketId: string): Promise<ChatMessage[]> {
-  // Try backend first
   try {
-    const res = await fetch(`${BASE_URL}/ai/chat/${encodeURIComponent(ticketId)}`, { headers: await headers() });
-    const json = await res.json();
-    if (res.ok && json.messages?.length) {
-      // Sync to localStorage as cache
+    const json = await edgeFetchJson<{ messages?: ChatMessage[] }>(`/ai/chat/${encodeURIComponent(ticketId)}`);
+    if (json.messages?.length) {
       try { localStorage.setItem(`${CHAT_LS_PREFIX}${ticketId}`, JSON.stringify(json.messages)); } catch {}
       return json.messages;
     }
   } catch {
     // Network error — fall through to localStorage
   }
-  // Fallback: localStorage
   try {
     const stored = localStorage.getItem(`${CHAT_LS_PREFIX}${ticketId}`);
     return stored ? JSON.parse(stored) : [];
@@ -525,13 +444,10 @@ export async function getChatHistory(ticketId: string): Promise<ChatMessage[]> {
 
 /** Save chat messages for a ticket (backend + localStorage) */
 export async function saveChatHistory(ticketId: string, messages: ChatMessage[]): Promise<void> {
-  // Always persist to localStorage immediately
   try { localStorage.setItem(`${CHAT_LS_PREFIX}${ticketId}`, JSON.stringify(messages)); } catch {}
-  // Best-effort backend save
   try {
-    await fetch(`${BASE_URL}/ai/chat/${encodeURIComponent(ticketId)}`, {
+    await edgeFetchJson(`/ai/chat/${encodeURIComponent(ticketId)}`, {
       method: 'PUT',
-      headers: await headers(),
       body: JSON.stringify({ messages }),
     });
   } catch {
@@ -543,10 +459,7 @@ export async function saveChatHistory(ticketId: string, messages: ChatMessage[])
 export async function clearChatHistory(ticketId: string): Promise<void> {
   try { localStorage.removeItem(`${CHAT_LS_PREFIX}${ticketId}`); } catch {}
   try {
-    await fetch(`${BASE_URL}/ai/chat/${encodeURIComponent(ticketId)}`, {
-      method: 'DELETE',
-      headers: await headers(),
-    });
+    await edgeFetchJson(`/ai/chat/${encodeURIComponent(ticketId)}`, { method: 'DELETE' });
   } catch {
     // Silently swallow
   }

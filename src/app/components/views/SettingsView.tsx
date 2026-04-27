@@ -38,7 +38,7 @@ function usePersistedState<T>(key: string, initial: T): [T, (v: T | ((prev: T) =
 }
 
 // --- Types ---
-type SettingsTab = 'agent' | 'templates' | 'hours' | 'demo' | 'ai' | 'prompts' | 'inboxes';
+type SettingsTab = 'agent' | 'templates' | 'hours' | 'demo' | 'ai' | 'prompts' | 'inboxes' | 'channels';
 
 interface SLAThreshold {
   priority: string;

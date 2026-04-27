@@ -1,10 +1,61 @@
 import { Hono } from "npm:hono";
 import { cors } from "npm:hono/cors";
 import { logger } from "npm:hono/logger";
+import { bodyLimit } from "npm:hono/body-limit";
 import * as kv from "./kv_store.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2.49.8";
 
 const app = new Hono();
+
+// ─── OpenRouter helper ───────────────────────────────────
+// Single call site for /api/v1/chat/completions. Adds a 60s timeout
+// (Supabase Functions inherit a 10-minute Deno deadline by default —
+// a hung LLM provider would hold the function instance for the full
+// window without this) and one automatic retry on 429 / 5xx.
+const OPENROUTER_TIMEOUT_MS = 60_000;
+const OPENROUTER_TRANSIENT = new Set([429, 502, 503, 504]);
+
+async function callOpenRouter(
+  apiKey: string,
+  payload: Record<string, unknown>,
+): Promise<{ status: number; json: any }> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(
+      () => ctrl.abort(new DOMException("OpenRouter timed out", "TimeoutError")),
+      OPENROUTER_TIMEOUT_MS,
+    );
+    try {
+      const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`,
+          "X-Title": "Hospitality BPO Platform",
+        },
+        body: JSON.stringify(payload),
+        signal: ctrl.signal,
+      });
+      const json = await res.json().catch(() => ({}));
+      // Retry transient failures once before surfacing.
+      if (OPENROUTER_TRANSIENT.has(res.status) && attempt === 0) {
+        await new Promise((r) => setTimeout(r, 500));
+        continue;
+      }
+      return { status: res.status, json };
+    } catch (err) {
+      // Network / timeout errors retry once; second failure throws.
+      if (attempt === 0) {
+        await new Promise((r) => setTimeout(r, 500));
+        continue;
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw new Error("OpenRouter call exhausted retries");
+}
 
 // ─── Service-role Supabase client ────────────────────────
 // Bypasses RLS for idempotency writes; scoping is enforced by explicit
@@ -124,6 +175,19 @@ app.use(
     allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     exposeHeaders: ["Content-Length"],
     maxAge: 600,
+  }),
+);
+
+// Cap request bodies. Largest legitimate payload is a KB document
+// import (~512KB raw text); 2MB is comfortably above that and well
+// below Deno's per-request memory ceiling. Bigger requests are
+// rejected before any handler reads them — closes the "POST 100MB
+// of garbage to OOM the function" attack surface.
+app.use(
+  "/*",
+  bodyLimit({
+    maxSize: 2 * 1024 * 1024,
+    onError: (c) => c.json({ error: "Request body exceeds 2MB limit" }, 413),
   }),
 );
 
@@ -298,9 +362,16 @@ app.put("/make-server-ab702ee0/preferences", async (c) => {
   }
 });
 
-// ─── OpenRouter Proxy: Compose Reply ─────────────────────
-// Proxies the AI call through the server so the API key never reaches the client
-app.post("/make-server-ab702ee0/ai/compose-reply", async (c) => {
+// ─── OpenRouter proxy handler ────────────────────────────
+// Single implementation backing both `/ai/compose-reply` (longer
+// replies, default temp 0.7) and `/ai/ask` (KB-grounded answers,
+// default temp 0.5). The endpoints used to duplicate ~70 lines each;
+// they now share validation, fetch + retry, response shaping, and
+// error reporting.
+async function handleOpenRouterProxy(
+  c: any,
+  defaults: { temperature: number; maxTokens: number; label: string },
+) {
   try {
     const apiKey = await kv.get(KV_AI_API_KEY);
     if (!apiKey) {
@@ -308,7 +379,7 @@ app.post("/make-server-ab702ee0/ai/compose-reply", async (c) => {
     }
 
     const body = await c.req.json();
-    const { systemPrompt, userPrompt, model, temperature, maxTokens } = body;
+    const { systemPrompt, userPrompt, model, temperature, maxTokens } = body ?? {};
 
     if (!systemPrompt || !userPrompt) {
       return c.json({ error: "Missing required fields: systemPrompt, userPrompt" }, 400);
@@ -317,39 +388,32 @@ app.post("/make-server-ab702ee0/ai/compose-reply", async (c) => {
     const aiModel = model || (await kv.get(KV_AI_MODEL)) || DEFAULT_AI_MODEL;
     const startMs = performance.now();
 
-    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`,
-        "X-Title": "Hospitality BPO Platform",
-      },
-      body: JSON.stringify({
-        model: aiModel,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
-        temperature: temperature ?? 0.7,
-        max_tokens: maxTokens ?? 1024,
-      }),
+    const { status, json } = await callOpenRouter(apiKey as string, {
+      model: aiModel,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      temperature: temperature ?? defaults.temperature,
+      max_tokens: maxTokens ?? defaults.maxTokens,
     });
 
     const durationMs = Math.round(performance.now() - startMs);
-    const json = await res.json();
 
-    if (!res.ok) {
+    if (status < 200 || status >= 300) {
       const errMsg = json?.error?.message || JSON.stringify(json);
-      console.log(`OpenRouter API error (compose-reply): ${res.status} ${errMsg}`);
-      return c.json({
-        error: errMsg,
-        status: res.status,
-        durationMs,
-        model: aiModel,
-      }, res.status);
+      console.log(`OpenRouter API error (${defaults.label}): ${status} ${errMsg}`);
+      return c.json({ error: errMsg, status, durationMs, model: aiModel }, status);
     }
 
-    const text = json.choices?.[0]?.message?.content || "";
+    const choice = json?.choices?.[0]?.message?.content;
+    if (typeof choice !== "string") {
+      // Provider returned 200 but no content — surface explicitly so
+      // the UI can show a real error instead of an empty bubble.
+      console.log(`Malformed OpenRouter response (${defaults.label}):`, json);
+      return c.json({ error: "AI provider returned an empty response", status: 502, durationMs, model: aiModel }, 502);
+    }
+
     const usage = json.usage
       ? {
           prompt: json.usage.prompt_tokens ?? 0,
@@ -358,90 +422,22 @@ app.post("/make-server-ab702ee0/ai/compose-reply", async (c) => {
         }
       : null;
 
-    return c.json({
-      text,
-      tokensUsed: usage,
-      model: aiModel,
-      durationMs,
-      status: res.status,
-    });
+    return c.json({ text: choice, tokensUsed: usage, model: aiModel, durationMs, status });
   } catch (err: any) {
-    console.log(`Network error in compose-reply proxy: ${err.message}`);
+    console.log(`Network error in ${defaults.label} proxy: ${err.message}`);
     return c.json({ error: `Network error: ${err.message}` }, 502);
   }
-});
+}
+
+// ─── OpenRouter Proxy: Compose Reply ─────────────────────
+app.post("/make-server-ab702ee0/ai/compose-reply", (c) =>
+  handleOpenRouterProxy(c, { temperature: 0.7, maxTokens: 1024, label: "compose-reply" }),
+);
 
 // ─── OpenRouter Proxy: Ask AI ────────────────────────────
-app.post("/make-server-ab702ee0/ai/ask", async (c) => {
-  try {
-    const apiKey = await kv.get(KV_AI_API_KEY);
-    if (!apiKey) {
-      return c.json({ error: "No API key configured. Go to Settings > AI Configuration to add one." }, 400);
-    }
-
-    const body = await c.req.json();
-    const { systemPrompt, userPrompt, model, temperature, maxTokens } = body;
-
-    if (!systemPrompt || !userPrompt) {
-      return c.json({ error: "Missing required fields: systemPrompt, userPrompt" }, 400);
-    }
-
-    const aiModel = model || (await kv.get(KV_AI_MODEL)) || DEFAULT_AI_MODEL;
-    const startMs = performance.now();
-
-    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`,
-        "X-Title": "Hospitality BPO Platform",
-      },
-      body: JSON.stringify({
-        model: aiModel,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
-        temperature: temperature ?? 0.5,
-        max_tokens: maxTokens ?? 512,
-      }),
-    });
-
-    const durationMs = Math.round(performance.now() - startMs);
-    const json = await res.json();
-
-    if (!res.ok) {
-      const errMsg = json?.error?.message || JSON.stringify(json);
-      console.log(`OpenRouter API error (ask-ai): ${res.status} ${errMsg}`);
-      return c.json({
-        error: errMsg,
-        status: res.status,
-        durationMs,
-        model: aiModel,
-      }, res.status);
-    }
-
-    const text = json.choices?.[0]?.message?.content || "";
-    const usage = json.usage
-      ? {
-          prompt: json.usage.prompt_tokens ?? 0,
-          completion: json.usage.completion_tokens ?? 0,
-          total: json.usage.total_tokens ?? 0,
-        }
-      : null;
-
-    return c.json({
-      text,
-      tokensUsed: usage,
-      model: aiModel,
-      durationMs,
-      status: res.status,
-    });
-  } catch (err: any) {
-    console.log(`Network error in ask-ai proxy: ${err.message}`);
-    return c.json({ error: `Network error: ${err.message}` }, 502);
-  }
-});
+app.post("/make-server-ab702ee0/ai/ask", (c) =>
+  handleOpenRouterProxy(c, { temperature: 0.5, maxTokens: 512, label: "ask-ai" }),
+);
 
 // ─── AI Auto-Reply: Claim idempotency row ────────────────
 // Server-side gate for AI auto-replies. Every tab that sees a new guest

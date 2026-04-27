@@ -32,6 +32,7 @@ import { useBookingDetails } from '../inbox/hooks/useBookingDetails';
 import { ContextSidebarPane } from '../inbox/ContextSidebarPane';
 import { InboxDialogs } from '../inbox/InboxDialogs';
 import { MessageErrorBoundary } from '../shared/MessageErrorBoundary';
+import { PanelErrorBoundary } from '../shared/PanelErrorBoundary';
 
 /** Linkify plain-text email bodies: converts <URL> and bare https:// to anchor tags,
  *  preserving the rest as plain text. Returns React nodes (no dangerouslySetInnerHTML). */
@@ -1931,14 +1932,16 @@ export function InboxView() {
 
         {/* Smart Reply Panel */}
         {showSmartReply && !guestMode && (
-          <SmartReplyPanel
-            ticket={activeTicket}
-            existingDraft={replyText}
-            onInsert={handleSmartReplyInsert}
-            onHide={() => setShowSmartReply(false)}
-            cacheRef={smartReplyCacheRef}
-            aiInquiries={classifiedInquiries}
-          />
+          <PanelErrorBoundary label="Smart Reply" resetKey={activeTicket.id}>
+            <SmartReplyPanel
+              ticket={activeTicket}
+              existingDraft={replyText}
+              onInsert={handleSmartReplyInsert}
+              onHide={() => setShowSmartReply(false)}
+              cacheRef={smartReplyCacheRef}
+              aiInquiries={classifiedInquiries}
+            />
+          </PanelErrorBoundary>
         )}
 
         {/* Paused-state banner — only renders when pg_cron auto-sync is off.

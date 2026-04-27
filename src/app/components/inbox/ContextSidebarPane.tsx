@@ -8,6 +8,7 @@ import { AssistantPanel } from './AssistantPanel';
 import { BookingDetailsSection } from './BookingDetailsSection';
 import { TicketDetailsSection } from './TicketDetailsSection';
 import { HostSection } from './HostSection';
+import { PanelErrorBoundary } from '../shared/PanelErrorBoundary';
 
 interface ContextSidebarPaneProps {
   activeTicket: Ticket;
@@ -142,17 +143,19 @@ function ContextSidebarPaneImpl({
       {/* Tab content */}
       <div className="flex-1 overflow-y-auto">
         {rightTab === 'assistant' ? (
-          <AssistantPanel
-            ticket={activeTicket}
-            onComposeReply={onComposeReply}
-            onNavigateToKB={onNavigateToKB}
-            onInquiriesClassified={onInquiriesClassified}
-            inquiryResolutions={inquiryResolutions}
-            onResolutionChange={onResolutionChange}
-            onBulkResolution={onBulkResolution}
-            onSummaryUpdate={onSummaryUpdate}
-            onClassifyingChange={onClassifyingChange}
-          />
+          <PanelErrorBoundary label="Assistant" resetKey={activeTicket.id}>
+            <AssistantPanel
+              ticket={activeTicket}
+              onComposeReply={onComposeReply}
+              onNavigateToKB={onNavigateToKB}
+              onInquiriesClassified={onInquiriesClassified}
+              inquiryResolutions={inquiryResolutions}
+              onResolutionChange={onResolutionChange}
+              onBulkResolution={onBulkResolution}
+              onSummaryUpdate={onSummaryUpdate}
+              onClassifyingChange={onClassifyingChange}
+            />
+          </PanelErrorBoundary>
         ) : (
           <div>
             <BookingDetailsSection

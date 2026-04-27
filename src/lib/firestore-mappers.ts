@@ -2,6 +2,7 @@ import type { Host, Message, Ticket } from '@/app/data/types';
 import { computeSLA, formatSLARelative, type EscalationOverride } from './compute-ticket-state';
 import { isBotSent } from './bot-signatures';
 import { validateFirestoreMessage } from './source-validators';
+import { toMillis } from './time-normalize';
 
 // ---------------------------------------------------------------------------
 // Firestore types (matching Unified Inbox's data model)
@@ -124,10 +125,7 @@ export function mapThreadToTicket(
   handoverReason?: string,
   propertyName?: string,
 ): Ticket {
-  // Firestore timestamps are in seconds — normalize to milliseconds
-  const lastMessageAtMs = item.last_message_at > 1e12
-    ? item.last_message_at          // already in ms
-    : item.last_message_at * 1000;  // convert seconds → ms
+  const lastMessageAtMs = toMillis(item.last_message_at);
 
   // Compute SLA from last guest message timestamp (consistent across list + detail)
   const slaResult = computeSLA(
@@ -183,8 +181,7 @@ export function mapV1ThreadToTicket(
   handoverReason?: string,
   propertyName?: string,
 ): Ticket {
-  const lastMsgTs = thread.last_message?.timestamp ?? 0;
-  const lastMessageAtMs = lastMsgTs > 1e12 ? lastMsgTs : lastMsgTs * 1000;
+  const lastMessageAtMs = toMillis(thread.last_message?.timestamp);
 
   const slaResult = computeSLA(
     lastMessageAtMs,
@@ -247,8 +244,7 @@ export function mapFirestoreMessage(
   // Don't rebind msg — the validator's return type is narrower and would
   // hide fields the downstream mapper expects.
   validateFirestoreMessage(msg);
-  // Normalize: Firestore timestamps may be in seconds
-  const tsMs = msg.timestamp > 1e12 ? msg.timestamp : msg.timestamp * 1000;
+  const tsMs = toMillis(msg.timestamp);
   // Determine sender: compare sender_id against thread's guest ID (same approach as
   // Unified Inbox's ChatBubble), then fall back to sender_role mapping.  Guest messages
   // from external channels (Airbnb, Booking.com) have empty sender_role/sender_name.
