@@ -15,6 +15,7 @@ import {
   classifyWithLLM,
   scoreKBForInquiry,
   filterGreetingNoise,
+  deriveInquiryKey,
   CLASSIFY_MODEL_VERSION,
   type DetectedInquiry,
   type InquiryKBMatch,
@@ -155,11 +156,13 @@ function extractFormFields(
 
 /** Fallback inquiry used when LLM returns empty or fails */
 function fallbackGeneralInquiry(ticket: Ticket): DetectedInquiry {
+  const detail = ticket.summary || 'Guest message requires review';
   return {
     id: 'inq-0',
+    inquiryKey: deriveInquiryKey('general', detail),
     type: 'general',
     label: 'General Inquiry',
-    detail: ticket.summary || 'Guest message requires review',
+    detail,
     confidence: 'low',
     relevantTags: ticket.tags,
     keywords: [],

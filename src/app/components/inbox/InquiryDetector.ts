@@ -23,6 +23,10 @@ export interface ContextItem {
 
 export interface DetectedInquiry {
   id: string;
+  /** Stable content-derived key (type|slugified-detail) — survives re-classification
+   *  even when the positional `id` shifts. Downstream draft caches key on this so
+   *  agent edits don't drop when a refresh reshuffles inquiry order. */
+  inquiryKey: string;
   type: InquiryType | string; // string allows LLM-invented slugs
   label: string;
   detail: string;
@@ -39,6 +43,35 @@ export interface DetectedInquiry {
   context?: ContextItem[];
   /** Resolution status — set by LLM classification when full conversation is provided */
   status?: 'active' | 'handled';
+}
+
+/**
+ * Content-derived key for matching inquiries across reclassifications.
+ * `type` + slugified `detail` (truncated). Stable even when the LLM
+ * shuffles `inq-ai-0/1/2` ordering on re-classify, so a StoredDraftV2
+ * section keyed on inquiryKey keeps matching its card.
+ *
+ * Collisions are rare but possible (same type + near-identical detail).
+ * Callers that build a list deduplicate by appending `|2`, `|3`, ...
+ */
+export function deriveInquiryKey(typeRaw: string, detail: string): string {
+  const typePart = String(typeRaw).toLowerCase().trim() || 'general';
+  const detailNorm = (detail || '')
+    .toLowerCase()
+    .replace(/\W+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+  return `${typePart}|${detailNorm}`;
+}
+
+/** Deduplicate inquiryKey collisions within a list by appending |N suffixes. */
+function dedupeInquiryKeys<T extends { inquiryKey: string }>(items: T[]): T[] {
+  const seen = new Map<string, number>();
+  return items.map(item => {
+    const count = seen.get(item.inquiryKey) ?? 0;
+    seen.set(item.inquiryKey, count + 1);
+    return count === 0 ? item : { ...item, inquiryKey: `${item.inquiryKey}|${count + 1}` };
+  });
 }
 
 export type InquiryType =
@@ -358,6 +391,7 @@ export function detectInquiries(
 
     found.set(rule.type, {
       id: `inq-${idCounter++}`,
+      inquiryKey: deriveInquiryKey(rule.type, detail),
       type: rule.type,
       label: rule.label,
       detail,
@@ -369,18 +403,20 @@ export function detectInquiries(
 
   // If nothing matched, add a generic inquiry
   if (found.size === 0) {
+    const genericDetail = ticketSummary || 'Guest message requires review';
     found.set('general', {
       id: `inq-${idCounter++}`,
+      inquiryKey: deriveInquiryKey('general', genericDetail),
       type: 'general',
       label: 'General Inquiry',
-      detail: ticketSummary || 'Guest message requires review',
+      detail: genericDetail,
       confidence: 'low',
       relevantTags: ticketTags,
       keywords: extractKeywords(allText, 'general'),
     });
   }
 
-  return Array.from(found.values());
+  return dedupeInquiryKeys(Array.from(found.values()));
 }
 
 /**
@@ -539,7 +575,7 @@ export async function classifyWithLLM(
       return EMPTY_RESULT;
     }
 
-    const inquiries: DetectedInquiry[] = rawItems.slice(0, 3).map((item, idx) => {
+    const inquiriesRaw: DetectedInquiry[] = rawItems.slice(0, 3).map((item, idx) => {
       // Clean LLM-returned keywords through the same stop-word filter
       // to prevent generic words like "policy" from causing false KB matches
       const rawKeywords = item.keywords || [];
@@ -551,11 +587,14 @@ export async function classifyWithLLM(
         ? cleanedKeywords
         : extractKeywords(guestMessages.join(' '), item.type || 'general');
 
+      const resolvedType = item.type || 'general';
+      const resolvedDetail = item.detail || 'Classified by AI';
       return {
         id: `inq-ai-${idx}`,
-        type: item.type || 'general',
+        inquiryKey: deriveInquiryKey(resolvedType, resolvedDetail),
+        type: resolvedType,
         label: item.label || 'AI Classified',
-        detail: item.detail || 'Classified by AI',
+        detail: resolvedDetail,
         confidence: (item.confidence as 'high' | 'medium' | 'low') || 'medium',
         relevantTags: item.relevantTags || [],
         keywords: finalKeywords,
@@ -566,6 +605,7 @@ export async function classifyWithLLM(
       };
     });
 
+    const inquiries = dedupeInquiryKeys(inquiriesRaw);
     const classifyResult: ClassifyResult = { inquiries, summary: aiSummary };
     _classifyCache.set(cacheKey, classifyResult);
     // Cap cache at 50 entries
@@ -707,8 +747,12 @@ export function scoreKBForInquiry(
     // 3+ keyword hits, guarantee a minimum score so host-provided info
     // is never missed. Matches the old `source === 'onboarding'` rule
     // under the new chunk shape.
+    //
+    // Guard: legacy rows in knowledge_chunks can ship without `source`
+    // (pre-ingest-router data). Treating those as "no form safety net"
+    // is safe — the keyword score alone still applies.
     const totalKwHits = exactHits + fuzzyHits;
-    if (chunk.source.type === 'form' && totalKwHits >= 3 && score < 30) {
+    if (chunk.source?.type === 'form' && totalKwHits >= 3 && score < 30) {
       score = 30;
       reasons.push('Form-entered data (keyword safety net)');
     }

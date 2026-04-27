@@ -28,7 +28,7 @@
 import { useEffect, useRef, useCallback } from 'react';
 import { toast } from 'sonner';
 import { useAppContext } from '../../context/AppContext';
-import { composeReplyAI } from '../../ai/api-client';
+import { composeReplyAI, classifyInquiries as classifyInquiriesProxy } from '../../ai/api-client';
 import { interpolate, resolvePrompt, resolveModel, resolveTemperature, resolveMaxTokens } from '../../ai/prompts';
 import type { PromptOverrides } from '../../ai/prompts';
 import { buildPropertyContext } from '../../ai/kb-context';
@@ -45,6 +45,23 @@ import {
   type AttemptRow,
 } from '../../../lib/ai-reply-idempotency';
 import { supabase as supabaseClient } from '../../../lib/supabase-client';
+import {
+  classifyWithLLM,
+  deriveInquiryKey,
+  type DetectedInquiry,
+} from './InquiryDetector';
+import {
+  composeStructuredReply,
+  assembleStructuredReply,
+  type StructuredReply,
+} from '../../ai/compose-structured';
+import {
+  computeMessagesHash,
+  computeSnippetHash,
+  saveDraftV2,
+  type StoredDraftV2,
+  type StoredSection,
+} from '../../../lib/ai-draft-cache';
 
 // ─── Debounce presets (ms) — configurable per host ───────────────
 const DEBOUNCE_PRESETS: Record<string, number> = {
@@ -260,6 +277,43 @@ function buildAutoReplyPrompt(
   };
 }
 
+/**
+ * Convert a StructuredReply + its input inquiries into a StoredDraftV2 so
+ * the autoReply draft branch can persist sections to ai_reply_drafts.
+ * Sections are keyed by inquiryKey; snippetHash captures drift against the
+ * current messages hash at write time.
+ */
+function toStoredDraftV2FromStructured(
+  reply: StructuredReply,
+  messagesHash: string,
+): StoredDraftV2 {
+  const sections: Record<string, StoredSection> = {};
+  for (const s of reply.sections) {
+    if (!s.inquiryKey) continue;
+    sections[s.inquiryKey] = {
+      inquiryKey: s.inquiryKey,
+      text: s.text,
+      covered: s.covered,
+      confidence: s.confidence,
+      source: 'auto-reply',
+      isSkipped: false,
+      isEdited: false,
+      snippetHash: computeSnippetHash(s.text, messagesHash),
+    };
+  }
+  return {
+    version: 2,
+    greeting: reply.greeting,
+    sections,
+    closing: reply.closing,
+    outcome: reply.outcome,
+    riskScore: reply.riskScore,
+    escalateTopics: reply.escalateTopics,
+    promisedActions: reply.promisedActions,
+    safetyFlagged: reply.safetyFlagged,
+  };
+}
+
 function buildConversationHistory(ticket: Ticket): string {
   // Exclude system messages — they are internal routing notes, not conversation content.
   // Feeding them to the AI pollutes tone assessment and confuses context.
@@ -306,6 +360,7 @@ export function useGlobalAutoReply() {
   const onboardingData = ctx?.onboardingData ?? {};
   const formTemplate = ctx?.formTemplate ?? [];
   const hasApiKey = ctx?.hasApiKey ?? false;
+  const agentName = ctx?.agentName ?? 'Team';
   const aiModel = ctx?.aiModel ?? '';
   const promptOverrides = ctx?.promptOverrides ?? {};
   const addBotMessage = ctx?.addBotMessage ?? (() => {});
@@ -706,48 +761,136 @@ export function useGlobalAutoReply() {
       const channelHint = CHANNEL_TONE[ticket.channel] || CHANNEL_TONE['Direct']!;
       const conversationHistory = buildConversationHistory(ticket);
       const isDraft = hostConfig.autoReplyMode === 'draft';
+      const useV2 = hostConfig.smartReplyV2 === true;
 
-      const { system: autoReplySystem, user: autoReplyUser } = buildAutoReplyPrompt(
-        ticket, lastGuestMsg.text, kbContext,
-        hostConfig.tone, conversationHistory, channelHint,
-        promptOverrides,
-      );
+      // `output` is the legacy-shaped routing payload downstream code expects.
+      // v2 branch fills it from composeStructuredReply; v1 branch fills it from
+      // parseAIReplyOutput. `v2Structured` is non-null only in v2 and drives
+      // the ai_reply_drafts section write in the draft-mode branch below.
+      let output: AIAutoReplyOutput;
+      let v2Structured: StructuredReply | null = null;
+      let v2Inquiries: DetectedInquiry[] = [];
 
-      console.log('[AutoReply] Single AI call for %s — context len: %d chars', ticketId, kbContext.length);
+      if (useV2) {
+        // Classify first — internal + Supabase caches make this cheap on rerun.
+        const convoLines = (ticket.messages || [])
+          .filter(m => m.sender !== 'system')
+          .map(m => {
+            const role = m.sender === 'guest' ? 'Guest'
+              : m.sender === 'bot' ? 'AI'
+              : m.sender === 'host' ? 'Host'
+              : 'Agent';
+            return `[${role}]: ${m.text}`;
+          });
+        console.log('[AutoReply] v2 path for %s — classifying + compose_structured', ticketId);
+        const classifyResult = await classifyWithLLM(
+          convoLines,
+          ticket.property,
+          ticket.host.name,
+          (opts) => classifyInquiriesProxy({
+            ...opts,
+            model: resolveModel('classify_inquiry', promptOverrides),
+            temperature: resolveTemperature('classify_inquiry', promptOverrides),
+            maxTokens: resolveMaxTokens('classify_inquiry', promptOverrides),
+          }),
+          kbContext,
+          promptOverrides,
+        );
+        v2Inquiries = classifyResult.inquiries.length > 0
+          ? classifyResult.inquiries
+          : [{
+              id: 'inq-ai-0',
+              inquiryKey: deriveInquiryKey('general', lastGuestMsg.text.slice(0, 40)),
+              type: 'general',
+              label: 'Guest Inquiry',
+              detail: lastGuestMsg.text.slice(0, 120) || 'Guest message requires review',
+              confidence: 'low',
+              relevantTags: [],
+              keywords: [],
+              aiClassified: true,
+            }];
 
-      const result = await composeReplyAI({
-        systemPrompt: autoReplySystem,
-        userPrompt: autoReplyUser,
-        model: resolveModel('auto_reply', promptOverrides),
-        temperature: resolveTemperature('auto_reply', promptOverrides),
-        maxTokens: resolveMaxTokens('auto_reply', promptOverrides),
-        signal,
-      });
+        v2Structured = await composeStructuredReply({
+          hostName: ticket.host.name,
+          hostTone: hostConfig.tone,
+          channel: ticket.channel,
+          channelHint,
+          guestFirstName: ticket.guestName.split(' ')[0] ?? ticket.guestName,
+          agentName,
+          language: ticket.language?.split('(')[0]?.trim() || 'English',
+          conversationHistory,
+          kbContext,
+          inquiries: v2Inquiries,
+          promptOverrides,
+          signal,
+        });
 
-      // ─── Cancellation check after AI call ─────────────────────
-      if (autoReplyCancelledRef.current[ticketId]) {
-        console.log('[AutoReply] Cancelled after AI response for %s — discarding result', ticketId);
-        return;
-      }
+        if (autoReplyCancelledRef.current[ticketId]) {
+          console.log('[AutoReply] v2 cancelled after compose for %s — discarding', ticketId);
+          return;
+        }
 
-      const output = parseAIReplyOutput(result.text);
-      console.log('[AutoReply] AI output for %s: outcome=%s, risk=%d, topics=[%s], actions=%d',
-        ticketId, output.outcome, output.risk_score, output.escalate_topics.join(', '), output.promised_actions.length);
+        const assembled = assembleStructuredReply({
+          greeting: v2Structured.greeting,
+          sections: v2Structured.sections,
+          closing: v2Structured.closing,
+        });
 
-      // ─── [STEP 5] Post-processing safety net ─────────────────────
-      // Detect banned time-commitment phrases in the AI reply even when the
-      // prompt instructions are followed imperfectly (LLMs are probabilistic).
-      // Phase 3 will extend this with per-property guardrails.bannedPhrases.
-      const bannedPhraseRegex = buildBannedPhraseRegex(/* extraPhrases from PropertyAISettings go here in Phase 3 */);
-      if (bannedPhraseRegex.test(output.reply)) {
-        console.log('[AutoReply] SAFETY FLAG: banned phrase detected in reply for %s — forcing draft mode', ticketId);
-        output.safetyFlagged = true;
-      }
+        output = {
+          reply: assembled,
+          outcome: v2Structured.outcome,
+          escalate_topics: v2Structured.escalateTopics,
+          risk_score: v2Structured.riskScore,
+          reason: v2Structured.reason,
+          promised_actions: v2Structured.promisedActions,
+          safetyFlagged: v2Structured.safetyFlagged,
+        };
+        console.log('[AutoReply] v2 output for %s: outcome=%s, risk=%d, sections=%d',
+          ticketId, output.outcome, output.risk_score, v2Structured.sections.length);
 
-      // ─── [STEP 5b] Risk Gate ──────────────────────────────────────
-      if (output.risk_score >= 8) {
-        console.log('[AutoReply] RISK GATE: score=%d — overriding outcome to escalate for %s', output.risk_score, ticketId);
-        output.outcome = 'escalate';
+      } else {
+        const { system: autoReplySystem, user: autoReplyUser } = buildAutoReplyPrompt(
+          ticket, lastGuestMsg.text, kbContext,
+          hostConfig.tone, conversationHistory, channelHint,
+          promptOverrides,
+        );
+
+        console.log('[AutoReply] Single AI call for %s — context len: %d chars', ticketId, kbContext.length);
+
+        const result = await composeReplyAI({
+          systemPrompt: autoReplySystem,
+          userPrompt: autoReplyUser,
+          model: resolveModel('auto_reply', promptOverrides),
+          temperature: resolveTemperature('auto_reply', promptOverrides),
+          maxTokens: resolveMaxTokens('auto_reply', promptOverrides),
+          signal,
+        });
+
+        // ─── Cancellation check after AI call ─────────────────────
+        if (autoReplyCancelledRef.current[ticketId]) {
+          console.log('[AutoReply] Cancelled after AI response for %s — discarding result', ticketId);
+          return;
+        }
+
+        output = parseAIReplyOutput(result.text);
+        console.log('[AutoReply] AI output for %s: outcome=%s, risk=%d, topics=[%s], actions=%d',
+          ticketId, output.outcome, output.risk_score, output.escalate_topics.join(', '), output.promised_actions.length);
+
+        // ─── [STEP 5] Post-processing safety net ─────────────────────
+        // Detect banned time-commitment phrases in the AI reply even when the
+        // prompt instructions are followed imperfectly (LLMs are probabilistic).
+        // Phase 3 will extend this with per-property guardrails.bannedPhrases.
+        const bannedPhraseRegex = buildBannedPhraseRegex(/* extraPhrases from PropertyAISettings go here in Phase 3 */);
+        if (bannedPhraseRegex.test(output.reply)) {
+          console.log('[AutoReply] SAFETY FLAG: banned phrase detected in reply for %s — forcing draft mode', ticketId);
+          output.safetyFlagged = true;
+        }
+
+        // ─── [STEP 5b] Risk Gate ──────────────────────────────────────
+        if (output.risk_score >= 8) {
+          console.log('[AutoReply] RISK GATE: score=%d — overriding outcome to escalate for %s', output.risk_score, ticketId);
+          output.outcome = 'escalate';
+        }
       }
 
       // ─── [STEP 5c] Commit-time tail check ──────────────────────────
@@ -784,6 +927,25 @@ export function useGlobalAutoReply() {
       // Safety-flagged replies are always forced into draft regardless of autoReplyMode,
       // so the operator can review before sending.
       const effectiveIsDraft = isDraft || output.safetyFlagged === true;
+
+      // v2: persist a StoredDraftV2 row so agents opening the SmartReply
+      // panel see the auto-reply broken into per-inquiry sections. Only fires
+      // in draft-mode paths — auto-send has nothing for the agent to edit.
+      if (effectiveIsDraft && v2Structured) {
+        const liveTicketForHash = ticketsRef.current.find(t => t.id === ticketId);
+        const messagesHash = computeMessagesHash(liveTicketForHash?.messages ?? ticket.messages ?? []);
+        try {
+          await saveDraftV2(supabaseClient, {
+            companyId,
+            threadKey: ticketId,
+            draft: toStoredDraftV2FromStructured(v2Structured, messagesHash),
+            messagesHash,
+            source: 'auto-reply',
+          });
+        } catch (e) {
+          console.warn('[AutoReply] v2 saveDraftV2 failed:', e);
+        }
+      }
 
       const outcomeForRouting = (output.outcome === 'partial' && hostConfig.partialCoverage === 'escalate-all')
         ? 'escalate'

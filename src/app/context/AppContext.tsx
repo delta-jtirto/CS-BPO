@@ -73,6 +73,11 @@ export interface HostSettings {
     showQualityPerformance: boolean;  // Show Quality & Performance settings tab
     showZoomOverride: boolean;        // Show zoom control in TopBar
   };
+  /** Smart Reply v2 — per-inquiry cards + unified structured compose.
+   *  Opt-in during rollout. When true, SmartReply uses the new single-phase
+   *  panel and useAutoReply (draft mode) writes sections to ai_reply_drafts.
+   *  Default off; existing hosts keep the v1 phase-based panel. */
+  smartReplyV2?: boolean;
 }
 
 export interface NotificationPrefs {

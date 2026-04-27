@@ -49,7 +49,7 @@ function buildGuestInsights(inquiries: DetectedInquiry[]): string {
 export function useSmartReply({ ticket, existingDraft, cacheRef, aiInquiries }: SmartReplyPanelProps): SmartReplyState {
   const {
     agentName, hasApiKey, aiModel, promptOverrides, properties, proxyCompanyIds,
-    knowledgeChunks, onboardingData, formTemplate,
+    kbEntries, knowledgeChunks, onboardingData, formTemplate,
   } = useAppContext();
 
   // Full guest-facing property context — same shape that feeds auto_reply

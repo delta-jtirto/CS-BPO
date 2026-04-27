@@ -225,6 +225,7 @@ export function SettingsView() {
   const [autoReply, setAutoReply] = useState(currentHostSettings?.autoReply || false);
   const [autoReplyMode, setAutoReplyMode] = useState<'auto' | 'draft' | 'assist'>(currentHostSettings?.autoReplyMode || 'auto');
   const [partialCoverage, setPartialCoverage] = useState<'answer-and-escalate' | 'escalate-all'>(currentHostSettings?.partialCoverage || 'answer-and-escalate');
+  const [smartReplyV2, setSmartReplyV2] = useState<boolean>(currentHostSettings?.smartReplyV2 ?? false);
   const [zeroCoverage, setZeroCoverage] = useState<'holding-message' | 'silent-escalate'>(currentHostSettings?.zeroCoverage || 'holding-message');
   const [cooldownEnabled, setCooldownEnabled] = useState(currentHostSettings?.cooldownEnabled ?? true);
   const [cooldownMinutes, setCooldownMinutes] = useState(currentHostSettings?.cooldownMinutes ?? 10);
@@ -252,6 +253,7 @@ export function SettingsView() {
       setAutoReply(settings.autoReply);
       setAutoReplyMode(settings.autoReplyMode || 'auto');
       setPartialCoverage(settings.partialCoverage || 'answer-and-escalate');
+      setSmartReplyV2(settings.smartReplyV2 ?? false);
       setZeroCoverage(settings.zeroCoverage || 'holding-message');
       setCooldownEnabled(settings.cooldownEnabled ?? true);
       setCooldownMinutes(settings.cooldownMinutes ?? 10);
@@ -810,6 +812,22 @@ export function SettingsView() {
 
                   {showAiAdvanced && (
                     <div className="border border-slate-100 rounded-xl p-4 space-y-4 bg-slate-50/60">
+                      {/* Smart Reply v2 — per-inquiry cards (beta) */}
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="text-xs font-semibold text-slate-600">Smart Reply v2 <span className="ml-1 text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-indigo-50 text-indigo-600 border border-indigo-200">Beta</span></p>
+                          <p className="text-[10px] text-slate-400 mt-0.5 leading-snug">Per-inquiry draft cards with inline edit, regenerate, and skip. When draft mode is on, AutoReply also writes sections agents can fine-tune.</p>
+                        </div>
+                        <button
+                          onClick={() => { const v = !smartReplyV2; setSmartReplyV2(v); autoSave({ smartReplyV2: v }); }}
+                          className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${smartReplyV2 ? 'bg-indigo-500' : 'bg-slate-300'}`}
+                          aria-pressed={smartReplyV2}
+                          aria-label="Toggle Smart Reply v2"
+                        >
+                          <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${smartReplyV2 ? 'translate-x-5' : 'translate-x-1'}`} />
+                        </button>
+                      </div>
+
                       {/* Reply delay */}
                       <div className="flex items-center justify-between">
                         <div>
