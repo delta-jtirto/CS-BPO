@@ -1,8 +1,9 @@
 import React, { createContext, useContext, useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import type { Ticket, KBEntry, Host, Message, KnowledgeChunk, IngestedDocument } from '../data/types';
-import { kvGet, kvSet, stableHash, STORAGE_KEYS } from '../lib/storage';
-import * as kbPersist from '@/lib/kb-persistence';
-import { MOCK_TICKETS, MOCK_KB, MOCK_HOSTS, MOCK_PROPERTIES } from '../data/mock-data';
+import { stableHash } from '../lib/storage';
+import { MOCK_TICKETS, MOCK_HOSTS, MOCK_PROPERTIES } from '../data/mock-data';
+import { useKBSlice } from './slices/useKBSlice';
+import { useAutoReplySlice } from './slices/useAutoReplySlice';
 import type { Property } from '../data/types';
 import { parseThreadStatus } from '../data/types';
 import { PREFILLED_ONBOARDING } from '../data/onboarding-prefill';
@@ -94,43 +95,6 @@ const DEFAULT_PHASES: FormPhase[] = [
   { id: 1, label: 'Critical', color: 'red' },
   { id: 2, label: 'Guest Experience', color: 'blue' },
 ];
-
-/**
- * Project a manual-sourced `KnowledgeChunk` back to the legacy `KBEntry`
- * shape so callers of `kbEntries` (KnowledgeBaseView's inline editor,
- * InquiryDetector's legacy consumers) keep working without rewriting.
- *
- * The chunk id convention is `manual-${timestamp}`; we extract the
- * timestamp as the KBEntry's numeric id. For chunks with unexpected ids
- * we hash to a stable positive int so the legacy UI can still key them.
- */
-function chunkToKBEntry(c: KnowledgeChunk): KBEntry {
-  const legacyIdMatch = c.id.match(/^manual-(\d+)/);
-  let numericId: number;
-  if (legacyIdMatch) {
-    numericId = parseInt(legacyIdMatch[1], 10);
-  } else {
-    // Deterministic string→int fold; same chunk id always maps to same legacy id.
-    let h = 0;
-    for (let i = 0; i < c.id.length; i++) {
-      h = ((h * 31) + c.id.charCodeAt(i)) | 0;
-    }
-    numericId = Math.abs(h) || 1;
-  }
-  return {
-    id: numericId,
-    hostId: c.hostId,
-    propId: c.propId,
-    roomId: c.roomId,
-    scope: c.roomId ? 'Room' : c.propId ? 'Property' : 'Host Global',
-    title: c.title,
-    content: c.body,
-    tags: c.tags,
-    internal: c.visibility === 'internal',
-    source: 'manual',
-    sectionId: typeof c.structured?.sectionId === 'string' ? c.structured.sectionId : undefined,
-  };
-}
 
 /**
  * Parse a form-data key into its structured parts so we can derive the
@@ -451,43 +415,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // Start empty — Firestore threads merge in once connections authenticate.
   // MOCK_TICKETS only loaded when devMode is explicitly enabled.
   const [tickets, setTickets] = useState<Ticket[]>([]);
-  // Legacy `kbEntries` is now a DERIVED view over `knowledgeChunks`.
-  // The mutators (addKBEntry/updateKBEntry/deleteKBEntry) write to the
-  // chunk store so there's a single source of truth. MOCK_KB is kept as
-  // a seed pool that's merged in when the chunk store is empty for demos —
-  // writing to a MOCK seed entry no-ops because its id has no backing chunk.
-  const [mockKbSeed] = useState<KBEntry[]>(MOCK_KB);
-  // Typed knowledge chunks — Phase 1+ ingest pipeline writes here. Empty in
-  // Phase 0; buildPropertyContext still derives chunks from legacy state.
-  const [knowledgeChunks, setKnowledgeChunks] = useState<KnowledgeChunk[]>([]);
-  const [ingestedDocuments, setIngestedDocuments] = useState<IngestedDocument[]>([]);
-  // Latest-value refs so async effects (Supabase hydrate) can snapshot
-  // current state without capturing stale closures.
-  const knowledgeChunksRef = useRef(knowledgeChunks);
-  const ingestedDocumentsRef = useRef(ingestedDocuments);
-  useEffect(() => { knowledgeChunksRef.current = knowledgeChunks; }, [knowledgeChunks]);
-  useEffect(() => { ingestedDocumentsRef.current = ingestedDocuments; }, [ingestedDocuments]);
+  // KB slice (knowledgeChunks, kbEntries, ingestedDocuments + persistence)
+  // is wired below once `proxyCompanyIds` is available; see `const kb = ...`.
 
-  // Derived kbEntries — projection of manual-sourced active chunks into
-  // the legacy `KBEntry` shape, merged with MOCK_KB seeds for demos.
-  // This kills the old setKbEntries state path; writes now flow through
-  // addKBEntry/updateKBEntry/deleteKBEntry → knowledgeChunks.
-  const kbEntries = useMemo<KBEntry[]>(() => {
-    const manualChunks = knowledgeChunks
-      .filter(c => c.source.type === 'manual' && c.status === 'active')
-      .map(chunkToKBEntry);
-    // Dedupe: a MOCK seed and a user-created chunk could collide on id
-    // (unlikely — seed ids are small ints, chunks use Date.now()-ish).
-    const byId = new Map<number, KBEntry>();
-    for (const e of mockKbSeed) byId.set(e.id, e);
-    for (const e of manualChunks) byId.set(e.id, e);
-    return Array.from(byId.values());
-  }, [knowledgeChunks, mockKbSeed]);
   // Messages for the currently active thread — lazy-loaded from Firestore
   const [activeMessages, setActiveMessages] = useState<Message[]>([]);
-  // Tracks which tickets just received their first Firestore message sync
-  // so useAutoReply can re-initialize its count without false-triggering
-  const firestoreSyncedTickets = useRef<Set<string>>(new Set());
+  // `firestoreSyncedTickets` ref lives on the AutoReply slice (wired below).
 
   // Optimistic pending messages for proxy channels (WhatsApp, Instagram, LINE, Email).
   // Keyed by ticket id. Each entry is a Message with deliveryStatus='sending'|'sent'|'failed'.
@@ -647,6 +580,32 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     fetchProxyCompanyIds().then(ids => setProxyCompanyIds(ids)).catch(() => {});
   }, []);
+
+  // ─── KB slice ─────────────────────────────────────────────────────────
+  // Owns knowledgeChunks + ingestedDocuments + the derived legacy kbEntries
+  // view, plus the IndexedDB ↔ Supabase ↔ realtime persistence pipeline.
+  // Destructured so existing local references (knowledgeChunksRef etc.)
+  // continue to compile without touching the surrounding code.
+  const kb = useKBSlice({ proxyCompanyIds });
+  const {
+    knowledgeChunks,
+    kbEntries,
+    ingestedDocuments,
+    upsertKnowledgeChunks,
+    updateKnowledgeChunk,
+    deleteKnowledgeChunks,
+    upsertIngestedDocument,
+    deleteIngestedDocument,
+    addKBEntry,
+    updateKBEntry,
+    deleteKBEntry,
+    deleteKBEntriesBySource,
+    _knowledgeChunksRef: knowledgeChunksRef,
+    _chunksHydratedRef: chunksHydrated,
+    _serverSyncedRef: serverSyncedRef,
+    _companyIdRef: companyIdRef,
+    _setKnowledgeChunks: setKnowledgeChunks,
+  } = kb;
 
   // Subscribe to proxy conversations via Supabase Realtime
   const { conversations: proxyConversations, isLoading: proxyConversationsLoading } = useProxyConversations({
@@ -976,27 +935,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     })();
   }, []);
 
-  // Load KB entries from database on app startup (Supabase) or localStorage (dev fallback)
-  useEffect(() => {
-    const loadKBFromDatabase = async () => {
-      // Try localStorage first (fast, reliable)
-      const localData = localStorage.getItem('kb_entries_all');
-      if (localData) {
-        try {
-          const entries = JSON.parse(localData);
-          if (Array.isArray(entries) && entries.length > 0) {
-            // Filter out stale form-derived entries — form data is now used directly for AI context
-            const manualOnly = entries.filter((e: { source?: string }) => e.source !== 'onboarding');
-            console.log(`[KB Load] Ignoring ${manualOnly.length} stale legacy KB entries from localStorage — kbEntries is now derived from knowledge_chunks.`);
-            return;
-          }
-        } catch {}
-      }
-      console.log('[KB Load] No persisted data found, using MOCK_KB');
-    };
-    loadKBFromDatabase();
-  }, []);
-
   const [formPersistStatus, setFormPersistStatus] = useState<'local' | 'server' | 'syncing'>('local');
 
   const [openRouterApiKey, setOpenRouterApiKeyRaw] = useState(() => {
@@ -1120,79 +1058,31 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
-  // ─── Auto-reply processing / cancellation / pause state ───────
-  const [autoReplyProcessing, setAutoReplyProcessingState] = useState<Record<string, boolean>>({});
-  const autoReplyCancelledRef = useRef<Record<string, boolean>>({});
-  const autoReplyAbortControllers = useRef<Record<string, AbortController>>({});
-  const [autoReplyPausedTickets, setAutoReplyPausedTickets] = useState<Record<string, boolean>>(() => {
-    try { const s = localStorage.getItem('autoReplyPausedTickets'); return s ? JSON.parse(s) : {}; } catch { return {}; }
-  });
-  const [autoReplyHandedOff, setAutoReplyHandedOffState] = useState<Record<string, boolean>>(() => {
-    try { const s = localStorage.getItem('autoReplyHandedOff'); return s ? JSON.parse(s) : {}; } catch { return {}; }
-  });
-  const [threadAiLocks, setThreadAiLocks] = useState<Record<string, boolean>>(() => {
-    try { const s = localStorage.getItem('threadAiLocks'); return s ? JSON.parse(s) : {}; } catch { return {}; }
-  });
-
-  const setAutoReplyProcessing = useCallback((ticketId: string, processing: boolean) => {
-    setAutoReplyProcessingState(prev => ({ ...prev, [ticketId]: processing }));
-  }, []);
-
-  const cancelAutoReply = useCallback((ticketId: string) => {
-    autoReplyCancelledRef.current[ticketId] = true;
-    setAutoReplyProcessingState(prev => ({ ...prev, [ticketId]: false }));
-    const abortController = autoReplyAbortControllers.current[ticketId];
-    if (abortController) {
-      abortController.abort();
-      delete autoReplyAbortControllers.current[ticketId];
-    }
-  }, []);
-
-  const toggleAutoReplyPause = useCallback((ticketId: string) => {
-    setAutoReplyPausedTickets(prev => {
-      const next = { ...prev, [ticketId]: !prev[ticketId] };
-      syncPrefToBackend('autoReplyPausedTickets', next);
-      return next;
-    });
-  }, [syncPrefToBackend]);
-
-  const setTicketAiEnabled = useCallback((ticketId: string, enabled: boolean) => {
-    setAutoReplyPausedTickets(prev => {
-      const next = { ...prev, [ticketId]: !enabled };
-      syncPrefToBackend('autoReplyPausedTickets', next);
-      return next;
-    });
-  }, [syncPrefToBackend]);
-
-  const setAutoReplyHandedOff = useCallback((ticketId: string, handedOff: boolean) => {
-    setAutoReplyHandedOffState(prev => ({ ...prev, [ticketId]: handedOff }));
-  }, []);
-
-  const toggleThreadAiLock = useCallback((ticketId: string) => {
-    setThreadAiLocks(prev => {
-      const next = { ...prev };
-      if (next[ticketId]) {
-        delete next[ticketId];
-      } else {
-        next[ticketId] = true;
-      }
-      syncPrefToBackend('threadAiLocks', next);
-      return next;
-    });
-  }, [syncPrefToBackend]);
-
-  // Persist paused/handed-off/lock state to localStorage
-  useEffect(() => {
-    try { localStorage.setItem('autoReplyPausedTickets', JSON.stringify(autoReplyPausedTickets)); } catch {}
-  }, [autoReplyPausedTickets]);
-
-  useEffect(() => {
-    try { localStorage.setItem('autoReplyHandedOff', JSON.stringify(autoReplyHandedOff)); } catch {}
-  }, [autoReplyHandedOff]);
-
-  useEffect(() => {
-    try { localStorage.setItem('threadAiLocks', JSON.stringify(threadAiLocks)); } catch {}
-  }, [threadAiLocks]);
+  // ─── Auto-reply slice ──────────────────────────────────────────────────
+  // Owns the auto-reply control surface (processing, cancellation refs,
+  // paused, handed-off, thread locks, firestoreSyncedTickets). Exposes
+  // direct setters as `_*` for the kill-switch / hydrate / cleanup paths.
+  const autoReply = useAutoReplySlice({ syncPrefToBackend, tickets });
+  const {
+    autoReplyProcessing,
+    autoReplyCancelledRef,
+    autoReplyAbortControllers,
+    firestoreSyncedTickets,
+    autoReplyPausedTickets,
+    autoReplyHandedOff,
+    threadAiLocks,
+    setAutoReplyProcessing,
+    cancelAutoReply,
+    toggleAutoReplyPause,
+    setTicketAiEnabled,
+    setAutoReplyHandedOff,
+    toggleThreadAiLock,
+    resumeAllAI,
+    _setAutoReplyProcessingState: setAutoReplyProcessingState,
+    _setAutoReplyPausedTickets: setAutoReplyPausedTickets,
+    _setAutoReplyHandedOffState: setAutoReplyHandedOffState,
+    _setThreadAiLocks: setThreadAiLocks,
+  } = autoReply;
 
   // #14: Persist drafts to localStorage
   useEffect(() => {
@@ -1734,123 +1624,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setDraftRepliesState(prev => { const n = { ...prev }; delete n[ticketId]; return n; });
   }, []);
 
-  // ─── Knowledge Chunks + Ingested Documents mutators ───────────────────────
-  //
-  // Write model: optimistic state update, then async Supabase upsert. The
-  // IndexedDB cache-write effect further down picks up the state change and
-  // mirrors it locally so offline readers still work.
-  //
-  // Realtime events from other tabs come in through a separate subscription
-  // and feed back into the same setState — upserts are idempotent by `id`
-  // so concurrent tabs converge on the same final state without loops.
-  const companyIdRef = useRef<string | null>(null);
-
-  const upsertKnowledgeChunks = useCallback((chunks: KnowledgeChunk[]) => {
-    setKnowledgeChunks(prev => {
-      const byId = new Map(prev.map(c => [c.id, c]));
-      for (const c of chunks) byId.set(c.id, c);
-      return Array.from(byId.values());
-    });
-    const companyId = companyIdRef.current;
-    if (!companyId) return;
-    // Queued: failed writes retry with exponential backoff + online flush.
-    kbPersist.enqueueUpsertChunks(chunks, companyId);
-  }, []);
-
-  const updateKnowledgeChunk = useCallback((id: string, updates: Partial<KnowledgeChunk>) => {
-    const nowIso = new Date().toISOString();
-    setKnowledgeChunks(prev => prev.map(c =>
-      c.id === id ? { ...c, ...updates, updatedAt: nowIso } : c,
-    ));
-    kbPersist.enqueueUpdateChunk(id, updates);
-  }, []);
-
-  const deleteKnowledgeChunks = useCallback((ids: string[]) => {
-    const idSet = new Set(ids);
-    setKnowledgeChunks(prev => prev.filter(c => !idSet.has(c.id)));
-    kbPersist.enqueueDeleteChunks(ids);
-  }, []);
-
-  const upsertIngestedDocument = useCallback((doc: IngestedDocument) => {
-    setIngestedDocuments(prev => {
-      const idx = prev.findIndex(d => d.id === doc.id);
-      if (idx === -1) return [...prev, doc];
-      const next = [...prev];
-      next[idx] = doc;
-      return next;
-    });
-    const companyId = companyIdRef.current;
-    if (!companyId) return;
-    kbPersist.enqueueUpsertDoc(doc, companyId);
-  }, []);
-
-  const deleteIngestedDocument = useCallback((id: string) => {
-    setIngestedDocuments(prev => prev.filter(d => d.id !== id));
-    kbPersist.enqueueDeleteDoc(id);
-  }, []);
-
-  // Legacy KB mutators — now write to `knowledge_chunks` under the hood.
-  // `kbEntries` is a read-only derived view, so these callers still get
-  // their expected behavior, but the data flows through the single
-  // canonical store that every AI path reads from.
-  //
-  // Declared AFTER the chunk mutators so the useCallback deps arrays
-  // below resolve without TDZ errors at render time.
-  const addKBEntry = useCallback(async (entry: Omit<KBEntry, 'id'>) => {
-    const nowIso = new Date().toISOString();
-    const timestamp = Date.now();
-    const chunkId = `manual-${timestamp}`;
-    const hash = await stableHash(JSON.stringify({ title: entry.title, body: entry.content }));
-    upsertKnowledgeChunks([{
-      id: chunkId,
-      hostId: entry.hostId,
-      propId: entry.propId,
-      roomId: entry.roomId,
-      kind: 'property_fact',
-      title: entry.title,
-      body: entry.content,
-      chunkHash: hash,
-      structured: entry.sectionId ? { sectionId: entry.sectionId } : undefined,
-      source: { type: 'manual', extractedAt: nowIso, editedBy: 'agent' },
-      visibility: entry.internal ? 'internal' : 'guest_facing',
-      status: 'active',
-      tags: entry.tags || [],
-      createdAt: nowIso,
-      updatedAt: nowIso,
-    }]);
-  }, [upsertKnowledgeChunks]);
-
-  const updateKBEntry = useCallback(async (id: number, updates: Partial<KBEntry>) => {
-    const chunkId = `manual-${id}`;
-    const patch: Partial<KnowledgeChunk> = {};
-    if (updates.title !== undefined) patch.title = updates.title;
-    if (updates.content !== undefined) patch.body = updates.content;
-    if (updates.tags !== undefined) patch.tags = updates.tags;
-    if (updates.internal !== undefined) {
-      patch.visibility = updates.internal ? 'internal' : 'guest_facing';
-    }
-    if (updates.content !== undefined || updates.title !== undefined) {
-      patch.chunkHash = await stableHash(JSON.stringify({
-        title: updates.title ?? '',
-        body: updates.content ?? '',
-      }));
-    }
-    updateKnowledgeChunk(chunkId, patch);
-  }, [updateKnowledgeChunk]);
-
-  const deleteKBEntry = useCallback((id: number) => {
-    deleteKnowledgeChunks([`manual-${id}`]);
-  }, [deleteKnowledgeChunks]);
-
-  const deleteKBEntriesBySource = useCallback((propId: string, source: 'onboarding' | 'manual') => {
-    // Only the 'manual' branch was ever actively used. We find every
-    // manual chunk scoped to this property and delete them in one batch.
-    if (source !== 'manual') return;
-    const ids = knowledgeChunksRef.current
-      .filter(c => c.source.type === 'manual' && c.propId === propId)
-      .map(c => c.id);
-    if (ids.length > 0) deleteKnowledgeChunks(ids);
-  }, [deleteKnowledgeChunks]);
+  // KB mutators (chunks, ingested docs, legacy KBEntry shims) are owned
+  // by useKBSlice; destructured into kb.* below.
 
   const markNotificationRead = useCallback((id: string) => {
     setNotifications(prev => prev.map(n => n.id === id ? { ...n, read: true } : n));
@@ -2311,223 +2086,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // run once on mount
 
-  // ─── Auto-persist manual KB entries when they change ────────────────────────
-  useEffect(() => {
-    if (kbEntries.length === 0) return;
-
-    const persistKBToDB = () => {
-      try {
-        localStorage.setItem('kb_entries_all', JSON.stringify(kbEntries));
-        console.log(`[KB Persist] ✓ Saved ${kbEntries.length} entries to localStorage`);
-      } catch (err) {
-        console.log('[KB Persist] localStorage failed:', err);
-      }
-    };
-
-    // Debounce persist by 500ms to avoid excessive saves during rapid form edits
-    const timer = setTimeout(() => {
-      persistKBToDB();
-    }, 500);
-
-    return () => clearTimeout(timer);
-  }, [kbEntries]);
-
-  // ─── Knowledge Chunks + Ingested Documents persistence ─────────────────
-  //
-  // Storage layers (in order of authority):
-  //   1. Supabase (canonical, multi-device, RLS-scoped)
-  //   2. IndexedDB (instant-render cache — shows data before network resolves)
-  //   3. React state (runtime)
-  //
-  // Hydrate flow:
-  //   a) Read IndexedDB → setState immediately (instant UI on page load,
-  //      works offline too)
-  //   b) Fetch from Supabase → setState again (canonical state wins)
-  //   c) Subscribe to realtime changes → incremental merges forever
-  //
-  // Write flow:
-  //   Mutators (upsertKnowledgeChunks etc.) already write to Supabase +
-  //   update state. The IndexedDB mirror effect below snapshots current
-  //   state on every change, so the local cache stays warm.
-  const chunksHydrated = useRef(false);
-  const docsHydrated = useRef(false);
-  const serverSyncedRef = useRef(false);
-
-  // Seed companyIdRef once proxyCompanyIds resolves. The prototype fallback
-  // yields 'delta-hq' for any authenticated user when no explicit mapping
-  // exists, so a warmed session always has a valid scope.
-  useEffect(() => {
-    if (proxyCompanyIds.length > 0) {
-      companyIdRef.current = proxyCompanyIds[0];
-    }
-  }, [proxyCompanyIds]);
-
-  // Step 1 — IndexedDB hydrate (fast, offline-safe).
-  useEffect(() => {
-    (async () => {
-      try {
-        const [chunks, docs] = await Promise.all([
-          kvGet<KnowledgeChunk[]>(STORAGE_KEYS.KB_CHUNKS),
-          kvGet<IngestedDocument[]>(STORAGE_KEYS.INGESTED_DOCS),
-        ]);
-        // Race-safe merge: if the user wrote to state before hydrate
-        // completed (e.g. import in <100ms), fresh user writes win over
-        // stale cache values.
-        if (Array.isArray(chunks)) {
-          setKnowledgeChunks(prev => {
-            if (prev.length === 0) return chunks;
-            const byId = new Map(chunks.map(c => [c.id, c]));
-            for (const c of prev) byId.set(c.id, c);
-            return Array.from(byId.values());
-          });
-        }
-        if (Array.isArray(docs)) {
-          setIngestedDocuments(prev => {
-            if (prev.length === 0) return docs;
-            const byId = new Map(docs.map(d => [d.id, d]));
-            for (const d of prev) byId.set(d.id, d);
-            return Array.from(byId.values());
-          });
-        }
-        console.log(`[KB Persist] ✓ Cache hydrated: ${chunks?.length ?? 0} chunks, ${docs?.length ?? 0} docs from IndexedDB`);
-      } catch (err) {
-        console.warn('[KB Persist] Cache hydrate failed:', err);
-      } finally {
-        chunksHydrated.current = true;
-        docsHydrated.current = true;
-      }
-    })();
-  }, []);
-
-  // Step 2 — Supabase fetch (canonical). Waits for proxyCompanyIds so RLS
-  // has a valid scope. Runs once per session; realtime handles updates.
-  //
-  // Also performs a one-time local→server migration: if the user has
-  // chunks in their IndexedDB cache that don't exist on the server, we
-  // upload them on first sync. Protects any work done before Supabase
-  // was enabled and any offline work that hasn't round-tripped yet.
-  useEffect(() => {
-    if (proxyCompanyIds.length === 0) return;
-    if (serverSyncedRef.current) return;
-    serverSyncedRef.current = true;
-    const companyId = proxyCompanyIds[0];
-    (async () => {
-      try {
-        const [serverChunks, serverDocs] = await Promise.all([
-          kbPersist.fetchAllChunks(),
-          kbPersist.fetchAllDocs(),
-        ]);
-
-        // Snapshot current in-memory state so we can detect local-only
-        // items. Read via the refs, not closure — state may have changed
-        // since mount.
-        const localChunks = knowledgeChunksRef.current;
-        const localDocs = ingestedDocumentsRef.current;
-
-        // local-only = present locally but absent on server. These are
-        // either pre-migration writes or offline writes awaiting sync.
-        const serverChunkIds = new Set(serverChunks.map(c => c.id));
-        const orphanLocalChunks = localChunks.filter(c => !serverChunkIds.has(c.id));
-        const serverDocIds = new Set(serverDocs.map(d => d.id));
-        const orphanLocalDocs = localDocs.filter(d => !serverDocIds.has(d.id));
-
-        if (orphanLocalChunks.length > 0 || orphanLocalDocs.length > 0) {
-          console.log(`[KB Persist] Migrating ${orphanLocalChunks.length} chunks + ${orphanLocalDocs.length} docs from local cache → Supabase`);
-          // Fire-and-forget — if it fails, the chunks stay in the local
-          // cache and the next user action will retry via the mutators.
-          if (orphanLocalChunks.length > 0) {
-            kbPersist.upsertChunks(orphanLocalChunks, companyId).catch(err =>
-              console.warn('[KB Persist] Migration upload failed:', err),
-            );
-          }
-          for (const d of orphanLocalDocs) {
-            kbPersist.upsertDoc(d, companyId).catch(err =>
-              console.warn('[KB Persist] Doc migration upload failed:', err),
-            );
-          }
-        }
-
-        // Merge: server is canonical, but keep local-only items (will be
-        // reconciled by the upload above or on next realtime tick) and
-        // prefer newer-updatedAt between the two.
-        setKnowledgeChunks(prev => {
-          const byId = new Map(serverChunks.map(c => [c.id, c]));
-          for (const c of prev) {
-            const serverCopy = byId.get(c.id);
-            if (!serverCopy) { byId.set(c.id, c); continue; }
-            if (new Date(c.updatedAt) > new Date(serverCopy.updatedAt)) byId.set(c.id, c);
-          }
-          return Array.from(byId.values());
-        });
-        setIngestedDocuments(prev => {
-          const byId = new Map(serverDocs.map(d => [d.id, d]));
-          for (const d of prev) if (!byId.has(d.id)) byId.set(d.id, d);
-          return Array.from(byId.values());
-        });
-        console.log(`[KB Persist] ✓ Synced from Supabase: ${serverChunks.length} chunks, ${serverDocs.length} docs`);
-      } catch (err) {
-        console.warn('[KB Persist] Supabase fetch failed — staying on IndexedDB cache:', err);
-      }
-    })();
-  }, [proxyCompanyIds]);
-
-  // Step 3 — Realtime. One tab's mutations become every other tab's
-  // incremental merge. Keeps two agents on two devices in sync without
-  // polling. Unsubscribe on provider unmount.
-  useEffect(() => {
-    if (proxyCompanyIds.length === 0) return;
-    const unsub = kbPersist.subscribeKBRealtime({
-      onChunkChange: (event, c) => {
-        if (event === 'DELETE') {
-          setKnowledgeChunks(prev => prev.filter(x => x.id !== c.id));
-          return;
-        }
-        // INSERT / UPDATE — upsert by id.
-        setKnowledgeChunks(prev => {
-          const idx = prev.findIndex(x => x.id === c.id);
-          if (idx === -1) return [...prev, c as KnowledgeChunk];
-          const next = [...prev];
-          next[idx] = c as KnowledgeChunk;
-          return next;
-        });
-      },
-      onDocChange: (event, d) => {
-        if (event === 'DELETE') {
-          setIngestedDocuments(prev => prev.filter(x => x.id !== d.id));
-          return;
-        }
-        setIngestedDocuments(prev => {
-          const idx = prev.findIndex(x => x.id === d.id);
-          if (idx === -1) return [...prev, d as IngestedDocument];
-          const next = [...prev];
-          next[idx] = d as IngestedDocument;
-          return next;
-        });
-      },
-    });
-    return unsub;
-  }, [proxyCompanyIds]);
-
-  // IndexedDB mirror — fire-and-forget cache writes on every state change.
-  // Doesn't block UI; failure here is non-fatal (Supabase is canonical).
-  useEffect(() => {
-    if (!chunksHydrated.current) return;
-    const timer = setTimeout(() => {
-      kvSet(STORAGE_KEYS.KB_CHUNKS, knowledgeChunks)
-        .then(() => console.log(`[KB Persist] ✓ Cached ${knowledgeChunks.length} chunks to IndexedDB`))
-        .catch(err => console.warn('[KB Persist] Cache write failed:', err));
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [knowledgeChunks]);
-
-  useEffect(() => {
-    if (!docsHydrated.current) return;
-    const timer = setTimeout(() => {
-      kvSet(STORAGE_KEYS.INGESTED_DOCS, ingestedDocuments)
-        .catch(err => console.warn('[KB Persist] Doc cache write failed:', err));
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [ingestedDocuments]);
+  // KB persistence (legacy localStorage mirror, IndexedDB hydrate, Supabase
+  // fetch + migration, realtime, IndexedDB cache mirror) is owned by
+  // useKBSlice; the slice is wired below.
 
   // ─── Manual sync to Supabase ─────────────────────────────────
   const manualSyncFormData = useCallback(async () => {
@@ -2828,27 +2389,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     return ticketId;
   }, []);
 
-  const resumeAllAI = useCallback(() => {
-    // Preserve locked threads; clear unlocked thread overrides
-    setAutoReplyPausedTickets(prev => {
-      const next: Record<string, boolean> = {};
-      for (const [id, val] of Object.entries(prev)) {
-        if (threadAiLocks[id]) next[id] = val;
-      }
-      syncPrefToBackend('autoReplyPausedTickets', next);
-      return next;
-    });
-    // Must explicitly set each unlocked ticket to `false` so that
-    // the `=== false` override check in InboxView/useAutoReply prevents
-    // system-message-derived "handed off" status from re-asserting.
-    setAutoReplyHandedOffState(prev => {
-      const next = { ...prev };
-      for (const t of tickets) {
-        if (!threadAiLocks[t.id]) next[t.id] = false;
-      }
-      return next;
-    });
-  }, [tickets, threadAiLocks, syncPrefToBackend]);
+  // resumeAllAI is owned by useAutoReplySlice (destructured above).
 
   return (
     <AppContext.Provider value={{
